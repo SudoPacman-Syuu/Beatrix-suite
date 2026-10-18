@@ -144,6 +144,55 @@ async def parse_sitemap(session, sitemap_url: str, *, timeout: int = 15,
     return urls
 
 
+async def wayback_urls(host: str, *, timeout: int = 20, max_urls: int = 2000,
+                       session=None) -> Set[str]:
+    """Pull a host's historical URLs from the Wayback Machine CDX API.
+
+    Zero-touch OSINT — the request goes to web.archive.org, never to the target.
+    Returns a set of distinct original URLs (collapsed by urlkey). Any failure
+    (network, rate-limit, bad JSON) yields an empty set rather than raising.
+    """
+    host = (host or "").strip().lower()
+    if host.startswith(("http://", "https://")):
+        host = urlparse(host).netloc
+    if not host:
+        return set()
+    api = ("https://web.archive.org/cdx/search/cdx?url="
+           + host + "/*&output=json&fl=original&collapse=urlkey&limit=" + str(int(max_urls)))
+    urls: Set[str] = set()
+    try:
+        import aiohttp
+    except Exception:
+        return urls
+    own = session is None
+    try:
+        if own:
+            connector = aiohttp.TCPConnector(ssl=False)
+            session = aiohttp.ClientSession(connector=connector)
+        async with session.get(api, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status != 200:
+                return urls
+            data = await resp.json(content_type=None)
+        # CDX JSON is [[field header], [row], ...]; skip the header row.
+        if isinstance(data, list):
+            for row in data[1:]:
+                if row and isinstance(row, list):
+                    u = str(row[0]).strip()
+                    if u.startswith(("http://", "https://")):
+                        urls.add(u)
+                        if len(urls) >= max_urls:
+                            break
+    except Exception:
+        pass
+    finally:
+        if own and session is not None:
+            try:
+                await session.close()
+            except Exception:
+                pass
+    return urls
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # T1594 — HTML comment / hidden input extraction
 # ═══════════════════════════════════════════════════════════════════════

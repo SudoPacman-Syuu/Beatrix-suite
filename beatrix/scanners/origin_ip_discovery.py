@@ -133,6 +133,9 @@ class OriginIPDiscovery:
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         ]
+        # Live CDN ranges fetched at runtime (Cloudflare publishes them free),
+        # merged with the static constants so CDN filtering stays current.
+        self._extra_cdn_ranges: List[str] = []
 
     async def run(self, target: str, shared_data: dict = None) -> dict:
         """
@@ -202,10 +205,15 @@ class OriginIPDiscovery:
         """
         result = OriginIPResult(domain=domain)
 
+        # Refresh live CDN ranges (Cloudflare, free) so filtering is accurate.
+        await self._refresh_cdn_ranges()
+
         # First, detect CDN
         result.cdn_detected, result.cdn_ips = await self.detect_cdn(domain)
 
-        # Run discovery techniques in parallel
+        # Run discovery techniques in parallel. Beyond the built-ins, these three
+        # free/keyless passive-DNS + internet-scan sources are where most origins
+        # actually leak (historical resolutions from before the CDN was added).
         techniques = [
             self._dns_history_lookup(domain),
             self._ssl_certificate_search(domain),
@@ -213,6 +221,9 @@ class OriginIPDiscovery:
             self._subdomain_correlation(domain),
             self._common_misconfigs(domain),
             self._historical_whois(domain),
+            self._alienvault_otx(domain),
+            self._hackertarget(domain),
+            self._urlscan(domain),
         ]
 
         # Add API-based techniques if keys available
@@ -713,6 +724,104 @@ class OriginIPDiscovery:
 
         return result
 
+    async def _refresh_cdn_ranges(self) -> None:
+        """Pull Cloudflare's published IP ranges (free) and cache them so CDN
+        filtering uses current data, not just the static constants."""
+        if self._extra_cdn_ranges:
+            return
+        ranges: List[str] = []
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                for url in ("https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6"):
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status == 200:
+                                for line in (await resp.text()).split():
+                                    line = line.strip()
+                                    if "/" in line:
+                                        ranges.append(line)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._extra_cdn_ranges = ranges
+
+    async def _alienvault_otx(self, domain: str) -> Dict:
+        """AlienVault OTX passive DNS — historical hostname→IP resolutions (keyless).
+
+        This is the big one: OTX often has the IP a host resolved to *before* a
+        CDN was placed in front, which is frequently still the live origin.
+        """
+        result = {'technique': 'AlienVault OTX (passive DNS)', 'ips': []}
+        try:
+            url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.get(url, headers={'User-Agent': self.user_agents[0]}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        seen = set()
+                        for rec in (data.get('passive_dns') or [])[:500]:
+                            ip = (rec.get('address') or '').strip()
+                            host = (rec.get('hostname') or '').lower().rstrip('.')
+                            if (self._is_valid_ip(ip) and ':' not in ip and ip not in seen
+                                    and host.endswith(domain) and not self._is_cdn_ip(ip)):
+                                seen.add(ip)
+                                tp = self._is_third_party_subdomain(host, domain)
+                                result['ips'].append({'ip': ip, 'source': f'OTX passive-DNS ({host})',
+                                                      'confidence': 0.3 if tp else 0.6})
+        except Exception:
+            pass
+        return result
+
+    async def _hackertarget(self, domain: str) -> Dict:
+        """HackerTarget hostsearch — host,IP pairs (free, rate-limited)."""
+        result = {'technique': 'HackerTarget', 'ips': []}
+        try:
+            url = f"https://api.hackertarget.com/hostsearch/?q={domain}"
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.get(url, headers={'User-Agent': self.user_agents[0]}) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        if 'API count exceeded' in text or text.lower().startswith('error'):
+                            return result
+                        seen = set()
+                        for line in text.splitlines():
+                            parts = line.split(',')
+                            if len(parts) == 2:
+                                host, ip = parts[0].strip().lower(), parts[1].strip()
+                                if (self._is_valid_ip(ip) and ip not in seen
+                                        and host.endswith(domain) and not self._is_cdn_ip(ip)):
+                                    seen.add(ip)
+                                    tp = self._is_third_party_subdomain(host, domain)
+                                    result['ips'].append({'ip': ip, 'source': f'HackerTarget ({host})',
+                                                          'confidence': 0.3 if tp else 0.55})
+        except Exception:
+            pass
+        return result
+
+    async def _urlscan(self, domain: str) -> Dict:
+        """urlscan.io — the IP observed when the site was scanned (keyless search)."""
+        result = {'technique': 'urlscan.io', 'ips': []}
+        try:
+            url = f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=100"
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.get(url, headers={'User-Agent': self.user_agents[0]}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        seen = set()
+                        for row in (data.get('results') or []):
+                            page = row.get('page') or {}
+                            ip = (page.get('ip') or '').strip()
+                            pd = (page.get('domain') or '').lower()
+                            if (self._is_valid_ip(ip) and ':' not in ip and ip not in seen
+                                    and pd.endswith(domain) and not self._is_cdn_ip(ip)):
+                                seen.add(ip)
+                                result['ips'].append({'ip': ip, 'source': f'urlscan.io ({pd})',
+                                                      'confidence': 0.5})
+        except Exception:
+            pass
+        return result
+
     async def _validate_origin_ips(
         self,
         domain: str,
@@ -919,7 +1028,7 @@ class OriginIPDiscovery:
         """
         all_excluded = (
             CLOUDFLARE_IP_RANGES + AKAMAI_IP_RANGES + FASTLY_IP_RANGES
-            + HOSTING_PROVIDER_RANGES
+            + HOSTING_PROVIDER_RANGES + self._extra_cdn_ranges
         )
         return self._ip_in_ranges(ip, all_excluded)
 

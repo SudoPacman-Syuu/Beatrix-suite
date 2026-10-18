@@ -754,10 +754,33 @@ class KillChainExecutor:
                 scope_patterns = [f"*.{domain}", domain]
             if scope_patterns and hasattr(crawler, "_scope"):
                 crawler._scope = scope_patterns
+            # Strict out-of-scope hosts the crawler must never follow (deny wins).
+            scope_deny = context.get("scope_deny", [])
+            if hasattr(crawler, "_scope_deny"):
+                crawler._scope_deny = scope_deny or []
 
             self._emit("crawl_start", target=url)
+            seed_urls = context.get("seed_urls") or []
+            seed_mode = context.get("seed_mode", "confirm")
+            _saved_max_pages = getattr(crawler, "max_pages", None)
             try:
-                crawl_result = await crawler.crawl(url, auth=context.get("auth"))
+                if seed_urls:
+                    # Reuse a pre-built site map instead of a blind BFS re-crawl.
+                    # "skip" fetches only the root (tech/cookies) and treats the seeds
+                    # as the surface; "confirm" visits each known URL once for
+                    # forms/tech/params. Neither follows newly-discovered links.
+                    try:
+                        crawler.max_pages = 0 if seed_mode == "skip" \
+                            else max(_saved_max_pages or 50, len(seed_urls) + 10)
+                    except Exception:
+                        pass
+                    self._emit("info", message=(
+                        f"Site map reuse ({'fast / skip crawl' if seed_mode == 'skip' else 'seed & confirm'}): "
+                        f"{len(seed_urls)} known URL(s) seeded — not re-crawling from root"))
+                    crawl_result = await crawler.crawl(url, auth=context.get("auth"),
+                                                       seeds=seed_urls, expand=False)
+                else:
+                    crawl_result = await crawler.crawl(url, auth=context.get("auth"))
 
                 # Store crawl data in context for later phases
                 context["crawl_result"] = crawl_result
@@ -794,6 +817,12 @@ class KillChainExecutor:
 
             except Exception as e:
                 self._emit("crawl_error", error=str(e))
+            finally:
+                if _saved_max_pages is not None:
+                    try:
+                        crawler.max_pages = _saved_max_pages
+                    except Exception:
+                        pass
 
         # Save crawl results
         if self.output_manager and crawl_result:
@@ -817,7 +846,10 @@ class KillChainExecutor:
         # challenge (PerimeterX, Cloudflare, DataDome, etc.).  Re-crawl
         # key pages with a real Chromium browser to extract links, forms,
         # and network requests that the HTTP crawler couldn't see.
-        if crawl_result and crawl_result.pages_crawled < 5:
+        # A site-map-seeded run deliberately crawls few/no pages (the surface was
+        # supplied up front), so a populated seed surface is not "starvation".
+        _seeded_surface = bool(context.get("seed_urls")) and len(context.get("discovered_urls") or []) >= 5
+        if crawl_result and crawl_result.pages_crawled < 5 and not _seeded_surface:
             techs = context.get("technologies", {})
             _waf_names = ("perimeterx", "cloudflare", "akamai", "imperva",
                           "datadome", "kasada", "shape", "distil", "incapsula")

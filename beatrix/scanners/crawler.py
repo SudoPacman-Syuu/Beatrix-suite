@@ -117,6 +117,12 @@ class TargetCrawler:
         # hostname matches any pattern (supports leading wildcards like
         # *.example.com). When empty, only same-origin links are followed.
         self._scope: List[str] = scope or []
+        # Hosts strictly OUT of scope — never followed/added, even same-origin.
+        self._scope_deny: List[str] = []
+        # When False, the crawler visits its frontier (seeds + the root's own
+        # links) once but does NOT follow newly-discovered links (no BFS) — used
+        # by the "seed from site map" path so the active scan reuses a pre-built map.
+        self._expand: bool = True
 
         # Passive scan pipeline — when set, every fetched response is
         # passed through registered PassiveScanChecks in real time.
@@ -257,7 +263,8 @@ class TargetCrawler:
         except Exception:
             pass
 
-    async def crawl(self, target: str, auth=None) -> CrawlResult:
+    async def crawl(self, target: str, auth=None, seeds: Optional[List[str]] = None,
+                    expand: bool = True) -> CrawlResult:
         """
         Crawl the target and build the attack surface.
 
@@ -266,12 +273,19 @@ class TargetCrawler:
             auth: Optional AuthCredentials — when provided, the crawler
                   sends auth headers/cookies on every request so it can
                   discover authenticated pages (dashboards, settings, APIs).
+            seeds: Known URLs (e.g. from a pre-built site map) to drop straight
+                  into the frontier so the scan reuses prior recon instead of
+                  rediscovering from the root.
+            expand: When False, visit the frontier once (root + seeds, for
+                  tech/forms/params) but do NOT follow newly-found links — the
+                  efficient "seed from site map" mode.
 
         Returns:
             CrawlResult with all discovered data
         """
         result = CrawlResult()
         self._visited = set()  # Reset for reuse safety
+        self._expand = expand
 
         # Normalize target
         if not target.startswith(("http://", "https://")):
@@ -279,6 +293,19 @@ class TargetCrawler:
 
         parsed = urlparse(target)
         result.base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Site-map seeding: known URLs become part of the frontier up front, so
+        # _crawl_links visits them directly (no BFS needed to rediscover them).
+        response = None
+        if seeds:
+            for s in seeds:
+                if isinstance(s, str) and s.startswith(("http://", "https://")):
+                    result.urls.add(s)
+                    _sp = urlparse(s)
+                    result.paths.add(_sp.path)
+                    if _sp.query:
+                        result.urls_with_params.add(s)
+            self.log(f"Seeded {len(result.urls)} URLs from site map (expand={expand})")
 
         # ── Build auth-aware headers and cookies ────────────────────────
         client_headers = {
@@ -347,10 +374,11 @@ class TargetCrawler:
 
             except Exception as e:
                 self.log(f"Initial fetch failed: {type(e).__name__}: {e}")
-                return result
+                if not seeds:
+                    return result
 
             # Parse the initial page
-            if response.status_code == 200 and "text/html" in response.headers.get("content-type", ""):
+            if response is not None and response.status_code == 200 and "text/html" in response.headers.get("content-type", ""):
                 self._extract_from_html(response.text, result.resolved_url, result)
                 self.log(f"Extracted {len(result.urls)} URLs, {len(result.js_files)} JS files, {len(result.forms)} forms from initial page")
 
@@ -382,6 +410,16 @@ class TargetCrawler:
                 return True
         return False
 
+    def _hostname_in_deny(self, hostname: str) -> bool:
+        """True if hostname matches any strict out-of-scope pattern (deny wins)."""
+        for pattern in (self._scope_deny or []):
+            if pattern.startswith("*."):
+                if hostname.endswith(pattern[1:]) or hostname == pattern[2:]:
+                    return True
+            elif hostname == pattern:
+                return True
+        return False
+
     async def _crawl_links(self, client: httpx.AsyncClient, result: CrawlResult, depth: int):
         """Crawl same-origin and in-scope links up to max_depth"""
         if depth > self.max_depth:
@@ -399,6 +437,8 @@ class TargetCrawler:
             is_same_origin = parsed.netloc == base_parsed.netloc
             # Allow in-scope subdomains if scope patterns are set
             is_in_scope = self._hostname_in_scope(parsed.hostname or "")
+            if self._hostname_in_deny(parsed.hostname or ""):   # strict out-of-scope wins
+                continue
             if not is_same_origin and not is_in_scope:
                 continue
             # Skip non-HTML resources
@@ -453,8 +493,8 @@ class TargetCrawler:
             except Exception:
                 continue
 
-        # Recurse for newly discovered links
-        if depth < self.max_depth and len(self._visited) < self.max_pages:
+        # Recurse for newly discovered links (skipped in seed-only / no-expand mode)
+        if self._expand and depth < self.max_depth and len(self._visited) < self.max_pages:
             await self._crawl_links(client, result, depth + 1)
 
     def _extract_from_html(self, html: str, page_url: str, result: CrawlResult):
@@ -472,7 +512,7 @@ class TargetCrawler:
             # Track same-origin URLs unconditionally + in-scope subdomain URLs
             is_same_origin = parsed.netloc == base_parsed.netloc
             is_in_scope = self._hostname_in_scope(parsed.hostname or "")
-            if is_same_origin or is_in_scope:
+            if (is_same_origin or is_in_scope) and not self._hostname_in_deny(parsed.hostname or ""):
                 result.urls.add(full_url)
                 result.paths.add(parsed.path)
 

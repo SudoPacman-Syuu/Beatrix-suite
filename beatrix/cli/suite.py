@@ -27,10 +27,13 @@ import hashlib
 import itertools
 import json
 import os
+import queue
 import re
 import shutil
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -56,6 +59,11 @@ from beatrix.cli.auth_gui import (
 )
 # Reuse the ghost dashboard's thread-safe event ring buffer.
 from beatrix.cli.ghost_web import _Broker
+from beatrix.core import nmap_runner
+from beatrix.core import packet_engine
+from beatrix.core import browser_driver
+from beatrix.core import recon_engine
+from beatrix.core import nuclei_runner
 
 DEFAULT_PORT = 8790
 DEFAULT_STATE_DIR = Path.home() / ".beatrix" / "suite"
@@ -277,6 +285,15 @@ def _host_in_scope(url_or_host: str, hosts: List[str]) -> bool:
     """
     from beatrix.ai.ghost2.core.session import Scope
     return Scope(target="", allowed_hosts=hosts).in_scope(url_or_host)
+
+
+def _scope_allows(url_or_host: str, allowed: List[str], denied: List[str]) -> bool:
+    """Scope decision with strict exclusions: in scope iff NOT matched by any
+    ``denied`` entry (or subdomains) AND (``allowed`` empty => all, else matches
+    ``allowed``). Deny always wins over the in-scope list."""
+    if denied and _host_in_scope(url_or_host, denied):
+        return False
+    return _host_in_scope(url_or_host, allowed) if allowed else True
 
 
 def _shutdown_loop(loop) -> None:
@@ -508,6 +525,39 @@ class _ProjectStore:
             p["scope"] = []
             self._write()
             return {"ok": True, "scope": []}
+
+    # Out-of-scope (exclusion) list — strictly excluded, deny wins over in-scope.
+    def get_scope_exclude(self, pid: Any) -> List[str]:
+        with self._lock:
+            p = self._find(pid)
+            return list(p.get("scope_exclude", [])) if p else []
+
+    def add_scope_exclude(self, pid: Any, entries: List[str]) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            p["scope_exclude"] = sorted(set(p.get("scope_exclude", [])) | set(entries))
+            self._write()
+            return {"ok": True, "exclude": p["scope_exclude"]}
+
+    def remove_scope_exclude(self, pid: Any, entry: str) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            p["scope_exclude"] = [s for s in p.get("scope_exclude", []) if s != entry]
+            self._write()
+            return {"ok": True, "exclude": p["scope_exclude"]}
+
+    def clear_scope_exclude(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            p["scope_exclude"] = []
+            self._write()
+            return {"ok": True, "exclude": []}
 
 
 # ── Issues (Burp-style) ──────────────────────────────────────────────────────
@@ -851,7 +901,62 @@ _ISSUE_SUMMARY_FIELDS = ("id", "title", "severity", "confidence", "host", "path"
                          "false_positive", "discovered_at")
 
 
-class _IssueStore:
+_UNDO_TTL = 600          # a cleared backup stays recoverable for ~10 min (lazy, on access)
+
+
+class _UndoableStore:
+    """Single-slot, on-disk UNDO for the per-project JSON stores. Before any destructive
+    write (clear / delete_items) a store calls ``_snapshot_undo(pid)``, which COPIES its data
+    file to ``<file>.undo`` (overwriting any prior backup — exactly one slot). ``restore(pid)``
+    moves it back. The backup is a file on disk, never a RAM buffer, and is dropped on the next
+    destructive op, on project close/delete, at shutdown, and by a periodic age sweep — so at
+    most one spare copy per store ever exists. Mix into any store that exposes ``_file(pid)``."""
+
+    def _undo_file(self, pid: Any) -> Path:
+        fp = self._file(pid)
+        return fp.with_name(fp.name + ".undo")
+
+    def _snapshot_undo(self, pid: Any) -> None:
+        fp = self._file(pid)
+        try:
+            if fp.exists():
+                shutil.copy2(str(fp), str(self._undo_file(pid)))
+            else:
+                self.drop_undo(pid)                 # nothing to back up → no stale slot
+        except Exception:  # noqa: BLE001
+            pass
+
+    def restore(self, pid: Any) -> Dict[str, Any]:
+        u = self._undo_file(pid)
+        try:
+            if u.exists():
+                if (time.time() - u.stat().st_mtime) > _UNDO_TTL:
+                    u.unlink(); return {"ok": False, "error": "undo expired"}
+                os.replace(str(u), str(self._file(pid)))   # move back AND drop the slot
+                return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "nothing to undo"}
+
+    def has_undo(self, pid: Any) -> bool:
+        try:
+            u = self._undo_file(pid)
+            if not u.exists():
+                return False
+            if (time.time() - u.stat().st_mtime) > _UNDO_TTL:   # lazy TTL: expire on access
+                u.unlink(); return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def drop_undo(self, pid: Any) -> None:
+        try:
+            self._undo_file(pid).unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _IssueStore(_UndoableStore):
     """Per-project issue list, persisted to ``<project>/issues.json``.
 
     Disk-backed with no long-lived cache (issue volume is modest and ops are
@@ -981,6 +1086,7 @@ class _IssueStore:
 
     def clear(self, pid: Any) -> Dict[str, Any]:
         with self._lock:
+            self._snapshot_undo(pid)
             data = self._read(pid)
             data["issues"] = []
             self._write(pid, data)
@@ -1078,6 +1184,260 @@ class _ScanCheckpoint:
         return {"ok": True}
 
 
+class _NmapSweep:
+    """Per-project Full-Sweep checkpoint, persisted to ``<project>/nmap_sweep.json``.
+
+    The Network module's resumable equivalent of :class:`_ScanCheckpoint`: a sweep
+    is an ordered list of nmap steps, and this records which ones already finished
+    so an interrupted sweep (manual Stop, project close, Codespace timeout, crash)
+    resumes from where it left off instead of restarting. A step stopped mid-run
+    is recorded in ``interrupted_step`` with the ``-oA`` base so it can continue via
+    ``nmap --resume``; completed steps are skipped. Atomic, best-effort writes — a
+    process killed mid-sweep leaves a valid file with ``status="running"``, which the
+    UI treats as resumable.
+    """
+
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "nmap_sweep.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            return json.loads(self._file(pid).read_text())
+        except Exception:
+            return {}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            p = self._file(pid)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, default=str))
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    def start(self, pid: Any, target: str, mode: str, steps: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            now = time.time()
+            self._write(pid, {
+                "target": target, "mode": mode, "steps": list(steps),
+                "completed": [], "interrupted_step": None,
+                "status": "running", "started": now, "updated": now,
+            })
+
+    def resume(self, pid: Any) -> Dict[str, Any]:
+        """Flip an interrupted sweep back to running (keeping its completed set)
+        and return it, or ``{}`` if there's nothing resumable."""
+        with self._lock:
+            data = self._read(pid)
+            if not data or data.get("status") not in ("running", "interrupted"):
+                return {}
+            data["status"] = "running"
+            data["updated"] = time.time()
+            self._write(pid, data)
+            return dict(data)
+
+    def mark_step_done(self, pid: Any, key: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data or data.get("status") != "running":
+                return
+            done = data.setdefault("completed", [])
+            if key not in done:
+                done.append(key)
+            if (data.get("interrupted_step") or {}).get("key") == key:
+                data["interrupted_step"] = None
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def set_interrupted(self, pid: Any, key: Optional[str], resume_base: Optional[str]) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data:
+                return
+            data["status"] = "interrupted"
+            data["interrupted_step"] = ({"key": key, "resume_base": resume_base} if key else None)
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def set_status(self, pid: Any, status: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data:
+                return
+            data["status"] = status
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def get(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            return self._read(pid)
+
+    def clear(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            try:
+                self._file(pid).unlink()
+            except Exception:
+                pass
+        return {"ok": True}
+
+
+# ── OSINT Full-Sweep stages ─────────────────────────────────────────────────────
+# The OSINT equivalent of nmap_runner.SWEEP_*: an ordered list of components run one
+# at a time, each fanned out over the entities discovered so far. ``scope`` is the
+# entity kind a stage consumes — domain → the sweep target (+ any domain entity);
+# host → the target + every discovered subdomain; ip → every discovered IP / origin
+# candidate; cidr → every discovered netblock. ``aggressive`` stages (brute force,
+# zone transfer, CIDR reverse-sweep) run only in Aggressive mode. Max coverage = every
+# practical keyless component in recon_engine.COMPONENTS.
+_RECON_SWEEP_STAGES: List[Dict[str, Any]] = [
+    # domain — the target domain itself (discovers subdomains, IPs, netblocks, contacts)
+    {"component": "dns_records",   "scope": "domain"},
+    {"component": "rdap_domain",   "scope": "domain"},
+    {"component": "whois",         "scope": "domain"},
+    {"component": "crtsh",         "scope": "domain"},
+    {"component": "certspotter",   "scope": "domain"},
+    {"component": "otx",           "scope": "domain"},
+    {"component": "hackertarget",  "scope": "domain"},
+    {"component": "wayback",       "scope": "domain"},
+    {"component": "rapiddns",      "scope": "domain"},
+    {"component": "origin_ip",     "scope": "domain"},
+    {"component": "zone_transfer", "scope": "domain", "aggressive": True},
+    {"component": "dns_brute",     "scope": "domain", "aggressive": True},
+    # host — the target + every discovered subdomain
+    {"component": "resolve",       "scope": "host"},
+    {"component": "tls_san",       "scope": "host"},
+    {"component": "asn",           "scope": "host"},
+    # ip — every discovered IP / origin candidate
+    {"component": "reverse",           "scope": "ip"},
+    {"component": "rdap_ip",           "scope": "ip"},
+    {"component": "shodan_internetdb", "scope": "ip"},
+    {"component": "geoip",             "scope": "ip"},
+    # cidr — every discovered netblock
+    {"component": "reverse_sweep",     "scope": "cidr", "aggressive": True},
+]
+_RECON_SWEEP_FANOUT_CAP = 100   # max targets per fan-out stage (rate-limit / runaway guard)
+
+
+def recon_sweep_stages(mode: str) -> List[Dict[str, Any]]:
+    """The ordered stage list for a mode. Standard skips the aggressive stages;
+    Aggressive runs them all. Each stage carries a stable ``key`` + display ``label``
+    (pulled from the component catalog)."""
+    aggressive = (mode == "aggressive")
+    out: List[Dict[str, Any]] = []
+    for st in _RECON_SWEEP_STAGES:
+        if st.get("aggressive") and not aggressive:
+            continue
+        if st["component"] not in recon_engine.COMPONENTS:
+            continue
+        comp = recon_engine.COMPONENTS[st["component"]]
+        out.append({"key": st["component"] + ":" + st["scope"],
+                    "component": st["component"], "scope": st["scope"],
+                    "label": comp.get("label") or st["component"],
+                    "aggressive": bool(st.get("aggressive"))})
+    return out
+
+
+class _ReconSweep:
+    """Per-project OSINT Full-Sweep checkpoint (``<project>/recon_sweep.json``).
+
+    The OSINT equivalent of :class:`_NmapSweep`. A sweep is an ordered list of stages
+    (see :func:`recon_sweep_stages`); because OSINT components fan out over discovered
+    entities, the resumable unit is one component/target operation, recorded in
+    ``completed`` so an interrupted sweep skips finished operations and still picks up
+    entities discovered since. ``stage`` tracks the current stage for the progress chip.
+    Atomic, best-effort writes; a process killed mid-sweep leaves a valid
+    ``status="running"`` file the UI treats as resumable."""
+
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "recon_sweep.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            return json.loads(self._file(pid).read_text())
+        except Exception:
+            return {}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            p = self._file(pid)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, default=str))
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    def start(self, pid: Any, target: str, mode: str, stages: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            now = time.time()
+            self._write(pid, {
+                "target": target, "mode": mode, "stages": list(stages),
+                "completed": [], "stage": 0, "stage_label": "",
+                "status": "running", "started": now, "updated": now,
+            })
+
+    def resume(self, pid: Any) -> Dict[str, Any]:
+        """Flip an interrupted sweep back to running (keeping its completed set) and
+        return it, or ``{}`` if there's nothing resumable."""
+        with self._lock:
+            data = self._read(pid)
+            if not data or data.get("status") not in ("running", "interrupted"):
+                return {}
+            data["status"] = "running"
+            data["updated"] = time.time()
+            self._write(pid, data)
+            return dict(data)
+
+    def mark_op_done(self, pid: Any, op_key: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data or data.get("status") != "running":
+                return
+            done = data.setdefault("completed", [])
+            if op_key not in done:
+                done.append(op_key)
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def set_stage(self, pid: Any, idx: int, label: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data:
+                return
+            data["stage"] = idx
+            data["stage_label"] = label
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def set_status(self, pid: Any, status: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            if not data:
+                return
+            data["status"] = status
+            data["updated"] = time.time()
+            self._write(pid, data)
+
+    def get(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            return self._read(pid)
+
+    def clear(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            try:
+                self._file(pid).unlink()
+            except Exception:
+                pass
+        return {"ok": True}
+
+
 # ── Shell page ───────────────────────────────────────────────────────────────
 # Left project rail + top tab bar (Dashboard | Auth | Ghost); panes swap
 # client-side. Theme-aware, inline CSS/JS, no external requests.
@@ -1087,12 +1447,76 @@ _PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beatrix Suite</title>
+<script>
+  /* Global UI scale — the whole interface scales with the window like a tuned
+     browser-zoom, multiplied by a user "Text size" preference (set in the hamburger
+     menu, persisted). CSS `zoom` (not transform) reflows content to fill the window
+     with no gaps and scales type, padding and fixed widths uniformly. Read from
+     window.innerWidth/Height, which the zoom we apply does NOT change, so there is no
+     feedback loop. Runs here in <head> so the first paint is already scaled (no
+     flash). Exposed as window.BeatrixUI for the menu control. Tune the constants. */
+  window.BeatrixUI = (function () {
+    var BASE_W = 1440, BASE_H = 900;        /* viewport the layout is tuned for → auto-scale 1.0 */
+    var AUTO_MIN = 0.72, AUTO_MAX = 1.20;   /* automatic window-fit clamp */
+    var USER_MIN = 0.70, USER_MAX = 1.60;   /* manual "Text size" range */
+    var ABS_MIN = 0.55, ABS_MAX = 2.00;     /* safety clamp on the final product */
+    var KEY = "beatrix.textScale", pending = 0;
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    function getTextScale() {
+      var v = NaN;
+      try { v = parseFloat(localStorage.getItem(KEY)); } catch (e) {}
+      return (v && v > 0) ? clamp(v, USER_MIN, USER_MAX) : 1;
+    }
+    function apply() {
+      pending = 0;
+      var auto = clamp(Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H), AUTO_MIN, AUTO_MAX);
+      document.documentElement.style.zoom = String(clamp(auto * getTextScale(), ABS_MIN, ABS_MAX));
+    }
+    function setTextScale(f) {
+      try { localStorage.setItem(KEY, String(clamp(f, USER_MIN, USER_MAX))); } catch (e) {}
+      apply();
+    }
+    apply();                                             /* before first paint */
+    window.addEventListener("resize", function () {      /* rAF-debounced on live resize */
+      if (!pending) pending = requestAnimationFrame(apply);
+    });
+    return { apply: apply, getTextScale: getTextScale, setTextScale: setTextScale,
+             USER_MIN: USER_MIN, USER_MAX: USER_MAX };
+  })();
+</script>
 <style>
-  :root { --bg:#0a0f0c; --panel:#0e150f; --border:#1e2b22; --fg:#d3ddd2; --muted:#6f8175;
-    --accent:#35d07e; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; }
+  :root { --bg:#080c0a; --panel:#10180f; --border:#243329; --fg:#dbe5da; --muted:#718579;
+    --accent:#39dd89; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; --orange:#ff9f43;
+    --gold:#ffcf3a; --gold-hi:#fff0a6;   /* atomic gold — Support button aura + donation accents */
+    /* NOTE: do not set `color-scheme` here. The Auth tab (and the detail views)
+       are transparent iframes that let the suite's dark background show through;
+       giving the parent a color-scheme the child doesn't share makes the browser
+       paint an opaque WHITE canvas behind the iframe. */
+    /* Codex Phosphor — nav-bar finish. chiaroscuro = bevel (bevel-hi/lo),
+       sfumato = soft glow (glow), the phosphor-green edge brackets a bar. */
+    --bar-bg:#121c14; --bevel-hi:rgba(220,255,230,.055); --bevel-lo:rgba(0,0,0,.4);
+    --edge:color-mix(in srgb, var(--accent) 38%, var(--border));
+    --glow:color-mix(in srgb, var(--accent) 45%, transparent);
+    /* Depth + motion + layout — extend the Phosphor language to the whole suite. */
+    --surface-2:#18231b; --accent-deep:#1f9e5c;
+    --bevel:inset 0 1px 0 var(--bevel-hi), inset 0 -1px 0 var(--bevel-lo);
+    --elev-1:0 1px 2px rgba(0,0,0,.45), 0 2px 8px -3px rgba(0,0,0,.4);
+    --elev-2:0 8px 24px -6px rgba(0,0,0,.55), 0 2px 7px -3px rgba(0,0,0,.45);
+    --elev-3:0 22px 56px -10px rgba(0,0,0,.62), 0 8px 22px -8px rgba(0,0,0,.5);
+    --gutter:clamp(12px, 1.1vw, 28px); --ctrl-h:34px;
+    --dur-1:90ms; --dur-2:160ms; --dur-3:240ms;
+    --ease-standard:cubic-bezier(.4,0,.2,1); --ease-emphasized:cubic-bezier(.2,.7,.2,1); }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f5f8f4; --panel:#ffffff; --border:#d7e0d5; --fg:#1c2620; --muted:#5f7167;
-      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; } }
+      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; --orange:#c25a00;
+      --gold:#ffcf3a; --gold-hi:#fff0a6;   /* gold reads on the dark-filled Support button in both themes */
+      --bar-bg:#eef3ec; --bevel-hi:rgba(255,255,255,.9); --bevel-lo:rgba(31,54,40,.13);
+      --edge:color-mix(in srgb, var(--accent) 45%, var(--border));
+      --glow:color-mix(in srgb, var(--accent) 36%, transparent);
+      --surface-2:#eef3ec; --accent-deep:#0b6d3e;
+      --elev-1:0 1px 2px rgba(31,54,40,.09), 0 2px 8px -3px rgba(31,54,40,.08);
+      --elev-2:0 8px 24px -6px rgba(31,54,40,.16), 0 2px 7px -3px rgba(31,54,40,.1);
+      --elev-3:0 22px 56px -10px rgba(31,54,40,.24), 0 8px 22px -8px rgba(31,54,40,.14); } }
   * { box-sizing:border-box; }
   html, body { height:100%; }
   /* Matrix rain sits BEHIND everything (negative z-index → below the static
@@ -1101,11 +1525,61 @@ _PAGE = r"""<!doctype html>
      transparent panes still let the rain glimmer through. */
   #mrain { position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.38; }
   #mrain.off { display:none; }
+  /* CRT whisper: a faint STATIC scanline wash over everything (no motion). Sits
+     above content but below menus/modals (z 50–90) so dropdowns stay crisp.
+     Dial via the alpha/gap below; killed with the matrix rain via "Screen FX". */
+  #scanlines { position:fixed; inset:0; z-index:40; pointer-events:none;
+    background:repeating-linear-gradient(to bottom, rgba(0,0,0,.06) 0 1px, transparent 1px 3px);
+    opacity:.6; }
+  #scanlines.off { display:none; }
+  /* Honor reduced-motion: drop the only looping animation; the static dot, its
+     glow, and the static scanlines stay (keep texture, remove movement). The JS
+     matrix rain defaults off under reduced-motion too (see setMatrixRain init). */
+  @media (prefers-reduced-motion: reduce) { .dot { animation:none; } }
   body { margin:0; display:flex; flex-direction:column; background:var(--bg); color:var(--fg);
     font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  header { display:flex; align-items:center; gap:16px; padding:10px 18px;
+  header { position:relative; display:flex; align-items:center; gap:16px; padding:10px 18px;
     background:var(--panel); border-bottom:1px solid var(--border);
     box-shadow:0 1px 0 color-mix(in srgb, var(--accent) 22%, transparent); }
+  /* ── "SUPPORT THE DEVELOPER": dead-center in the top bar, always emanating an atomic-gold
+        aura on BOTH the border and the letters. The letters use a bright gold-white core so
+        they stay crisp; the colored glow is layered behind. Dark fill → reads in light + dark. */
+  #support-btn { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    z-index:5; white-space:nowrap; cursor:pointer; font:inherit; font-size:12px; font-weight:800;
+    letter-spacing:.16em; padding:6px 18px; border-radius:8px;
+    color:var(--gold-hi);
+    background:linear-gradient(180deg, rgba(20,15,0,.72), rgba(8,6,0,.82));
+    border:1px solid color-mix(in srgb, var(--gold) 80%, transparent);
+    text-shadow:0 0 4px color-mix(in srgb, var(--gold) 85%, transparent),
+                0 0 11px color-mix(in srgb, var(--gold) 65%, transparent),
+                0 0 22px color-mix(in srgb, var(--gold) 40%, transparent);
+    box-shadow:0 0 8px color-mix(in srgb, var(--gold) 55%, transparent),
+               0 0 20px color-mix(in srgb, var(--gold) 34%, transparent),
+               inset 0 0 9px color-mix(in srgb, var(--gold) 26%, transparent);
+    animation:support-aura 2.6s var(--ease-standard, ease-in-out) infinite;
+    transition:transform var(--dur-1, .12s) ease, box-shadow var(--dur-1, .12s) ease; }
+  #support-btn:hover { transform:translate(-50%,calc(-50% - 1px));
+    box-shadow:0 0 13px color-mix(in srgb, var(--gold) 72%, transparent),
+               0 0 30px color-mix(in srgb, var(--gold) 46%, transparent),
+               inset 0 0 12px color-mix(in srgb, var(--gold) 34%, transparent); }
+  #support-btn:active { transform:translate(-50%,-50%); }
+  #support-btn:focus-visible { outline:2px solid var(--gold); outline-offset:2px; }
+  @keyframes support-aura {
+    0%,100% { box-shadow:0 0 7px color-mix(in srgb, var(--gold) 48%, transparent),
+                         0 0 16px color-mix(in srgb, var(--gold) 28%, transparent),
+                         inset 0 0 8px color-mix(in srgb, var(--gold) 22%, transparent);
+              text-shadow:0 0 4px color-mix(in srgb, var(--gold) 80%, transparent),
+                          0 0 10px color-mix(in srgb, var(--gold) 55%, transparent); }
+    50%    { box-shadow:0 0 14px color-mix(in srgb, var(--gold) 78%, transparent),
+                         0 0 34px color-mix(in srgb, var(--gold) 50%, transparent),
+                         inset 0 0 13px color-mix(in srgb, var(--gold) 38%, transparent);
+              text-shadow:0 0 6px var(--gold),
+                          0 0 16px color-mix(in srgb, var(--gold) 72%, transparent),
+                          0 0 26px color-mix(in srgb, var(--gold) 45%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { #support-btn { animation:none; } }
+  /* Narrow top bars: shrink the label and drop the project text so nothing collides with center. */
+  @media (max-width:900px) { #support-btn { font-size:10.5px; letter-spacing:.1em; padding:5px 10px; }
+    header .proj-label { display:none; } }
   .brand { display:flex; align-items:center; gap:3px; user-select:none; }
   .brand-name { font-weight:800; font-size:15px; letter-spacing:.22em; color:var(--yellow);
     text-shadow:0 0 14px color-mix(in srgb, var(--yellow) 42%, transparent); }
@@ -1118,9 +1592,13 @@ _PAGE = r"""<!doctype html>
   .hamburger { font-size:17px; line-height:1; color:var(--fg); background:transparent;
     border:1px solid transparent; border-radius:7px; padding:4px 9px; cursor:pointer; }
   .hamburger:hover { background:var(--bg); border-color:var(--border); }
-  .app-menu { position:absolute; left:0; top:calc(100% + 8px); z-index:70; width:260px; display:none;
+  /* Layering scale (keep floating UI unambiguously in front of content + scrollbars):
+     sticky table headers = 3 · dropdowns/menus = 1000 · tooltips = 1100 · modals = 2000.
+     Dropdowns that live inside overflow:hidden panes are position:fixed so they are never
+     clipped by a scroll container (positioned in JS via placeFixedUnder). */
+  .app-menu { position:absolute; left:0; top:calc(100% + 8px); z-index:1000; width:260px; display:none;
     background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:6px;
-    box-shadow:0 16px 40px rgba(0,0,0,.45); }
+    box-shadow:var(--elev-2); }
   .app-menu.open { display:block; }
   .menu-session { padding:8px 10px 10px; border-bottom:1px solid var(--border); margin-bottom:6px; }
   .menu-label { font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
@@ -1129,23 +1607,139 @@ _PAGE = r"""<!doctype html>
   .menu-item { display:block; width:100%; text-align:left; font:inherit; font-size:13px; color:var(--fg);
     background:transparent; border:0; border-radius:6px; padding:8px 10px; cursor:pointer; }
   .menu-item:hover { background:var(--bg); }
+  /* Text-size control (global UI scale) */
+  .menu-sep { height:1px; background:var(--border); margin:6px 4px; }
+  .menu-scale { display:flex; align-items:center; gap:8px; padding:6px 10px 8px; }
+  .menu-scale .menu-label { flex:1; }
+  .menu-scale-ctl { display:flex; align-items:center; gap:4px; }
+  .scale-btn { font:inherit; font-size:13px; font-weight:700; line-height:1; color:var(--fg);
+    background:var(--bg); border:1px solid var(--border); border-radius:6px; width:26px; height:24px;
+    cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .scale-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .scale-val { font:inherit; font-size:12px; color:var(--muted); background:transparent; border:0;
+    min-width:42px; text-align:center; cursor:pointer; padding:0; }
+  .scale-val:hover { color:var(--fg); }
   /* Session picker modal */
-  .modal-overlay { position:fixed; inset:0; z-index:90; display:none; align-items:center;
+  .modal-overlay { position:fixed; inset:0; z-index:2000; display:none; align-items:center;
     justify-content:center; background:rgba(0,0,0,.55); backdrop-filter:blur(2px); }
   .modal-overlay.open { display:flex; }
   .modal { width:min(620px, 92vw); max-height:86vh; overflow:auto; background:var(--panel);
     border:1px solid var(--border); border-radius:14px; padding:20px 22px;
-    box-shadow:0 24px 60px rgba(0,0,0,.5); }
+    box-shadow:var(--elev-3); }
   .modal-head { display:flex; align-items:center; }
   .modal h2 { margin:0; font-size:18px; }
   .modal-cancel { margin-left:auto; font-size:15px; color:var(--muted); background:transparent;
     border:0; cursor:pointer; border-radius:6px; padding:2px 7px; }
   .modal-cancel:hover { color:var(--fg); background:var(--bg); }
   .modal-sub { color:var(--muted); font-size:12.5px; line-height:1.55; margin:8px 0 14px; }
+  /* ── Donation wallets (shared by the Support popup + the opening splash) ── */
+  .bx-donate-modal { width:min(560px,94vw); }
+  .bx-wallets { display:flex; flex-direction:column; gap:12px; margin:4px 0 2px; }
+  .bx-wallet { padding:14px 16px; background:var(--surface-2);
+    border:1px solid color-mix(in srgb, var(--gold) 45%, var(--border)); border-radius:12px;
+    box-shadow:0 0 0 1px color-mix(in srgb, var(--gold) 10%, transparent),
+               0 0 16px -5px color-mix(in srgb, var(--gold) 45%, transparent);
+    transition:border-color var(--dur-1) var(--ease-standard), box-shadow var(--dur-1) var(--ease-standard); }
+  .bx-wallet:hover { border-color:var(--gold);
+    box-shadow:0 0 0 1px color-mix(in srgb, var(--gold) 22%, transparent),
+               0 0 22px -4px color-mix(in srgb, var(--gold) 60%, transparent); }
+  .bx-wallet-top { display:flex; align-items:center; gap:11px; margin-bottom:11px; }
+  .bx-wallet-icon { width:32px; height:32px; border-radius:50%; flex-shrink:0; overflow:hidden;
+    display:flex; align-items:center; justify-content:center; background:var(--panel); }
+  .bx-wallet-icon svg { width:30px; height:30px; display:block; }
+  .bx-wallet-name { font-size:12.5px; font-weight:700; letter-spacing:.03em; }
+  .bx-wallet-body { display:flex; gap:14px; align-items:flex-start; }
+  .bx-wallet-qr { flex-shrink:0; width:92px; height:92px; border-radius:8px; background:#fff; padding:4px;
+    cursor:zoom-in; border:1px solid var(--border); transition:transform var(--dur-1) var(--ease-standard); }
+  .bx-wallet-qr:hover { transform:scale(1.04); }
+  .bx-wallet-qr img { width:100%; height:100%; image-rendering:pixelated; display:block; }
+  .bx-wallet-details { flex:1; min-width:0; }
+  .bx-wallet-addr { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; color:var(--muted);
+    word-break:break-all; line-height:1.55; user-select:all; margin-bottom:9px; }
+  .bx-wallet-copy { padding:5px 13px; border:1px solid color-mix(in srgb, var(--gold) 50%, var(--border));
+    background:transparent; color:var(--gold-hi); border-radius:6px; font:inherit; font-size:11.5px;
+    font-weight:600; cursor:pointer; white-space:nowrap;
+    transition:background var(--dur-1) var(--ease-standard), border-color var(--dur-1) var(--ease-standard); }
+  .bx-wallet-copy:hover { background:color-mix(in srgb, var(--gold) 14%, transparent); border-color:var(--gold); }
+  .bx-wallet-copy.copied { color:var(--green); border-color:color-mix(in srgb, var(--green) 45%, transparent); }
+  .bx-donate-note { text-align:center; color:var(--muted); font-size:11.5px; margin:14px 0 2px; }
+  @media (max-width:560px) { .bx-wallet-body { flex-direction:column; align-items:center; text-align:center; }
+    .bx-wallet-top { justify-content:center; } }
+  /* QR enlarge overlay */
+  .bx-qr-zoom { position:fixed; inset:0; z-index:3000; display:none; flex-direction:column; gap:14px;
+    align-items:center; justify-content:center; background:rgba(0,0,0,.86); backdrop-filter:blur(8px); cursor:zoom-out; }
+  .bx-qr-zoom.open { display:flex; }
+  .bx-qr-zoom img { width:min(300px,78vw); height:auto; aspect-ratio:1; image-rendering:pixelated;
+    background:#fff; padding:12px; border-radius:12px; border:1px solid var(--border); }
+  .bx-qr-zoom-label { color:var(--fg); font-size:13px; font-weight:600; }
+  .bx-qr-zoom-dismiss { color:var(--muted); font-size:11px; }
+  /* ── Opening splash / title card ── */
+  /* The overlay itself scrolls and the card centers via margin:auto (NOT align/justify-center, which
+     would push the top off-screen and clip it when the card is taller than the viewport). The card has
+     no vh cap, so under the global `zoom` it scales together with the viewport and never gets cut. */
+  .splash-overlay { position:fixed; inset:0; z-index:2600; display:none; flex-direction:column;
+    align-items:center; overflow-y:auto; padding:clamp(14px,2.4vw,26px); background:rgba(0,0,0,.72);
+    backdrop-filter:blur(3px); animation:bx-splash-in var(--dur-2,.18s) var(--ease-standard) both; }
+  .splash-overlay.open { display:flex; }
+  @keyframes bx-splash-in { from { opacity:0; } to { opacity:1; } }
+  /* column flex: margin-block:auto centers vertically AND stays scroll-reachable (no stretch, no top
+     clip); align-items:center handles the horizontal. */
+  .splash-card { width:min(760px,96vw); flex-shrink:0; margin:auto 0; overflow:hidden; background:var(--panel);
+    border:1px solid color-mix(in srgb, var(--gold) 34%, var(--border)); border-radius:16px;
+    box-shadow:var(--elev-3), 0 0 50px -12px color-mix(in srgb, var(--gold) 40%, transparent); }
+  /* The banner IS the logo (mascot + BEATRIX wordmark on black) — show it big + grand on the black hero;
+     the support paragraph sits on that same black field just below it, lifted on a soft frosted
+     "highlighter" band with a gold letter-outline, and the black melts gently into the panel below. */
+  .splash-hero { position:relative; overflow:hidden; border-radius:16px 16px 0 0; background:#000;
+    text-align:center; padding:clamp(18px,3vw,30px) clamp(14px,4vw,34px) clamp(64px,8vw,96px); }
+  .splash-logo { display:block; width:100%; height:auto; max-height:clamp(260px,44vh,460px);
+    object-fit:contain; margin:0 auto 6px;
+    filter:drop-shadow(0 0 44px color-mix(in srgb, var(--gold) 30%, transparent)); }
+  .splash-hero::after { content:""; position:absolute; left:0; right:0; bottom:0; height:92px; z-index:1;
+    background:linear-gradient(to bottom, transparent, var(--panel)); pointer-events:none; }
+  .splash-lead { position:relative; z-index:2; max-width:640px; margin:10px auto 0; padding:14px 22px;
+    border-radius:16px; color:#f3f7f2; font-size:clamp(14.5px,1.5vw,16.5px); line-height:1.72; text-align:center;
+    -webkit-text-stroke:.5px color-mix(in srgb, var(--gold) 55%, transparent); paint-order:stroke fill;
+    text-shadow:0 1px 6px rgba(0,0,0,.7);
+    background:rgba(10,14,10,.34); backdrop-filter:blur(7px); -webkit-backdrop-filter:blur(7px); }
+  .splash-body { padding:20px clamp(18px,4vw,30px) 24px; }
+  .splash-donate-label { text-align:center; color:var(--gold-hi); font-weight:700; letter-spacing:.14em;
+    text-transform:uppercase; font-size:12px; margin-bottom:14px;
+    text-shadow:0 0 10px color-mix(in srgb, var(--gold) 45%, transparent); }
+  .splash-exit { display:block; margin:20px auto 2px; cursor:pointer; font:inherit; font-size:13.5px;
+    font-weight:700; letter-spacing:.04em; padding:10px 26px; border-radius:9px; color:#0b0b06;
+    background:linear-gradient(180deg, var(--gold-hi), var(--gold)); border:0;
+    box-shadow:0 0 16px -2px color-mix(in srgb, var(--gold) 65%, transparent), var(--bevel);
+    transition:transform var(--dur-1) var(--ease-standard), box-shadow var(--dur-1) var(--ease-standard); }
+  .splash-exit:hover { transform:translateY(-1px); box-shadow:0 0 26px -2px color-mix(in srgb, var(--gold) 80%, transparent); }
+  .splash-exit:focus-visible { outline:2px solid var(--gold); outline-offset:2px; }
+  @media (prefers-reduced-motion: reduce) { .splash-overlay { animation:none; } }
+  /* Shared confirm dialog + undo toast (data-safety: are-you-sure + undo) */
+  .bx-confirm-btns { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
+  .bx-confirm-btns button { font:inherit; font-size:13px; height:34px; padding:0 15px; border-radius:6px; cursor:pointer; }
+  .bx-confirm-btns button[data-act="cancel"] { color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); box-shadow:var(--bevel); transition:border-color var(--dur-1) var(--ease-standard); }
+  .bx-confirm-btns button[data-act="cancel"]:hover { border-color:var(--edge); }
+  .bx-clear-scope { display:flex; flex-direction:column; gap:7px; margin:2px 0 14px; }
+  .bx-clear-scope label { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--fg); cursor:pointer; }
+  .bx-clear-scope select { height:30px; }
+  #bx-toasts { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); z-index:2200;
+    display:flex; flex-direction:column; gap:8px; align-items:center; pointer-events:none; }
+  .bx-toast { pointer-events:auto; display:flex; align-items:center; gap:14px; padding:10px 8px 10px 15px;
+    background:var(--surface-2); color:var(--fg); border:1px solid var(--border); border-radius:10px;
+    box-shadow:var(--elev-3); font-size:13px; max-width:92vw;
+    animation:bx-toast-in var(--dur-2) var(--ease-emphasized); }
+  .bx-toast-act { font:inherit; font-size:13px; font-weight:600; color:var(--accent); background:transparent;
+    border:0; cursor:pointer; padding:3px 6px; border-radius:5px; white-space:nowrap; }
+  .bx-toast-act:hover { background:color-mix(in srgb, var(--accent) 14%, transparent); }
+  .bx-toast-x { color:var(--muted); font-weight:400; }
+  @keyframes bx-toast-in { from { opacity:0; transform:translateY(12px); } }
+  @media (prefers-reduced-motion: reduce) { .bx-toast { animation:none; } }
   .session-tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:12px; }
   .session-tabs button { font:inherit; font-size:13px; color:var(--muted); background:transparent;
     border:0; border-bottom:2px solid transparent; padding:7px 12px; cursor:pointer; }
-  .session-tabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .session-tabs button.active { color:var(--fg); border-bottom-color:var(--accent);
+    text-shadow:0 0 7px var(--glow); box-shadow:0 1px 6px -2px var(--glow); }
   .recent-list { display:flex; flex-direction:column; gap:6px; min-height:80px; }
   .recent-item { display:flex; align-items:center; gap:12px; padding:10px 12px; border:1px solid var(--border);
     border-radius:9px; cursor:pointer; background:var(--bg); }
@@ -1184,6 +1778,18 @@ _PAGE = r"""<!doctype html>
     box-shadow:0 0 7px color-mix(in srgb, var(--green) 75%, transparent);
     animation:dotpulse 2.4s ease-in-out infinite; }
   @keyframes dotpulse { 0%,100%{ opacity:1; } 50%{ opacity:.45; } }
+  /* Radioactive glow — marks a project tab / nav module with a live scan running. */
+  @keyframes radioactive {
+    0%,100% { box-shadow:0 0 3px #6ee600, 0 0 6px rgba(126,255,26,.35); }
+    50%     { box-shadow:0 0 9px #9dff3a, 0 0 18px rgba(126,255,26,.70); }
+  }
+  .proj.scanning, .stage-menu .mod.scanning, nav .mod.scanning {
+    animation:radioactive 1.6s ease-in-out infinite;
+    border-color:#7fe61a !important; color:#c6ff8e !important;
+    text-shadow:0 0 6px rgba(126,255,26,.6); }
+  @media (prefers-reduced-motion: reduce) {
+    .proj.scanning, .stage-menu .mod.scanning, nav .mod.scanning {
+      animation:none; box-shadow:0 0 10px #7fe61a; } }
 
   .body { flex:1; min-height:0; display:flex; }
 
@@ -1199,24 +1805,149 @@ _PAGE = r"""<!doctype html>
   .proj.add { color:var(--muted); font-weight:400; font-size:20px; border-style:dashed; }
   .proj.add:hover { color:var(--accent); }
 
-  .workspace { flex:1; min-width:0; display:flex; flex-direction:column; }
-  nav { display:flex; gap:2px; padding:0 12px; background:var(--panel); border-bottom:1px solid var(--border); }
-  nav button { font:inherit; font-size:13px; color:var(--muted); background:transparent; border:none;
-    border-bottom:2px solid transparent; padding:9px 16px; cursor:pointer; }
-  nav button:hover { color:var(--fg); }
-  nav button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .workspace { flex:1; min-width:0; display:flex; flex-direction:column; position:relative; }
+  /* Scroll affordance for the hidden-scrollbar nav: gradient overlays on the non-scrolling
+     parent (NOT a mask on the nav — a mask would also clip the nav's fixed dropdowns). They
+     only cover the nav strip (height synced to --navh) and never the dropdowns (which are
+     fixed, z 1000, above these z 3 overlays). Fade in only on the edge that has more to scroll. */
+  .workspace::before, .workspace::after { content:""; position:absolute; top:0; height:var(--navh, 40px);
+    width:30px; pointer-events:none; z-index:3; opacity:0; transition:opacity .14s ease; }
+  .workspace::before { left:0; background:linear-gradient(to right, var(--bar-bg) 18%, transparent); }
+  .workspace::after { right:0; background:linear-gradient(to left, var(--bar-bg) 18%, transparent); }
+  .workspace.navscroll-l::before { opacity:1; }
+  .workspace.navscroll-r::after { opacity:1; }
+  /* Top module nav — the dominant raised bar (chiaroscuro bevel).
+     Fluid first: horizontal padding + label size scale down with the viewport
+     (clamp) so more modules fit before anything scrolls — on a normal monitor
+     the whole strip just fits. Scroll fallback: the row never wraps and never
+     lets its buttons spill past the window; once even the tightened buttons
+     overflow (a narrow window, or more modules added later) the strip scrolls
+     laterally within itself instead of overextending the bar / forcing a
+     page-level horizontal scrollbar. Same treatment as the .rep-tabbar strip. */
+  nav { display:flex; flex-wrap:nowrap; gap:2px; padding:0 12px; background:var(--bar-bg);
+    border-bottom:1px solid var(--border); box-shadow:inset 0 1px 0 var(--bevel-hi), 0 1px 0 var(--bevel-lo);
+    position:relative; z-index:50; overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain;
+    scrollbar-width:none; }                                   /* scrollbar hidden: the thin bar sat at the nav's bottom edge, exactly where the stage dropdowns open, and collided with them. The bar still scrolls (wheel / trackpad / drag); edge fades (below) hint it.
+    z-index:50 (was 1): the stage dropdowns are position:fixed but TRAPPED in this nav's stacking context, so the whole context must sit above module content — a module's sticky table header (th, z 3) and the scanline overlay (z 40) each form their own root-level stacking context and would otherwise paint OVER the dropdowns. 50 clears content (max z 10) + scanlines (40), stays below the menu/tooltip/modal tiers (1000+). */
+  nav::-webkit-scrollbar { display:none; }
+  /* The bar now holds kill-chain STAGE buttons; each stage's modules live in a
+     click-open dropdown (.stage-menu). Module buttons (.mod) stay inside <nav> so
+     existing `nav button[data-tab=...]` callers keep matching. */
+  .stage-wrap { position:relative; flex:0 0 auto; display:flex; }
+  nav .stage { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; font:inherit;
+    font-size:clamp(11.5px, 0.35vw + 8.5px, 13px); color:var(--muted); background:transparent; border:none;
+    border-bottom:2px solid transparent; padding:9px clamp(8px, 1.1vw, 16px); cursor:pointer;
+    transition:color .12s ease, border-color .12s ease; }
+  nav .stage:hover { color:var(--fg); }
+  /* Active stage = brighter label + a soft phosphor underline (sfumato glow). */
+  nav .stage.active { color:var(--fg); border-bottom-color:var(--accent);
+    text-shadow:0 0 8px var(--glow); box-shadow:0 1px 7px -2px var(--glow); }
+  /* Stages with no modules yet (Weaponization / Installation / C2) read as dim placeholders. */
+  nav .stage.empty { color:color-mix(in srgb, var(--muted) 55%, transparent); }
+  nav .stage.empty:hover { color:var(--muted); }
+  /* Caret: hints that a stage opens a dropdown; flips when open. */
+  nav .stage .caret { width:0; height:0; border-left:3.5px solid transparent; border-right:3.5px solid transparent;
+    border-top:4px solid currentColor; opacity:.65; transition:transform .12s ease; }
+  nav .stage-wrap.open .stage .caret { transform:rotate(180deg); }
+  /* Dropdown of modules. position:fixed (coords set in JS from the stage rect) so the
+     bar's overflow-x scroll never clips it. */
+  .stage-menu { position:fixed; display:none; z-index:1000; min-width:150px; padding:4px;
+    background:var(--panel); border:1px solid var(--border); border-radius:8px;
+    box-shadow:var(--elev-2); }
+  .stage-wrap.open .stage-menu { display:block; }
+
+  /* ── Shared dropdown-menu animation ──────────────────────────────────────────
+     Every click-opened menu — nav stages, the hamburger menu, the Issues "validate"
+     dropdown and the Repeater popover — fades + slides on open AND close. `display`
+     is animated discretely (allow-discrete) so each menu still fully unmounts to
+     display:none when closed. Each menu keeps its own display:none / .open rules; this
+     layer only adds the motion. */
+  .stage-menu, .app-menu, .iss-ghost-menu, .rep-pop {
+    opacity:0; transform:translateY(-6px) scale(.98); transform-origin:top center;
+    transition:opacity .15s ease, transform .15s ease, display .15s allow-discrete; }
+  .stage-wrap.open .stage-menu, .app-menu.open, .iss-ghost-menu.open, .rep-pop.open {
+    opacity:1; transform:translateY(0) scale(1); }
+  @starting-style {
+    .stage-wrap.open .stage-menu, .app-menu.open, .iss-ghost-menu.open, .rep-pop.open {
+      opacity:0; transform:translateY(-6px) scale(.98); } }
+  /* Right-click context menus toggle display directly, so they animate on open with a
+     keyframe (entry only — a context menu should dismiss instantly). */
+  @keyframes bx-menu-pop { from { opacity:0; transform:translateY(-6px) scale(.98); } }
+  .ctx, .iss-ctx, .ctxmenu { animation:bx-menu-pop .15s ease; transform-origin:top left; }
+  @media (prefers-reduced-motion: reduce) {
+    .stage-menu, .app-menu, .iss-ghost-menu, .rep-pop,
+    .stage-wrap.open .stage-menu, .app-menu.open, .iss-ghost-menu.open, .rep-pop.open {
+      transition:none; transform:none; }
+    .ctx, .iss-ctx, .ctxmenu { animation:none; } }
+  .stage-menu .mod { display:block; width:100%; text-align:left; white-space:nowrap; font:inherit; font-size:12.5px;
+    color:var(--muted); background:transparent; border:0; border-radius:5px; padding:7px 12px; cursor:pointer;
+    transition:color .12s ease, background .12s ease; }
+  .stage-menu .mod:hover { color:var(--fg); background:var(--bg); }
+  /* Active module = the one currently shown; mirrors the project-rail active cue. */
+  .stage-menu .mod.active { color:var(--fg); background:color-mix(in srgb, var(--accent) 14%, transparent);
+    box-shadow:inset 2px 0 0 var(--accent); }
+  .stage-menu .mod-empty { padding:7px 12px; font-size:12px; color:var(--muted); opacity:.7; font-style:italic; }
+  /* Module sub-navbars (Network / Packets / Recon) — one shared treatment so the
+     three never drift. A green hairline + recessed inner bevel brackets each strip
+     as a distinct secondary instrument panel below the raised top nav (hierarchy:
+     top = raised/neutral, sub = recessed/green). The `.workspace` scope keeps this
+     winning over the per-module rules regardless of source order. */
+  .workspace .net-rtabs, .workspace .pk-subtabs, .workspace .rc-etabs {
+    background:var(--bar-bg); border-bottom:1px solid var(--edge);
+    box-shadow:inset 0 1px 0 var(--bevel-hi), inset 0 -2px 5px -3px var(--bevel-lo); }
+  .workspace .net-rtabs button, .workspace .pk-subtabs button, .workspace .rc-etabs button {
+    transition:color .12s ease, border-color .12s ease; }
+  .workspace .net-rtabs button.active, .workspace .pk-subtabs button.active, .workspace .rc-etabs button.active {
+    text-shadow:0 0 7px var(--glow); box-shadow:0 1px 6px -2px var(--glow); }
   main { flex:1; min-height:0; position:relative; }
   .pane { position:absolute; inset:0; display:none; overflow:auto; }
-  .pane.active { display:block; }
+  .pane.active { display:block; animation:bx-pane-in var(--dur-2) var(--ease-standard); }
+  @keyframes bx-pane-in { from { opacity:0; } to { opacity:1; } }
+  @media (prefers-reduced-motion: reduce) { .pane.active { animation:none; } }
+  /* Bars read as raised surfaces (nav's inset chiaroscuro), not flat strips. */
+  .net-toolbar, .pk-toolbar, .rc-toolbar, .ar-toolbar, .rep-toolbar, .iss-toolbar,
+  .msf-hud, .msf-panel-bar, .net-cmdrow { box-shadow:var(--bevel); }
+  .net-toolbar > button, .net-toolbar > select, .net-toolbar > input,
+  .pk-toolbar > button, .pk-toolbar > select, .pk-toolbar > input,
+  .rc-toolbar > button, .rc-toolbar > select, .rc-toolbar > input,
+  .ar-toolbar > button, .ar-toolbar > select, .ar-toolbar > input,
+  .rep-toolbar > button, .rep-toolbar > select, .rep-toolbar > input,
+  .iss-toolbar > button, .iss-toolbar > select, .iss-toolbar > input,
+  .net-cmdrow > input { height:var(--ctrl-h); }
+  /* Tasteful, non-blocking motion: rows ease their hover tint; sub-tabs ease state. */
+  tbody tr { transition:background var(--dur-1) var(--ease-standard); }
+  .net-rtabs button, .pk-subtabs button, .nuc-subtabs button, .iss-dtabs button,
+  .ar-dtabs button, .rc-etabs button { transition:color var(--dur-1) var(--ease-standard),
+    border-color var(--dur-1) var(--ease-standard), background var(--dur-1) var(--ease-standard); }
+  @media (prefers-reduced-motion: reduce) {
+    tbody tr, .net-rtabs button, .pk-subtabs button, .nuc-subtabs button, .iss-dtabs button,
+    .ar-dtabs button, .rc-etabs button { transition:none; } }
+  /* Keyboard focus ring — visible for keyboard users (discoverability), silent for mouse. */
+  button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible,
+  a:focus-visible, [tabindex]:focus-visible {
+    outline:2px solid var(--accent); outline-offset:1px; border-radius:6px; }
   .pane.frame { overflow:hidden; }
   iframe { width:100%; height:100%; border:0; display:block; background:transparent; }
   /* The Hunt workstation is a control panel + terminal side by side, so it
      overrides the generic block layout while active (ID beats .pane.active). */
-  #pane-dashboard.active { display:flex; flex-direction:row; overflow:hidden; }
+  #pane-scan.active { display:flex; flex-direction:row; overflow:hidden; }
+  /* Passive Scan module — same two-pane layout as Active Scan */
+  #pane-passive.active { display:flex; flex-direction:row; overflow:hidden; }
+  .pv-opts { display:flex; flex-direction:column; gap:5px; }
+  #pv-added { color:var(--accent); }
+  #pv-log .tline { padding:1px 0; white-space:pre-wrap; word-break:break-word; }
+  #pv-log .l-phase { color:var(--accent); font-weight:600; }
+  #pv-log .l-err { color:var(--red); }
+  #pv-log .l-done { color:var(--green); font-weight:700; }
+  /* "Use site map" seeding control in the Active Scan sidebar */
+  .h-seed-chk { display:block; margin-top:14px; font-size:12.5px; color:var(--fg); cursor:pointer; }
+  .h-seed-opts { margin:7px 0 0 6px; padding:7px 10px; border-left:2px solid var(--edge);
+    background:color-mix(in srgb, var(--accent) 5%, transparent); border-radius:0 6px 6px 0; }
+  .h-seed-opts label { display:block; margin:4px 0; font-size:12px; color:var(--fg); cursor:pointer; }
 
   /* Right-click context menu for project tabs */
-  .ctx { position:fixed; z-index:50; display:none; background:var(--panel); border:1px solid var(--border);
-    border-radius:6px; padding:4px; min-width:130px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+  .ctx { position:fixed; z-index:1000; display:none; background:var(--panel); border:1px solid var(--border);
+    border-radius:6px; padding:4px; min-width:130px; box-shadow:var(--elev-2); }
   .ctx button { display:block; width:100%; text-align:left; font:inherit; font-size:13px; color:var(--red);
     background:transparent; border:0; padding:6px 10px; border-radius:4px; cursor:pointer; }
   .ctx button:hover { background:var(--bg); }
@@ -1228,12 +1959,58 @@ _PAGE = r"""<!doctype html>
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   input[type=text] { font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--border);
     border-radius:6px; padding:7px 10px; min-width:280px; }
-  button.run { font:inherit; color:#08131a; background:var(--accent); border:0; border-radius:6px;
-    padding:8px 16px; cursor:pointer; font-weight:600; }
-  button.run:disabled { opacity:.5; cursor:default; }
-  button.stop { font:inherit; color:#fff; background:var(--red); border:0; border-radius:6px;
-    padding:8px 16px; cursor:pointer; font-weight:600; }
-  button.stop:disabled { opacity:.4; cursor:default; }
+  /* Native form controls don't inherit the theme because `color-scheme` is left off
+     :root on purpose (see the note at the top — a root color-scheme paints an opaque
+     white canvas behind the transparent Auth iframe). So theme the controls directly:
+     a baseline box for any unscoped <select> + number/search input, an on-brand accent
+     for checks/radios, and `color-scheme` on the CONTROLS ONLY (never an ancestor of the
+     iframe) so their native parts — dropdown arrow, open popup, checkbox, spinners —
+     render dark too. Per-module scoped rules keep winning on specificity. */
+  select { font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:7px 8px; cursor:pointer; }
+  input[type=number], input[type=search] { font:inherit; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  input[type=checkbox], input[type=radio] { accent-color:var(--accent); }
+  select, input, textarea, button, option { color-scheme:dark; }
+  @media (prefers-color-scheme: light) {   /* must follow the dark rule to win the cascade */
+    select, input, textarea, button, option { color-scheme:light; } }
+  option { background:var(--panel); color:var(--fg); }
+  button.run { font:inherit; font-size:13px; color:#08131a; background:var(--accent); border:0; border-radius:6px;
+    padding:7px 15px; cursor:pointer; font-weight:600; box-shadow:var(--bevel), 0 1px 8px -3px var(--glow);
+    transition:filter var(--dur-1) var(--ease-standard), box-shadow var(--dur-1) var(--ease-standard), transform var(--dur-1) var(--ease-standard); }
+  button.run:hover { filter:brightness(1.05) saturate(1.05); box-shadow:var(--bevel), 0 2px 13px -3px var(--glow); }
+  button.run:active { transform:translateY(1px); box-shadow:var(--bevel); }
+  button.run:disabled { opacity:.5; cursor:default; box-shadow:none; filter:none; transform:none; }
+  button.stop { font:inherit; font-size:13px; color:#fff; background:var(--red); border:0; border-radius:6px;
+    padding:7px 15px; cursor:pointer; font-weight:600; box-shadow:var(--bevel), 0 1px 8px -3px color-mix(in srgb, var(--red) 45%, transparent);
+    transition:filter var(--dur-1) var(--ease-standard), box-shadow var(--dur-1) var(--ease-standard), transform var(--dur-1) var(--ease-standard); }
+  button.stop:hover { filter:brightness(1.05); }
+  button.stop:active { transform:translateY(1px); }
+  button.stop:disabled { opacity:.4; cursor:default; box-shadow:none; filter:none; transform:none; }
+  /* Secondary toolbar buttons — one canonical, beveled size suite-wide (0,3,1 specificity
+     lifts every toolbar's non-primary buttons without disturbing the per-module rules). */
+  .net-toolbar button:not(.run):not(.stop), .pk-toolbar button:not(.run):not(.stop),
+  .rc-toolbar button:not(.run):not(.stop), .ar-toolbar button:not(.run):not(.stop),
+  .rep-toolbar button:not(.run):not(.stop), .iss-toolbar button:not(.run):not(.stop),
+  .msf-hud button:not(.run):not(.stop), .msf-panel-bar button:not(.run):not(.stop) {
+    font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 12px; cursor:pointer;
+    box-shadow:var(--bevel);
+    transition:border-color var(--dur-1) var(--ease-standard), background var(--dur-1) var(--ease-standard),
+      color var(--dur-1) var(--ease-standard), box-shadow var(--dur-1) var(--ease-standard),
+      transform var(--dur-1) var(--ease-standard); }
+  .net-toolbar button:not(.run):not(.stop):hover, .pk-toolbar button:not(.run):not(.stop):hover,
+  .rc-toolbar button:not(.run):not(.stop):hover, .ar-toolbar button:not(.run):not(.stop):hover,
+  .rep-toolbar button:not(.run):not(.stop):hover, .iss-toolbar button:not(.run):not(.stop):hover,
+  .msf-hud button:not(.run):not(.stop):hover, .msf-panel-bar button:not(.run):not(.stop):hover {
+    border-color:var(--edge); background:color-mix(in srgb, var(--surface-2) 80%, var(--accent)); }
+  .net-toolbar button:not(.run):not(.stop):active, .pk-toolbar button:not(.run):not(.stop):active,
+  .rc-toolbar button:not(.run):not(.stop):active, .ar-toolbar button:not(.run):not(.stop):active,
+  .rep-toolbar button:not(.run):not(.stop):active, .iss-toolbar button:not(.run):not(.stop):active,
+  .msf-hud button:not(.run):not(.stop):active, .msf-panel-bar button:not(.run):not(.stop):active { transform:translateY(1px); }
+  .net-toolbar button:disabled, .pk-toolbar button:disabled, .rc-toolbar button:disabled,
+  .ar-toolbar button:disabled, .rep-toolbar button:disabled, .iss-toolbar button:disabled,
+  .msf-hud button:disabled, .msf-panel-bar button:disabled { opacity:.5; cursor:default; box-shadow:none; transform:none; }
   .ghost-toolbar { display:flex; align-items:center; gap:16px; margin:10px 0 4px;
     color:var(--muted); font-size:12px; }
   .ghost-toolbar b { color:var(--fg); }
@@ -1290,9 +2067,9 @@ _PAGE = r"""<!doctype html>
   .mod-row { display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:4px; cursor:pointer; font-size:12.5px; }
   .mod-row:hover { background:var(--bg); }
   .mod-row input { flex-shrink:0; margin:0; }
-  .mod-tooltip { position:fixed; z-index:60; display:none; max-width:280px; background:var(--panel);
+  .mod-tooltip { position:fixed; z-index:1100; display:none; max-width:280px; background:var(--panel);
     border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-size:12px; color:var(--fg);
-    line-height:1.45; box-shadow:0 8px 24px rgba(0,0,0,.35); pointer-events:none; }
+    line-height:1.45; box-shadow:var(--elev-2); pointer-events:none; }
 
   .hunt-terminal-wrap { flex:1; min-width:0; display:flex; flex-direction:column; padding:16px; min-height:0; }
   .term-chrome { flex:1; min-height:0; display:flex; flex-direction:column; background:#050607;
@@ -1316,13 +2093,19 @@ _PAGE = r"""<!doctype html>
     border:0; cursor:pointer; padding:2px 6px; border-radius:4px; }
   .scope-item button:hover { color:var(--red); background:var(--bg); }
   .scope-empty { padding:14px 12px; color:var(--muted); font-size:12.5px; }
+  /* Out-of-scope (strict exclusion) list — red accent to distinguish from in-scope */
+  .scope-ex-card { border-color:color-mix(in srgb, var(--red) 40%, var(--border)) !important; }
+  .scope-ex-btn { background:var(--red) !important; border-color:var(--red) !important; }
+  .scope-ex-list { border-color:color-mix(in srgb, var(--red) 35%, var(--border)); }
+  .scope-ex-list .scope-item { border-left:2px solid var(--red); }
+  .scope-ex-list .scope-item .host { color:var(--red); }
 
   /* ── Issues tab (Burp-style) ── */
   nav button .badge { display:none; margin-left:6px; min-width:16px; padding:0 5px; border-radius:9px;
     background:var(--red); color:#fff; font-size:10.5px; font-weight:700; line-height:16px; text-align:center; }
   nav button .badge.show { display:inline-block; }
   #pane-issues.active { display:flex; flex-direction:column; overflow:hidden; }
-  .iss-toolbar { display:flex; align-items:center; gap:14px; padding:8px 14px; border-bottom:1px solid var(--border);
+  .iss-toolbar { display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:14px; padding:8px var(--gutter); border-bottom:1px solid var(--border);
     background:var(--panel); flex-shrink:0; font-size:12px; color:var(--muted); }
   .iss-toolbar b { color:var(--fg); }
   .iss-toolbar .spacer { flex:1; }
@@ -1333,9 +2116,9 @@ _PAGE = r"""<!doctype html>
   .iss-ghost-btn { font:inherit; font-size:12px; color:var(--fg); background:var(--bg);
     border:1px solid var(--border); border-radius:6px; padding:4px 9px; cursor:pointer; white-space:nowrap; }
   .iss-ghost-btn:hover { border-color:var(--accent); color:var(--accent); }
-  .iss-ghost-menu { position:absolute; right:0; top:calc(100% + 6px); z-index:40; min-width:190px; display:none;
+  .iss-ghost-menu { position:fixed; z-index:1000; min-width:190px; display:none;
     background:var(--panel); border:1px solid var(--border); border-radius:9px; padding:6px;
-    box-shadow:0 14px 34px rgba(0,0,0,.4); max-height:60vh; overflow:auto; }
+    box-shadow:var(--elev-2); max-height:60vh; overflow:auto; }
   .iss-ghost-menu.open { display:block; }
   .ghost-menu-item { display:block; width:100%; text-align:left; font:inherit; font-size:12.5px; color:var(--fg);
     background:transparent; border:0; border-radius:5px; padding:6px 9px; cursor:pointer; white-space:nowrap; }
@@ -1358,7 +2141,7 @@ _PAGE = r"""<!doctype html>
   .splitter-y::after { left:calc(50% - 15px); top:calc(50% - 1.5px); height:3px; width:30px; }
   .splitter:hover::after, .splitter:focus-visible::after { background:#08131a; opacity:1; }
   table.iss { width:100%; border-collapse:collapse; font-size:12.5px; }
-  table.iss thead th { position:sticky; top:0; background:var(--panel); text-align:left; padding:7px 10px;
+  table.iss thead th { position:sticky; top:0; z-index:3; background:var(--panel); text-align:left; padding:7px 10px;
     border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap; color:var(--muted); font-weight:600; }
   table.iss thead th:hover { color:var(--fg); }
   table.iss thead th .arrow { color:var(--accent); }
@@ -1412,8 +2195,8 @@ _PAGE = r"""<!doctype html>
     border:1px solid var(--border); border-radius:6px; padding:5px 12px; cursor:pointer; }
   .iss-detail .detail-actions .btn:hover { border-color:var(--accent); color:var(--accent); }
   /* Issue right-click menu (severity / highlight / delete) */
-  .iss-ctx { position:fixed; z-index:70; display:none; background:var(--panel); border:1px solid var(--border);
-    border-radius:8px; padding:6px; min-width:190px; box-shadow:0 10px 30px rgba(0,0,0,.4); font-size:12.5px; }
+  .iss-ctx { position:fixed; z-index:1000; display:none; background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; padding:6px; min-width:190px; box-shadow:var(--elev-2); font-size:12.5px; }
   .iss-ctx .lbl { color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; padding:5px 8px 3px; }
   .iss-ctx .opts { display:flex; flex-wrap:wrap; gap:4px; padding:0 6px 6px; }
   .iss-ctx .opts button { font:inherit; font-size:11px; padding:3px 8px; border-radius:4px; border:1px solid var(--border);
@@ -1444,7 +2227,7 @@ _PAGE = r"""<!doctype html>
   .rep-tab .x { color:var(--muted); font-size:14px; line-height:1; padding:0 2px; border-radius:3px; }
   .rep-tab .x:hover { color:var(--red); background:var(--panel); }
   .rep-tab.add { color:var(--accent); font-size:15px; padding:6px 10px; }
-  .rep-toolbar { flex-shrink:0; display:flex; align-items:center; gap:10px; padding:10px;
+  .rep-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:10px; padding:10px var(--gutter);
     background:var(--bg); border-bottom:1px solid var(--border); }
   #rep-target { flex:1; min-width:180px; font:inherit; font-size:13px; color:var(--fg);
     background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
@@ -1456,13 +2239,13 @@ _PAGE = r"""<!doctype html>
   .rep-status .ok { color:var(--green); } .rep-status .bad { color:var(--red); }
   .rep-status .dim { color:var(--muted); }
   .rep-split { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
-  .rep-col { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
+  .rep-col, .http-col { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
   .rep-colhdr { flex-shrink:0; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
     color:var(--muted); padding:7px 12px; background:var(--panel); border-bottom:1px solid var(--border); }
   /* Display tokens for HTTP syntax highlighting. They default to the app's
      theme colors (so they adapt to light/dark), and the settings menu overrides
      them per-user via inline vars on #pane-repeater. */
-  #pane-repeater {
+  #pane-repeater, #pane-network, #pane-http {
     --rep-font: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
     --rep-font-size: 13px;
     --rep-line: 1.6;
@@ -1475,6 +2258,9 @@ _PAGE = r"""<!doctype html>
     --tok-xml-tag: var(--blue);    --tok-xml-attr: var(--accent); --tok-xml-str: var(--green);
     --tok-xml-ent: var(--yellow);  --tok-comment: var(--muted);
     --tok-kw: var(--accent);
+    /* Semantic layer: parameter names, modifiable values, and sensitive/decodable
+       blobs (encoded values, cookies, tokens) — the things a tester reads for. */
+    --tok-param: var(--blue);      --tok-val: var(--orange);     --tok-sensitive: var(--violet);
   }
   /* Shared type ramp for the request backdrop, the response, and the (invisible-
      text) textarea, so the caret lands exactly on the highlighted glyphs. */
@@ -1482,9 +2268,14 @@ _PAGE = r"""<!doctype html>
     font-family: var(--rep-font); font-size: var(--rep-font-size); line-height: var(--rep-line);
     tab-size: 2; -moz-tab-size: 2; }
   .rep-editwrap { position:relative; flex:1; min-height:0; }
+  /* Wrap long lines so a big request stays readable without horizontal scroll.
+     The backdrop (.rep-hl) and the textarea (.rep-input) share these rules
+     verbatim — identical font, width, padding, and wrapping — so the colored
+     layer stays glyph-aligned under the caret even as lines wrap. */
   .rep-hl, .rep-input {
     position:absolute; inset:0; margin:0; border:0; padding:12px 14px; box-sizing:border-box;
-    white-space:pre; overflow:auto; }
+    white-space:pre-wrap; overflow-wrap:break-word; word-break:break-word;
+    overflow-x:hidden; overflow-y:auto; }
   /* The textarea stays on top (z-index:1) and receives all editing, so the
      backdrop keeps pointer-events:auto — that lets elementsFromPoint() find the
      colored spans under the cursor for HTTP Tips. */
@@ -1518,19 +2309,58 @@ _PAGE = r"""<!doctype html>
   .rep-code .tok-xml-ent   { color:var(--tok-xml-ent); font-weight:600; }
   .rep-code .tok-comment   { color:var(--tok-comment); font-style:italic; }
   .rep-code .tok-kw        { color:var(--tok-kw); font-weight:600; }
-  /* When Tips are on, faintly underline the tokens you can hover for help. */
-  .rep-split.tips-on .rep-code [data-tip] { text-decoration: underline dotted;
-    text-decoration-color: rgba(127,127,127,.55); text-underline-offset: 3px; }
+  /* ── Semantic token layer ──
+     Only color / background / (monospace-safe) weight are used — never padding
+     or borders — so the request backdrop stays glyph-aligned under the textarea. */
+  .rep-code .tok-param     { color:var(--tok-param); font-weight:600; }
+  .rep-code .tok-val       { color:var(--tok-val); }
+  .rep-code .tok-sensitive { color:var(--tok-sensitive); font-weight:600; }
+  /* Modifiable values and sensitive blobs get a highlighter chip ON THE REQUEST
+     SIDE — that's what you edit, so make it unmissable. The response side keeps
+     the colors but not the chip (you read it, you don't tamper with it). */
+  #rep-request-hl .tok-val       { background:color-mix(in srgb, var(--tok-val) 18%, transparent); border-radius:2px; }
+  #rep-request-hl .tok-sensitive { background:color-mix(in srgb, var(--tok-sensitive) 20%, transparent); border-radius:2px; }
+  /* A faint always-on chip for sensitive blobs on the response side too, so
+     cookies / tokens / encoded values still catch the eye when reading a reply. */
+  .rep-code .tok-sensitive { background:color-mix(in srgb, var(--tok-sensitive) 10%, transparent); border-radius:2px; }
+  /* When Tips are on, faintly underline the tokens you can hover for help. The
+     rule is zone-agnostic (`.tips-on` is toggled on each registered tip zone —
+     the Repeater split and the Network results pane), so any module can opt in. */
+  .tips-on [data-tip] { text-decoration: underline dotted;
+    text-decoration-color: rgba(127,127,127,.55); text-underline-offset: 3px; cursor: help; }
+
+  /* ── Auto-decode panel ──
+     A bounded strip below the split that lists every cookie, token, and encoded
+     value in the current request/response with its decoded form — no hovering. */
+  #rep-decoded { flex-shrink:0; max-height:40%; overflow:auto; border-top:1px solid var(--border);
+    background:var(--panel); padding:8px 12px 12px; }
+  #rep-decoded .dec-hdr { font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--muted); margin:2px 0 8px; }
+  #rep-decoded .dec-empty { font-size:12.5px; color:var(--muted); padding:6px 0; }
+  .dec-row { display:grid; grid-template-columns:auto auto 1fr; align-items:baseline; gap:8px;
+    padding:6px 0; border-top:1px solid var(--border); }
+  .dec-row:first-of-type { border-top:0; }
+  .dec-src { font-size:10px; font-weight:700; letter-spacing:.04em; padding:1px 6px; border-radius:4px;
+    color:var(--bg); align-self:center; }
+  .dec-src.dec-req { background:var(--blue); } .dec-src.dec-resp { background:var(--accent); }
+  .dec-label { font-family:var(--rep-font); font-size:12.5px; font-weight:600; color:var(--tok-param);
+    white-space:nowrap; }
+  .dec-fw { font-size:10.5px; padding:1px 6px; border-radius:4px; background:color-mix(in srgb, var(--violet) 18%, transparent);
+    color:var(--violet); white-space:nowrap; align-self:center; }
+  .dec-fw.enc { background:color-mix(in srgb, var(--red) 16%, transparent); color:var(--red); }
+  .dec-val { grid-column:1 / -1; font-family:var(--rep-font); font-size:12.5px; color:var(--fg);
+    white-space:pre-wrap; word-break:break-word; margin-top:2px; }
+  .dec-val .dec-mono { color:var(--tok-sensitive); }
 
   /* ── AutoRepeater (Intruder-style) ── */
   #pane-autorepeater.active { display:flex; flex-direction:column; overflow:hidden; }
-  .ar-toolbar { flex-shrink:0; display:flex; align-items:center; gap:8px; padding:10px;
+  .ar-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter);
     background:var(--bg); border-bottom:1px solid var(--border); }
   #ar-target { flex:1; min-width:160px; font:inherit; font-size:13px; color:var(--fg);
     background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
   #ar-attack { font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
     border:1px solid var(--border); border-radius:6px; padding:7px 8px; }
-  .ar-toolbar .btn2 { font:inherit; font-size:12.5px; color:var(--fg); background:var(--panel);
+  .ar-toolbar .btn2 { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
     border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
   .ar-toolbar .btn2:hover { border-color:var(--accent); }
   .ar-progress { font-size:12px; color:var(--muted); white-space:nowrap; }
@@ -1576,7 +2406,7 @@ _PAGE = r"""<!doctype html>
   .ar-results { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
   .ar-table-wrap { flex:1.4; min-width:0; overflow:auto; background:var(--bg); position:relative; }
   .ar-table { width:100%; border-collapse:collapse; font-size:12px; }
-  .ar-table thead th { position:sticky; top:0; z-index:1; text-align:left; padding:7px 10px; background:var(--panel);
+  .ar-table thead th { position:sticky; top:0; z-index:3; text-align:left; padding:7px 10px; background:var(--panel);
     border-bottom:1px solid var(--border); color:var(--muted); font-weight:600; cursor:pointer; white-space:nowrap; }
   .ar-table thead th:hover { color:var(--fg); }
   .ar-table thead th.sorted::after { content:" ▾"; color:var(--accent); }
@@ -1600,9 +2430,9 @@ _PAGE = r"""<!doctype html>
   .rep-gear { font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
     border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
   .rep-gear:hover { border-color:var(--accent); color:var(--accent); }
-  .rep-pop { position:absolute; right:0; top:calc(100% + 6px); z-index:40; width:288px;
+  .rep-pop { position:fixed; z-index:1000; width:288px;
     background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px 14px;
-    box-shadow:0 14px 34px rgba(0,0,0,.4); display:none; }
+    box-shadow:var(--elev-2); display:none; }
   .rep-pop.open { display:block; }
   .rep-pop h4 { margin:2px 0 9px; font-size:10.5px; letter-spacing:.07em; text-transform:uppercase;
     color:var(--muted); }
@@ -1621,23 +2451,867 @@ _PAGE = r"""<!doctype html>
     background:none; border:0; cursor:pointer; padding:0; }
   .rep-reset:hover { text-decoration:underline; }
   /* HTTP Tips: on/off toggle + hover bubble */
-  .rep-tipbtn { font:inherit; font-size:13px; color:var(--muted); background:var(--panel);
-    border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer;
-    white-space:nowrap; }
-  .rep-tipbtn:hover { color:var(--fg); }
+  .rep-tipbtn { font:inherit; font-size:13px; color:var(--muted); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 11px; cursor:pointer;
+    white-space:nowrap; box-shadow:var(--bevel);
+    transition:color var(--dur-1) var(--ease-standard), border-color var(--dur-1) var(--ease-standard), background var(--dur-1) var(--ease-standard); }
+  .rep-tipbtn:hover { color:var(--fg); border-color:var(--edge); }
   .rep-tipbtn.on { color:#08131a; background:var(--accent); border-color:var(--accent); font-weight:600; }
   .rep-split.tips-on .rep-input, .rep-split.tips-on .rep-resp { cursor:help; }
-  #rep-tip { position:fixed; z-index:80; display:none; max-width:340px; pointer-events:none;
+  #rep-tip { position:fixed; z-index:1100; display:none; max-width:340px; pointer-events:none;
     background:var(--panel); border:1px solid var(--border); border-radius:9px; padding:9px 11px;
-    box-shadow:0 12px 34px rgba(0,0,0,.45); font-size:12.5px; line-height:1.5; }
+    box-shadow:var(--elev-2); font-size:12.5px; line-height:1.5; }
   #rep-tip .tip-title { font-weight:700; color:var(--accent); margin-bottom:3px; font-size:12.5px; }
   #rep-tip .tip-desc { color:var(--fg); white-space:pre-wrap; word-break:break-word; }
   #rep-tip .tip-sec { margin-top:6px; padding-top:6px; border-top:1px solid var(--border);
     color:var(--yellow); font-size:12px; white-space:pre-wrap; word-break:break-word; }
+
+  /* ── Network (Zenmap-style nmap) ── */
+  #pane-network.active { display:flex; flex-direction:column; overflow:hidden; }
+  .net-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter);
+    background:var(--bg); border-bottom:1px solid var(--border); }
+  #net-target { flex:1; min-width:180px; font:inherit; font-size:13px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  #net-profile { font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:7px 8px; max-width:230px; }
+  .net-toolbar button { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 12px; cursor:pointer; }
+  .net-toolbar button.run { color:#08131a; background:var(--accent); border:0; font-weight:600; }
+  .net-toolbar button:disabled { opacity:.5; cursor:default; }
+  .net-toolbar .spacer { flex:1; }
+  .net-toolbar button.sweep:not(.run):not(.stop) { color:var(--accent); background:var(--surface-2);
+    border:1px solid var(--edge); font-weight:600; box-shadow:var(--bevel), 0 1px 8px -4px var(--glow); }
+  .net-toolbar button.sweep:not(.run):not(.stop):hover { border-color:var(--accent);
+    background:color-mix(in srgb, var(--accent) 14%, var(--surface-2)); box-shadow:var(--bevel), 0 2px 12px -4px var(--glow); }
+  .net-cap { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:5px; white-space:nowrap; }
+  .net-cmdrow { flex-shrink:0; display:flex; align-items:center; gap:8px; padding:6px var(--gutter);
+    background:var(--panel); border-bottom:1px solid var(--border); font-size:12.5px; }
+  .net-cmdlabel { color:var(--muted); font-family:ui-monospace,Menlo,monospace; }
+  #net-args { flex:1; min-width:120px; font-family:ui-monospace,Menlo,monospace; font-size:12.5px;
+    color:var(--fg); background:var(--bg); border:1px solid var(--border); border-radius:5px; padding:5px 8px; }
+  .net-tpreview { color:var(--muted); font-family:ui-monospace,Menlo,monospace; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; max-width:40%; }
+  .net-body { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
+  .net-left { width:240px; flex-shrink:0; display:flex; flex-direction:column; background:var(--bg); overflow:auto; }
+  .net-right { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
+  .net-colhdr { flex-shrink:0; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--muted); padding:7px 12px; background:var(--panel); border-bottom:1px solid var(--border); }
+  .net-hostlist, .net-history { padding:4px 0; }
+  .net-hostsearch { margin:5px 8px; padding:5px 7px; font:inherit; font-size:12px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:5px; }
+  .net-hostsearch:focus { outline:1px solid var(--accent); }
+  #nt-topology { overflow:auto; padding:10px; }
+  .net-topo svg { display:block; }
+  .net-topo .edge { stroke:var(--border); stroke-width:1.5; fill:none; }
+  .net-topo .node { fill:var(--muted); } .net-topo .node.target { fill:var(--accent); }
+  .net-topo .node.root { fill:var(--fg); }
+  .net-topo text { fill:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+  .net-topo text.meta { fill:var(--muted); }
+  /* ── HTTP module (capture-browser history + site map) ── */
+  #pane-http.active { display:flex; flex-direction:column; overflow:hidden; }
+  .http-search { flex:0 1 220px !important; min-width:120px; }
+  .http-filterbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:6px; gap:8px; padding:5px var(--gutter);
+    font-size:12px; color:var(--muted); background:var(--panel); border-bottom:1px solid var(--border); }
+  .http-filterbar b { color:var(--fg); font-weight:600; }
+  .http-filterbar .x { cursor:pointer; color:var(--accent); }
+  .http-main { flex:1; min-width:0; display:flex; flex-direction:column; min-height:0; }
+  /* ── Site map module — compartmentalized, collapsible, color-coded tree ── */
+  #pane-sitemap.active { display:flex; flex-direction:column; overflow:hidden; }
+  .sm-filter { flex:0 1 200px !important; min-width:110px; }
+  /* Color/glyph legend so the encoding explains itself */
+  .sm-legend { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:5px 12px;
+    font-size:11px; color:var(--muted); background:var(--panel); border-bottom:1px solid var(--border); }
+  .sm-leg { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; }
+  .sm-leg i { width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .sm-legsep { width:1px; height:12px; background:var(--border); }
+  .sm-tree { flex:1; overflow:auto; padding:10px 12px; font-family:ui-monospace,Menlo,monospace;
+    font-size:12.5px; background:var(--bg); }
+  /* Host compartment: a titled card whose whole subtree collapses as a unit */
+  .sm-host { border:1px solid var(--border); border-radius:10px; margin:0 0 10px; overflow:hidden;
+    background:var(--panel); box-shadow:0 1px 0 color-mix(in srgb, var(--accent) 10%, transparent);
+    animation:sm-pop .18s ease both; }
+  .sm-host-hd { display:flex; align-items:center; gap:8px; padding:8px 11px; cursor:pointer;
+    background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 9%, var(--panel)), var(--panel));
+    border-bottom:1px solid var(--border); user-select:none; }
+  .sm-host.collapsed > .sm-host-hd { border-bottom-color:transparent; }
+  .sm-host-name { font-weight:700; color:var(--accent); letter-spacing:.01em; cursor:pointer; }
+  .sm-host-hd:hover .sm-host-name { text-shadow:0 0 12px var(--glow); }
+  .sm-host:not(.collapsed) > .sm-host-hd .sm-tw { transform:rotate(90deg); }
+  .sm-host-hd:hover .sm-tw { border-left-color:var(--accent); }
+  .sm-host-hd .sm-dot { background:var(--muted); }
+  .sm-host-hd.sig1 .sm-dot { background:var(--green); }
+  .sm-host-hd.sig2 .sm-dot { background:var(--blue); }
+  .sm-host-hd.sig3 .sm-dot { background:var(--yellow); }
+  .sm-host-hd.sig4 .sm-dot { background:var(--orange); box-shadow:0 0 7px color-mix(in srgb,var(--orange) 60%,transparent); }
+  .sm-host-hd.sig5 .sm-dot { background:var(--red); box-shadow:0 0 7px color-mix(in srgb,var(--red) 60%,transparent); }
+  .sm-host-kids, .sm-kids { display:grid; grid-template-rows:1fr;
+    transition:grid-template-rows .18s cubic-bezier(.4,0,.2,1); }
+  .sm-host.collapsed > .sm-host-kids, .sm-node.collapsed > .sm-kids { grid-template-rows:0fr; }
+  .sm-kids-inner { overflow:hidden; min-height:0; }
+  .sm-host-body { padding:5px 6px 7px; }
+  /* Tree node + its indent guide (continuous vertical rule down each nesting level) */
+  .sm-node { position:relative; }
+  .sm-node .sm-node { margin-left:15px; border-left:1px solid var(--border); }
+  .sm-node .sm-node:hover { border-left-color:color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  /* A row: twisty · sig dot · label · badges · spacer · count */
+  .sm-row { display:flex; align-items:center; gap:7px; padding:3px 9px 3px 6px; cursor:pointer;
+    border-radius:7px; white-space:nowrap; transition:background .12s ease; }
+  .sm-row:hover { background:color-mix(in srgb, var(--accent) 13%, transparent); }
+  .sm-row.sel { background:color-mix(in srgb, var(--accent) 20%, transparent);
+    box-shadow:inset 2px 0 0 var(--accent); }
+  .sm-row.sig5 { background:color-mix(in srgb, var(--red) 9%, transparent); }
+  .sm-row.sig4 { background:color-mix(in srgb, var(--orange) 9%, transparent); }
+  .sm-row.sig5:hover { background:color-mix(in srgb, var(--red) 16%, transparent); }
+  .sm-row.sig4:hover { background:color-mix(in srgb, var(--orange) 16%, transparent); }
+  /* Twisty: right-pointing triangle, rotates down when the node is open */
+  .sm-tw { width:0; height:0; flex-shrink:0; border-top:4px solid transparent;
+    border-bottom:4px solid transparent; border-left:5px solid var(--muted);
+    transition:transform .16s ease; margin-right:1px; }
+  .sm-node:not(.collapsed) > .sm-row .sm-tw { transform:rotate(90deg); }
+  .sm-row:hover .sm-tw { border-left-color:var(--accent); }
+  .sm-tw.leaf { border-left-color:transparent; }   /* leaf: keep the alignment, draw nothing */
+  /* Significance dot — the primary status color code */
+  .sm-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; background:var(--muted); position:relative; }
+  /* "worse inside" badge for a folder-endpoint whose subtree is more significant */
+  .sm-dwarn { position:absolute; top:-3px; right:-3px; width:6px; height:6px; border-radius:50%;
+    border:1.5px solid var(--bg); box-sizing:content-box; }
+  .sm-dwarn.w2 { background:var(--blue); } .sm-dwarn.w3 { background:var(--yellow); }
+  .sm-dwarn.w4 { background:var(--orange); } .sm-dwarn.w5 { background:var(--red); }
+  .sm-row.sig1 .sm-dot { background:var(--green); }
+  .sm-row.sig2 .sm-dot { background:var(--blue); }
+  .sm-row.sig3 .sm-dot { background:var(--yellow); }
+  .sm-row.sig4 .sm-dot { background:var(--orange); box-shadow:0 0 7px color-mix(in srgb,var(--orange) 60%,transparent); }
+  .sm-row.sig5 .sm-dot { background:var(--red); box-shadow:0 0 7px color-mix(in srgb,var(--red) 60%,transparent); }
+  .sm-seg { color:var(--fg); overflow:hidden; text-overflow:ellipsis; }
+  .sm-row.dir > .sm-seg { font-weight:600; }
+  .sm-row.sig5 > .sm-seg, .sm-row.sig4 > .sm-seg { font-weight:600; }
+  /* Status pill, method chips, kind tag, query marker */
+  .sm-pill { font-size:10px; padding:0 5px; border-radius:4px; border:1px solid var(--border);
+    color:var(--muted); font-variant-numeric:tabular-nums; }
+  .sm-row.sig1 .sm-pill { color:var(--green); border-color:color-mix(in srgb,var(--green) 40%,transparent); }
+  .sm-row.sig2 .sm-pill { color:var(--blue); border-color:color-mix(in srgb,var(--blue) 40%,transparent); }
+  .sm-row.sig3 .sm-pill { color:var(--yellow); border-color:color-mix(in srgb,var(--yellow) 40%,transparent); }
+  .sm-row.sig4 .sm-pill { color:var(--orange); border-color:color-mix(in srgb,var(--orange) 45%,transparent); }
+  .sm-row.sig5 .sm-pill { color:var(--red); border-color:color-mix(in srgb,var(--red) 45%,transparent); }
+  .sm-m { font-size:9.5px; letter-spacing:.04em; padding:0 4px; border-radius:3px; background:var(--bg);
+    color:var(--muted); border:1px solid var(--border); }
+  .sm-m.w { color:var(--violet); border-color:color-mix(in srgb,var(--violet) 45%,transparent); }
+  .sm-kind { font-size:9.5px; letter-spacing:.03em; padding:0 4px; border-radius:3px; color:var(--muted);
+    border:1px solid transparent; background:color-mix(in srgb,var(--muted) 14%,transparent); }
+  .sm-kind.api { color:var(--violet); background:color-mix(in srgb,var(--violet) 15%,transparent); }
+  .sm-kind.doc { color:var(--accent); background:color-mix(in srgb,var(--accent) 15%,transparent); }
+  .sm-kind.script { color:var(--blue); background:color-mix(in srgb,var(--blue) 15%,transparent); }
+  .sm-q { color:var(--yellow); font-weight:700; }
+  .sm-scope { width:6px; height:6px; border-radius:50%; background:var(--accent); flex-shrink:0;
+    box-shadow:0 0 6px var(--glow); }
+  .sm-count { margin-left:auto; color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums;
+    padding-left:8px; }
+  .sm-hidden { display:none !important; }
+  @keyframes sm-pop { from { opacity:0; transform:translateY(-5px); } }
+  /* Flat facet-view endpoint rows (Group by Type/Method/Status) + group count hint */
+  .sm-ep-host { color:var(--muted); }
+  .sm-ep-host::after { content:""; }
+  .sm-row .sm-ep-host + .sm-seg { color:var(--fg); }
+  .sm-ghint { color:var(--muted); font-size:10.5px; font-variant-numeric:tabular-nums; margin-left:2px; }
+  /* Filters button + active-count badge */
+  .sm-filt-btn { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:7px; padding:4px 10px; cursor:pointer; display:inline-flex; align-items:center; gap:4px; }
+  .sm-filt-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .sm-filt-badge { display:none; min-width:15px; height:15px; padding:0 4px; border-radius:8px; font-size:10px; font-weight:700;
+    line-height:15px; text-align:center; color:var(--bg); background:var(--accent); }
+  .sm-filt-badge.on { display:inline-block; }
+  /* Filter & arrange popover */
+  .sm-pan { position:fixed; z-index:1000; display:none; width:min(360px,92vw); max-height:74vh; overflow:auto;
+    background:var(--panel); border:1px solid var(--border); border-radius:11px; box-shadow:var(--elev-2);
+    font-size:12.5px; }
+  .sm-pan.open { display:block; animation:bx-menu-pop .15s ease; transform-origin:top left; }
+  .sm-pan-hd { display:flex; align-items:center; justify-content:space-between; padding:10px 12px; font-weight:700;
+    border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--panel); z-index:1; }
+  .sm-pan-reset { font:inherit; font-size:11.5px; color:var(--muted); background:transparent; border:1px solid var(--border);
+    border-radius:6px; padding:2px 8px; cursor:pointer; }
+  .sm-pan-reset:hover { color:var(--accent); border-color:var(--accent); }
+  .sm-pan-body { padding:4px 12px 12px; }
+  .sm-sec { padding:9px 0; border-bottom:1px solid color-mix(in srgb,var(--border) 60%,transparent); }
+  .sm-sec:last-child { border-bottom:0; }
+  .sm-sec-h { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
+  .sm-sec-l { font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  .sm-allnone { margin-left:auto; display:inline-flex; gap:2px; }
+  .sm-allnone button { font:inherit; font-size:10.5px; color:var(--accent); background:transparent; border:0; cursor:pointer; padding:0 3px; }
+  .sm-allnone button:hover { text-decoration:underline; }
+  .sm-pan-q { width:14px; height:14px; flex-shrink:0; border-radius:50%; border:1px solid var(--border); color:var(--muted);
+    font-size:9.5px; font-weight:700; line-height:12px; text-align:center; cursor:help; }
+  .sm-pan-q:hover { border-color:var(--accent); color:var(--accent); }
+  .sm-chips { display:flex; flex-wrap:wrap; gap:5px; }
+  .sm-fchip { font:inherit; font-size:11.5px; color:var(--muted); background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:3px 9px; cursor:pointer; transition:all .12s ease; }
+  .sm-fchip:hover { border-color:var(--accent); color:var(--fg); }
+  .sm-fchip.on { color:var(--bg); background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .sm-togs { display:flex; flex-direction:column; gap:6px; }
+  .sm-ftog { display:flex; align-items:center; gap:7px; cursor:pointer; color:var(--fg); }
+  .sm-ftog input { accent-color:var(--accent); }
+  .sm-fld { display:flex; align-items:center; gap:8px; margin:6px 0; }
+  .sm-fld-l { flex:0 0 78px; color:var(--muted); font-size:11.5px; }
+  .sm-fin { flex:1; min-width:0; font:inherit; font-size:12px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:4px 8px; font-family:ui-monospace,Menlo,monospace; }
+  .sm-fin:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 25%,transparent); }
+  .sm-fin-sz { flex:0 1 72px; }
+  .sm-fld-dash { color:var(--muted); }
+  .sm-segs { display:flex; flex-wrap:wrap; gap:4px; }
+  .sm-seg-b { font:inherit; font-size:11.5px; color:var(--muted); background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:3px 10px; cursor:pointer; transition:all .12s ease; }
+  .sm-seg-b:hover { border-color:var(--accent); color:var(--fg); }
+  .sm-seg-b.on { color:var(--bg); background:var(--accent); border-color:var(--accent); font-weight:600; }
+  /* Format-instruction tooltip (always-on; richer than a native title) */
+  .sm-hint { position:fixed; z-index:1100; display:none; max-width:320px; pointer-events:none;
+    background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:8px 10px;
+    box-shadow:var(--elev-2); line-height:1.5; }
+  .sm-hint-t { font-weight:700; color:var(--accent); font-size:12px; margin-bottom:3px; }
+  .sm-hint-b { color:var(--fg); font-size:12px; white-space:pre-wrap; word-break:break-word; }
+  .sm-hint-ex { margin-top:6px; padding:5px 7px; border-radius:5px; background:var(--bg); color:var(--muted);
+    font-family:ui-monospace,Menlo,monospace; font-size:11px; white-space:pre-wrap; word-break:break-word; }
+  /* Right-click context menu (route a request to another module) */
+  .ctxmenu { position:fixed; z-index:1000; min-width:190px; padding:4px;
+    background:var(--panel); border:1px solid var(--border); border-radius:6px;
+    box-shadow:0 8px 28px rgba(0,0,0,.4); font-size:12.5px; }
+  .ctxmenu button { display:block; width:100%; text-align:left; background:transparent;
+    border:0; color:var(--fg); padding:6px 10px; border-radius:4px; cursor:pointer; font:inherit; }
+  .ctxmenu button:hover { background:color-mix(in srgb, var(--accent) 18%, transparent); }
+  .ctxmenu .sep { height:1px; background:var(--border); margin:4px 2px; }
+  /* Embedded capture browser (live screencast) */
+  #pane-browser.active { display:flex; flex-direction:column; overflow:hidden; }
+  #br-url { flex:1; min-width:140px; }
+  .br-screen-wrap { flex:1; min-height:0; overflow:auto; position:relative; outline:none;
+    background:#0b0f14; display:flex; align-items:flex-start; justify-content:center; }
+  .br-screen { max-width:100%; height:auto; display:block; background:#fff; cursor:default; }
+  .br-screen-hint { position:absolute; top:38%; left:50%; transform:translate(-50%,-50%);
+    max-width:380px; text-align:center; color:var(--muted); font-size:13px; line-height:1.55; }
+  .http-list { flex:1 1 55%; min-height:0; overflow:auto; }
+  .http-detail { flex:1 1 45%; min-height:0; display:flex; flex-direction:column;
+    border-top:1px solid var(--border); }
+  .http-reqresp { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
+  .http-pane { flex:1; min-width:0; margin:0; overflow:auto; background:var(--bg);
+    padding:7px 11px; white-space:pre-wrap; word-break:break-word; }
+  .http-intercept-bar { display:flex; align-items:center; gap:10px; padding:5px 10px;
+    background:color-mix(in srgb, var(--yellow) 12%, transparent);
+    border-bottom:1px solid var(--border); font-size:12px; }
+  .http-held-label { color:var(--yellow); font-family:ui-monospace,Menlo,monospace; }
+  tr.http-row { cursor:pointer; } tr.http-row:hover { background:var(--panel); }
+  tr.http-row.active { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  tr.http-row.oos td { opacity:.5; }
+  tr.http-row td.st-2 { color:var(--green); } tr.http-row td.st-3 { color:var(--blue); }
+  tr.http-row td.st-4 { color:var(--yellow); } tr.http-row td.st-5 { color:var(--red); }
+  /* ── HTTP module overhaul: body split, detail bar, sprucing ── */
+  .http-body { flex:1; min-height:0; display:flex; flex-direction:column; }
+  #pane-http .http-detail { border-top:0; }
+  .http-detailbar { flex-shrink:0; display:flex; align-items:center; gap:8px; padding:5px 10px;
+    background:var(--panel); border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+  .http-db-label { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+  #http-decoded.rep-decoded { flex-shrink:0; max-height:34%; }
+  /* List: method chip, colored status pill, type tag, scope dot (sitemap color language) */
+  #http-list table { width:100%; border-collapse:collapse; }
+  #pane-http .http-m { display:inline-block; font-size:9.5px; letter-spacing:.04em; padding:0 5px;
+    border-radius:3px; background:var(--bg); color:var(--muted); border:1px solid var(--border); vertical-align:middle; }
+  #pane-http .http-m.w { color:var(--violet); border-color:color-mix(in srgb,var(--violet) 45%,transparent); }
+  #http-list .http-pill { font-variant-numeric:tabular-nums; font-weight:600; }
+  #http-list .http-pill.s1 { color:var(--green); } #http-list .http-pill.s2 { color:var(--blue); }
+  #http-list .http-pill.s3 { color:var(--yellow); } #http-list .http-pill.s4 { color:var(--orange); }
+  #http-list .http-pill.s5 { color:var(--red); }
+  #http-list .http-type { font-size:10px; color:var(--muted); }
+  #http-list .http-type.api { color:var(--violet); } #http-list .http-type.doc { color:var(--accent); }
+  #http-list .http-type.script { color:var(--blue); }
+  #http-list .http-scope { display:inline-block; width:6px; height:6px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 6px var(--glow); }
+  #http-list thead th { position:sticky; top:0; z-index:1; background:var(--panel); cursor:pointer;
+    user-select:none; white-space:nowrap; border-bottom:1px solid var(--border); }
+  #http-list thead th:hover { color:var(--accent); }
+  /* browser-history-style selection: checkbox column + sticky selection bar */
+  #http-list th.http-ck, #http-list td.http-ck { width:34px; text-align:center; cursor:default; padding:0 4px; }
+  #http-list th.http-ck:hover { color:inherit; }
+  #http-list input[type=checkbox] { accent-color:var(--accent); cursor:pointer; vertical-align:middle; margin:0; }
+  .http-selbar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:10px; padding:6px var(--gutter);
+    background:color-mix(in srgb, var(--accent) 13%, var(--panel)); border-bottom:1px solid var(--edge);
+    font-size:12.5px; box-shadow:var(--bevel); }
+  .http-selbar.empty { display:none; }
+  .http-selbar button { font:inherit; font-size:12px; height:28px; padding:0 11px; border-radius:6px; cursor:pointer;
+    color:var(--fg); background:var(--surface-2); border:1px solid var(--border); box-shadow:var(--bevel); }
+  .http-selbar button:hover { border-color:var(--edge); }
+  .http-selbar .http-sel-del { color:var(--red); border-color:color-mix(in srgb, var(--red) 40%, var(--border)); }
+  .http-selbar .http-sel-del { margin-left:auto; }
+  tr.http-row.hl-red { box-shadow:inset 4px 0 0 #ff5f57; }
+  tr.http-row.hl-orange { box-shadow:inset 4px 0 0 #ff9f43; }
+  tr.http-row.hl-yellow { box-shadow:inset 4px 0 0 #f5c451; }
+  tr.http-row.hl-green { box-shadow:inset 4px 0 0 #57d98a; }
+  tr.http-row.hl-blue { box-shadow:inset 4px 0 0 #5aa9ff; }
+  #http-list td.http-note, #http-list th.http-note-h { color:var(--muted); font-size:11.5px;
+    max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .http-findbar { flex-shrink:0; display:flex; align-items:center; gap:7px; padding:6px var(--gutter);
+    background:var(--panel); border-bottom:1px solid var(--border); box-shadow:var(--bevel); }
+  .http-findbar input { flex:0 1 280px; height:28px; font:inherit; font-size:12.5px; color:var(--fg);
+    background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0 9px; }
+  .http-findbar button { height:28px; width:30px; font:inherit; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; cursor:pointer; box-shadow:var(--bevel); }
+  .http-findbar button:hover { border-color:var(--edge); }
+  .http-findbar #http-find-close { margin-left:auto; }
+  mark.bx-find { background:color-mix(in srgb, var(--yellow) 55%, transparent); color:inherit; border-radius:2px; }
+  mark.bx-find.cur { background:var(--accent); color:#08131a; }
+  #http-list thead th.sorted::after { content:" ▾"; color:var(--accent); }
+  #http-list thead th.sorted.asc::after { content:" ▴"; }
+  tr.http-row.sel { background:color-mix(in srgb, var(--accent) 18%, transparent); box-shadow:inset 2px 0 0 var(--accent); }
+  /* Group-by: full-width header rows inside the one table (keeps columns aligned) */
+  tr.http-grp-row > td { background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 11%, var(--panel)), var(--panel));
+    border-top:1px solid var(--border); border-bottom:1px solid var(--border);
+    padding:6px 11px; cursor:pointer; user-select:none; }
+  tr.http-grp-row .http-grp-nm { font-weight:700; color:var(--accent); letter-spacing:.02em; }
+  tr.http-grp-row .http-grp-ct { color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; margin-left:9px; }
+  tr.http-grp-row .http-grp-tw { display:inline-block; width:0; height:0; vertical-align:middle; margin-right:8px;
+    border-top:4px solid transparent; border-bottom:4px solid transparent; border-left:5px solid var(--muted);
+    transition:transform .16s ease; transform:rotate(90deg); }
+  tr.http-grp-row.collapsed .http-grp-tw { transform:none; }
+  .net-hostrow, .net-histrow { padding:6px 12px; font-size:12.5px; cursor:pointer;
+    border-left:3px solid transparent; }
+  .net-hostrow:hover, .net-histrow:hover { background:var(--panel); }
+  .net-hostrow.active, .net-histrow.active { background:var(--panel); border-left-color:var(--accent); }
+  .net-hostrow .st-up { color:var(--green); } .net-hostrow .st-down { color:var(--muted); }
+  .net-histrow .meta { color:var(--muted); font-size:11px; }
+  .net-rtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--panel);
+    border-bottom:1px solid var(--border); }
+  .net-rtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent;
+    border:0; border-bottom:2px solid transparent; padding:6px 10px; cursor:pointer; }
+  .net-rtabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .net-rbody { flex:1; min-height:0; position:relative; }
+  .nt-pane { position:absolute; inset:0; display:none; overflow:auto; padding:10px 12px; }
+  .nt-pane.active { display:block; }
+  #nt-output { white-space:pre-wrap; word-break:break-word; margin:0; font-size:12.5px; color:var(--fg); }
+  table.net-ports { width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.net-ports th, table.net-ports td { text-align:left; padding:4px 10px;
+    border-bottom:1px solid var(--border); vertical-align:top; }
+  table.net-ports th { color:var(--muted); font-weight:600; font-size:11px;
+    text-transform:uppercase; letter-spacing:.04em; }
+  .net-pstate-open { color:var(--green); font-weight:600; }
+  .net-pstate-closed { color:var(--muted); } .net-pstate-filtered { color:var(--yellow); }
+  .net-empty { color:var(--muted); font-size:12.5px; padding:10px 2px; }
+  .net-dsec { margin:0 0 14px; } .net-dsec h4 { margin:0 0 4px; font-size:12px; color:var(--accent); }
+  .net-dsec pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--fg); }
+  .pk-placeholder { padding:24px; color:var(--muted); font-size:13px; }
+
+  /* ── Packets (Wireshark-style + scapy) ── */
+  #pane-packets.active { display:flex; flex-direction:column; overflow:hidden; }
+  .pk-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter);
+    background:var(--bg); border-bottom:1px solid var(--border); }
+  .pk-toolbar select, .pk-toolbar input { font:inherit; font-size:13px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 8px; }
+  #pk-filter { flex:1; min-width:140px; font-family:ui-monospace,Menlo,monospace; font-size:12.5px; }
+  #pk-capture { max-width:220px; }
+  .pk-toolbar button { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 12px; cursor:pointer; }
+  .pk-toolbar button.run { color:#08131a; background:var(--accent); border:0; font-weight:600; }
+  .pk-toolbar button:disabled { opacity:.5; cursor:default; }
+  .pk-toolbar .spacer { flex:1; } .pk-vsep { width:1px; align-self:stretch; background:var(--border); }
+  .pk-subtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--panel);
+    border-bottom:1px solid var(--border); }
+  .pk-subtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent;
+    border:0; border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
+  .pk-subtabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .pk-body { flex:1; min-height:0; position:relative; }
+  .pk-pane { position:absolute; inset:0; display:none; flex-direction:column; overflow:hidden; }
+  .pk-pane.active { display:flex; }
+  .pk-list { flex:1 1 55%; min-height:0; overflow:auto; }
+  table.pk-tbl { width:100%; border-collapse:collapse; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  table.pk-tbl th, table.pk-tbl td { text-align:left; padding:3px 8px; border-bottom:1px solid var(--border);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  table.pk-tbl th { position:sticky; top:0; z-index:3; background:var(--panel); color:var(--muted); font-weight:600;
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; z-index:1; }
+  table.pk-tbl td.pk-info { max-width:0; width:40%; }
+  tr.pk-row { cursor:pointer; } tr.pk-row:hover { background:var(--panel); }
+  tr.pk-row.active { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  tr.pk-row.proto-TCP td.pk-proto { color:var(--blue); }
+  tr.pk-row.proto-UDP td.pk-proto { color:var(--violet); }
+  tr.pk-row.proto-DNS td.pk-proto { color:var(--green); }
+  tr.pk-row.proto-ICMP td.pk-proto, tr.pk-row.proto-ARP td.pk-proto { color:var(--yellow); }
+  tr.pk-row.proto-TLS td.pk-proto { color:var(--orange); }
+  .pk-detailwrap { flex:1 1 45%; min-height:0; display:flex; gap:1px; background:var(--border);
+    border-top:1px solid var(--border); }
+  .pk-tree { flex:1; min-width:0; overflow:auto; background:var(--bg); padding:6px 10px;
+    font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .pk-hex { flex:1; min-width:0; overflow:auto; margin:0; background:var(--bg); padding:6px 10px;
+    font-size:11.5px; white-space:pre; color:var(--muted); }
+  .pk-tree details { margin:0 0 2px; } .pk-tree summary { cursor:pointer; color:var(--accent); font-weight:600; }
+  .pk-tree .pk-field { padding-left:16px; } .pk-tree .pk-fname { color:var(--blue); }
+  .pk-tree .pk-fval { color:var(--fg); }
+  .pk-craftrow { display:flex; align-items:center; gap:8px; padding:8px 12px; flex-wrap:wrap; }
+  .pk-craftrow input[type=text] { flex:1; min-width:200px; font-family:ui-monospace,Menlo,monospace;
+    font-size:12.5px; color:var(--fg); background:var(--bg); border:1px solid var(--border);
+    border-radius:5px; padding:6px 8px; }
+  .pk-craftrow select { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:5px; padding:4px 6px; }
+  .pk-craftrow label { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:4px; }
+  .pk-craftrow button { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
+  .pk-craftrow button.run { color:#08131a; background:var(--accent); border:0; font-weight:600; }
+  .pk-preset { font-size:12px !important; }
+  .pk-craft-out { flex:1; overflow:auto; padding:0 12px 12px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .pk-con-note { padding:8px 12px; font-size:12px; color:var(--yellow);
+    background:color-mix(in srgb, var(--yellow) 10%, transparent); border-bottom:1px solid var(--border); }
+  .pk-con-out { flex:1; overflow:auto; margin:0; padding:8px 12px; white-space:pre-wrap;
+    word-break:break-word; font-size:12px; color:var(--fg); }
+  .pk-con-out .pk-con-cmd { color:var(--accent); }
+  /* Crafter — guided recipes */
+  #pk-crafter { overflow:auto; }
+  #pk-crafter .pk-craft-out { flex:0 0 auto; overflow:visible; }  /* the whole pane scrolls, not just the output */
+  .pk-recipebar { border-bottom:1px solid var(--border); }
+  #pk-recipe { flex:1; min-width:220px; font:inherit; font-size:12.5px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:5px 7px; }
+  .pk-linkbtn { font:inherit; font-size:12px; color:var(--accent); background:transparent;
+    border:0; cursor:pointer; padding:4px 2px; }
+  .pk-linkbtn:hover { text-decoration:underline; }
+  .pk-recipe-desc { padding:8px 12px 2px; font-size:12.5px; color:var(--muted); line-height:1.5; }
+  .pk-fields { padding:6px 12px 2px; display:flex; flex-direction:column; gap:8px; }
+  .pk-field-row { display:flex; align-items:flex-start; gap:10px; }
+  .pk-field-label { flex:0 0 130px; font-size:12.5px; color:var(--fg); padding-top:6px; text-align:right; }
+  .pk-field-ctrl { flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+  .pk-field-ctrl input[type=text], .pk-field-ctrl input[type=number], .pk-field-ctrl select {
+    font-family:ui-monospace,Menlo,monospace; font-size:12.5px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:5px; padding:6px 8px; width:100%; max-width:360px; }
+  .pk-field-hint { font-size:11.5px; color:var(--muted); line-height:1.45; max-width:420px; }
+  .pk-resend-hint { max-width:none; padding:0 0 4px; }
+  .pk-flagset { display:flex; flex-wrap:wrap; gap:10px; padding-top:4px; }
+  .pk-flag { font-size:12px; color:var(--fg); display:flex; align-items:center; gap:3px; }
+  .pk-flag .pk-flagname { color:var(--muted); font-size:11px; }
+  .pk-scapy-preview { margin:6px 12px 2px; padding:7px 10px; background:var(--bg);
+    border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:5px;
+    font-size:12px; overflow:auto; }
+  .pk-scapy-preview .pk-scapy-label { color:var(--muted); text-transform:uppercase; font-size:10px;
+    letter-spacing:.06em; margin-right:6px; }
+  .pk-scapy-preview code { font-family:ui-monospace,Menlo,monospace; color:var(--accent); }
+  .pk-optionsrow { border-top:1px solid var(--border); margin-top:4px; }
+  .pk-num { width:52px; min-width:0 !important; flex:0 0 auto !important; }
+  .pk-chk { cursor:pointer; }
+  .pk-verdict { margin:6px 12px 0; padding:8px 11px; border-radius:6px; font-size:12.5px;
+    line-height:1.5; border:1px solid var(--border); }
+  .pk-v-ok { color:var(--green); background:color-mix(in srgb, var(--green) 12%, transparent);
+    border-color:color-mix(in srgb, var(--green) 40%, var(--border)); }
+  .pk-v-bad { color:var(--red); background:color-mix(in srgb, var(--red) 12%, transparent);
+    border-color:color-mix(in srgb, var(--red) 40%, var(--border)); }
+  .pk-v-warn { color:var(--yellow); background:color-mix(in srgb, var(--yellow) 12%, transparent);
+    border-color:color-mix(in srgb, var(--yellow) 40%, var(--border)); }
+  .pk-v-dim { color:var(--muted); }
+  .pk-detailbar { display:flex; align-items:center; gap:8px; padding:4px 10px;
+    border-bottom:1px solid var(--border); }
+  .pk-detailbar-hint { font-size:11px; color:var(--muted); }
+  .pk-trace td { padding:3px 10px; }
+  .pk-hopn { color:var(--muted); text-align:right; }
+  .pk-hoprtt { color:var(--muted); }
+  .pk-hoptag { color:var(--green); font-size:10px; border-radius:4px; padding:0 4px;
+    border:1px solid color-mix(in srgb, var(--green) 40%, var(--border)); }
+  .pk-cheat { margin:8px 12px 14px; border:1px solid var(--border); border-radius:6px; }
+  .pk-cheat summary { cursor:pointer; padding:7px 10px; font-size:12px; color:var(--muted); }
+  .pk-cheat-body { padding:4px 12px 10px; font-size:12px; color:var(--fg); line-height:1.55; }
+  .pk-cheat-body table { border-collapse:collapse; margin:4px 0; }
+  .pk-cheat-body td { padding:2px 10px 2px 0; vertical-align:top; }
+  .pk-cheat-body code { font-family:ui-monospace,Menlo,monospace; color:var(--accent); font-size:11.5px; }
+  .pk-cheat-body p { margin:6px 0; }
+  /* Follow-stream overlay (covers the dissection panes) */
+  .pk-stream { position:absolute; inset:0; z-index:3; display:flex; flex-direction:column;
+    background:var(--bg); border-top:1px solid var(--border); }
+  .pk-stream-head { flex-shrink:0; display:flex; align-items:center; gap:10px; padding:6px 10px;
+    border-bottom:1px solid var(--border); font-size:12px; background:var(--panel); }
+  .pk-stream-title { font-family:ui-monospace,Menlo,monospace; color:var(--fg); }
+  .pk-stream-legend { font-size:11px; color:var(--muted); }
+  .pk-stream-legend .c { color:var(--blue); } .pk-stream-legend .s { color:var(--green); }
+  .pk-stream-body { flex:1; overflow:auto; margin:0; padding:8px 12px; white-space:pre-wrap;
+    word-break:break-word; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .pk-stream-seg { display:block; } .pk-stream-seg.client { color:var(--blue); }
+  .pk-stream-seg.server { color:var(--green); }
+  /* Statistics tab */
+  .pk-stats-body { position:absolute; inset:0; overflow:auto; padding:10px 14px; }
+  .pk-stats-body h4 { margin:12px 0 4px; font-size:11px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--muted); }
+  table.pk-stats { width:100%; border-collapse:collapse; font-family:ui-monospace,Menlo,monospace;
+    font-size:12px; margin-bottom:6px; }
+  table.pk-stats th, table.pk-stats td { text-align:left; padding:3px 10px;
+    border-bottom:1px solid var(--border); white-space:nowrap; }
+  table.pk-stats th { color:var(--muted); font-weight:600; font-size:10.5px; text-transform:uppercase; }
+  table.pk-stats td.num { text-align:right; color:var(--fg); }
+
+  /* ── Nuclei (manual templated scanning) ── */
+  #pane-nuclei.active { display:flex; flex-direction:column; overflow:hidden; }
+  .nuc-flagin { flex:0 1 200px !important; min-width:120px !important; }
+  .nuc-subtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--bar-bg);
+    border-bottom:1px solid var(--edge); box-shadow:inset 0 1px 0 var(--bevel-hi), inset 0 -2px 5px -3px var(--bevel-lo); }
+  .nuc-subtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent; border:0;
+    border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
+  .nuc-subtabs button.active { color:var(--fg); border-bottom-color:var(--accent);
+    text-shadow:0 0 7px var(--glow); box-shadow:0 1px 6px -2px var(--glow); }
+  .nuc-body { flex:1; min-height:0; position:relative; }
+  .nuc-pane { position:absolute; inset:0; display:none; flex-direction:column; overflow:hidden; }
+  .nuc-pane.active { display:flex; }
+  /* severity colors (shared by findings + template browser) */
+  .nuc-sev-critical { color:var(--red); font-weight:700; }
+  .nuc-sev-high { color:var(--orange); font-weight:700; }
+  .nuc-sev-medium { color:var(--yellow); font-weight:600; }
+  .nuc-sev-low { color:var(--blue); }
+  .nuc-sev-info, .nuc-sev-unknown { color:var(--muted); }
+  /* findings table + detail */
+  .nuc-ftable td { vertical-align:top; }
+  .nuc-ftable .nuc-tid { color:var(--muted); }
+  .nuc-ftable .nuc-matched { color:var(--muted); word-break:break-all; }
+  .nuc-frow { cursor:pointer; }
+  .nuc-frow:hover { background:var(--panel); }
+  .nuc-frow.active { background:color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+  .nuc-detail { padding:10px 12px 16px; border-top:1px solid var(--border); margin-top:6px; }
+  .nuc-detail:empty { display:none; }
+  .nuc-detail h4 { margin:0 0 6px; font-size:13px; }
+  .nuc-dmeta { font-size:11.5px; color:var(--muted); margin-bottom:6px; }
+  .nuc-dmeta code { color:var(--accent); font-family:ui-monospace,Menlo,monospace; }
+  .nuc-tag { font-size:10.5px; color:var(--muted); border:1px solid var(--border); border-radius:4px; padding:0 5px; margin-right:3px; }
+  .nuc-drow { margin:7px 0; }
+  .nuc-dlbl { display:block; font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin-bottom:2px; }
+  .nuc-drow pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; }
+  .nuc-drow ul { margin:2px 0; padding-left:18px; font-size:12px; }
+  .nuc-dact { margin-top:10px; display:flex; align-items:center; gap:4px; }
+  .nuc-dact .btn { font:inherit; font-size:12px; color:var(--fg); background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:5px 10px; cursor:pointer; }
+  .nuc-dact .btn:hover { border-color:var(--accent); }
+  /* template browser */
+  .nuc-tplbar, .nuc-custom-bar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:8px var(--gutter);
+    border-bottom:1px solid var(--border); background:var(--bg); }
+  .nuc-tplbar input, .nuc-custom-bar input { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:6px 9px; }
+  .nuc-tplbar #nuc-tpl-q { flex:1; min-width:160px; font-family:ui-monospace,Menlo,monospace; }
+  .nuc-tplbody { flex:1; min-height:0; display:flex; }
+  .nuc-tpl-list { flex:0 0 42%; overflow:auto; border-right:1px solid var(--border); }
+  .nuc-tplrow { padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; }
+  .nuc-tplrow:hover { background:var(--panel); }
+  .nuc-tplrow.active { background:color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+  .nuc-tplrow-top { display:flex; align-items:center; gap:7px; font-size:12px; }
+  .nuc-tplid { color:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:11.5px; }
+  .nuc-tplsrc { font-size:10px; color:var(--muted); border:1px solid var(--border); border-radius:4px; padding:0 4px; }
+  .nuc-tpladd { margin-left:auto; font:inherit; font-size:11px; color:var(--accent); background:transparent;
+    border:1px solid color-mix(in srgb, var(--accent) 40%, var(--border)); border-radius:5px; padding:1px 7px; cursor:pointer; }
+  .nuc-tpladd:hover { background:color-mix(in srgb, var(--accent) 14%, transparent); }
+  .nuc-tplname { font-size:12px; color:var(--muted); margin-top:2px; }
+  .nuc-tpltags { font-size:11px; color:var(--muted); margin-top:3px; opacity:.85; }
+  .nuc-tpl-pv { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+  .nuc-tpl-meta { flex-shrink:0; padding:7px 12px; font-size:11.5px; color:var(--muted); border-bottom:1px solid var(--border); }
+  .nuc-tpl-meta:empty { display:none; }
+  .nuc-tpl-yaml { flex:1; margin:0; overflow:auto; padding:10px 12px; white-space:pre; font-size:12px; color:var(--fg); }
+  /* custom editor */
+  .nuc-custom-bar input { flex:1; max-width:360px; font-family:ui-monospace,Menlo,monospace; }
+  .nuc-custom-text { flex:1; min-height:0; margin:0; resize:none; border:0; outline:none; padding:12px;
+    font-family:ui-monospace,Menlo,monospace; font-size:12.5px; color:var(--fg); background:var(--bg); white-space:pre; }
+  .nuc-custom-note { flex-shrink:0; padding:8px 12px; font-size:11.5px; color:var(--muted); border-top:1px solid var(--border); }
+  /* template explorer modal */
+  .modal.nuc-exp { width:min(1120px,95vw); height:86vh; padding:0; display:flex; flex-direction:column; overflow:hidden; }
+  .nuc-exp .modal-head { padding:12px 16px; border-bottom:1px solid var(--border); align-items:center; }
+  .nuc-exp-sel { margin-left:auto; margin-right:12px; font-size:12px; color:var(--accent); }
+  .nuc-exp-bar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter); border-bottom:1px solid var(--border); }
+  .nuc-exp-bar input { flex:1; font:inherit; font-size:12.5px; font-family:ui-monospace,Menlo,monospace; color:var(--fg);
+    background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  .nuc-exp-lenses { flex-shrink:0; display:flex; flex-wrap:wrap; gap:6px; padding:10px 16px; border-bottom:1px solid var(--border); }
+  .nuc-lens { font:inherit; font-size:11.5px; color:var(--fg); background:var(--panel); border:1px solid var(--border);
+    border-radius:999px; padding:4px 11px; cursor:pointer; }
+  .nuc-lens:hover { border-color:var(--accent); color:var(--accent); }
+  .nuc-exp-body { flex:1; min-height:0; display:flex; }
+  .nuc-exp-nav { flex:0 0 46%; overflow:auto; border-right:1px solid var(--border); padding:4px 0; }
+  .nuc-noderow, .nuc-tnode { display:flex; align-items:center; gap:6px; padding:3px 10px 3px 0; cursor:pointer; font-size:12px; }
+  .nuc-noderow:hover, .nuc-tnode:hover { background:var(--panel); }
+  .nuc-tnode.active { background:color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+  .nuc-caret { width:12px; text-align:center; color:var(--muted); flex-shrink:0; }
+  .nuc-folder { color:var(--accent); font-weight:600; }
+  .nuc-count { color:var(--muted); font-size:10.5px; margin-left:4px; flex-shrink:0; }
+  .nuc-tnode .nuc-tplid { flex-shrink:0; }
+  .nuc-tnode-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); }
+  .nuc-tnode .nuc-tpladd { margin-left:6px; flex-shrink:0; }
+  .nuc-exp-pv { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+  .nuc-loading { color:var(--muted); font-size:11.5px; }
+
+  /* ── Recon (recon-ng-style OSINT) ── */
+  #pane-recon.active { display:flex; flex-direction:column; overflow:hidden; }
+  .rc-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter);
+    background:var(--bg); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  #rc-component { font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:7px 8px; max-width:260px; }
+  #rc-target { flex:1; min-width:200px; font:inherit; font-size:13px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  #rc-opts { width:200px; font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  .rc-toolbar button { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:6px; padding:7px 12px; cursor:pointer; }
+  .rc-toolbar button.run { color:#08131a; background:var(--accent); border:0; font-weight:600; }
+  .rc-toolbar button:disabled { opacity:.5; cursor:default; }
+  .rc-toolbar .spacer { flex:1; }
+  .rc-body { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
+  .rc-left { width:250px; flex-shrink:0; display:flex; flex-direction:column; background:var(--bg); }
+  .rc-right { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
+  .rc-counts { padding:8px 12px; display:flex; flex-direction:column; gap:3px; font-size:12.5px; }
+  .rc-counts .rc-crow { display:flex; justify-content:space-between; color:var(--muted); }
+  .rc-counts .rc-crow b { color:var(--fg); font-variant-numeric:tabular-nums; }
+  .rc-log { flex:1; min-height:0; overflow:auto; margin:0; padding:8px 12px; font-size:12px;
+    white-space:pre-wrap; word-break:break-word; color:var(--fg); }
+  .rc-etabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--panel);
+    border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  .rc-etabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent;
+    border:0; border-bottom:2px solid transparent; padding:6px 10px; cursor:pointer; }
+  .rc-etabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .rc-etabs button .rc-badge { margin-left:5px; font-size:10.5px; color:var(--bg);
+    background:var(--muted); border-radius:8px; padding:0 5px; }
+  .rc-etabs button.active .rc-badge { background:var(--accent); }
+  #rc-filter { flex-shrink:0; margin:8px 12px; font:inherit; font-size:12.5px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:6px 10px; }
+  .rc-table { flex:1; min-height:0; overflow:auto; padding:0 12px 12px; }
+  table.rc-tbl { width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.rc-tbl th, table.rc-tbl td { text-align:left; padding:5px 10px; border-bottom:1px solid var(--border);
+    vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+  /* Sticky header: opaque bg + a box-shadow separator (a real border detaches from a
+     sticky row under border-collapse — the "jank"), so it stays clean on scroll. */
+  table.rc-tbl th { position:sticky; top:0; z-index:3; background:var(--bg); color:var(--muted); font-weight:600;
+    font-size:11px; text-transform:uppercase; letter-spacing:.04em; border-bottom:0; box-shadow:inset 0 -1px 0 var(--border); }
+  table.rc-tbl th.rc-sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  table.rc-tbl th.rc-sortable:hover { color:var(--fg); }
+  table.rc-tbl th .rc-arr { color:var(--accent); margin-left:3px; }
+  table.rc-tbl td.rc-key { font-family:ui-monospace,Menlo,monospace; color:var(--blue); }
+  table.rc-tbl td.rc-desc { color:var(--muted); font-size:12px; line-height:1.45; min-width:220px; }
+  .rc-cdn { font-size:10.5px; padding:1px 6px; border-radius:4px; color:var(--bg);
+    background:var(--yellow); }
+  .rc-verified { color:var(--green); font-weight:600; } .rc-unver { color:var(--muted); }
+  .rc-vuln { color:var(--red); font-weight:600; }
+  .rc-acts { display:flex; gap:4px; flex-wrap:wrap; }
+  .rc-acts button { font:inherit; font-size:11px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:4px; padding:2px 7px; cursor:pointer; white-space:nowrap; }
+  .rc-acts button:hover { border-color:var(--accent); }
+  /* ── Recon: sort headers, faceted grouping panel, chips, view toggle, map ── */
+  .rc-ctl { flex-shrink:0; display:flex; align-items:center; gap:8px; padding:8px 12px; }
+  .rc-ctl #rc-filter { flex:1; margin:0; }   /* filter grows inside the control row */
+  .rc-toggle { font:inherit; font-size:12px; color:var(--muted); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; white-space:nowrap; }
+  .rc-toggle:hover { color:var(--fg); border-color:var(--accent); }
+  .rc-toggle.on { color:#08131a; background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .rc-viewtoggle { display:flex; flex-shrink:0; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .rc-viewtoggle button { font:inherit; font-size:12px; color:var(--muted); background:var(--panel);
+    border:0; padding:6px 11px; cursor:pointer; }
+  .rc-viewtoggle button.active { color:#08131a; background:var(--accent); font-weight:600; }
+  .rc-chips { flex-shrink:0; display:flex; flex-wrap:wrap; gap:6px; padding:0 12px 8px; }
+  .rc-chips:empty { display:none; }
+  .rc-chip { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--fg);
+    background:color-mix(in srgb, var(--accent) 13%, transparent); border:1px solid var(--edge);
+    border-radius:12px; padding:2px 5px 2px 9px; }
+  .rc-chip b { color:var(--accent); font-weight:600; }
+  .rc-chip button { font:inherit; font-size:11px; color:var(--muted); background:transparent; border:0;
+    cursor:pointer; padding:0 3px; line-height:1; border-radius:50%; }
+  .rc-chip button:hover { color:var(--red); }
+  .rc-viewwrap { flex:1; min-height:0; display:flex; gap:1px; background:var(--border); }
+  .rc-facets { width:234px; flex-shrink:0; overflow:auto; background:var(--bg); padding:4px 0 10px; }
+  .rc-facets[hidden] { display:none; }
+  .rc-facet { padding:4px 10px 2px; }
+  .rc-facet-h { display:flex; justify-content:space-between; font-size:10px; text-transform:uppercase;
+    letter-spacing:.06em; color:var(--muted); font-weight:700; padding:6px 2px 4px; }
+  .rc-facet-h span { font-weight:400; opacity:.7; }
+  .rc-grp { position:relative; display:flex; align-items:center; gap:8px; width:100%; text-align:left;
+    font:inherit; font-size:12px; color:var(--fg); background:transparent; border:0; border-radius:5px;
+    padding:4px 8px; cursor:pointer; overflow:hidden; }
+  .rc-grp:hover { background:var(--panel); }
+  .rc-grp-bar { position:absolute; left:0; top:2px; bottom:2px; border-radius:4px; z-index:0;
+    background:color-mix(in srgb, var(--accent) 20%, transparent); }
+  .rc-grp.active { box-shadow:inset 2px 0 0 var(--accent); }
+  .rc-grp.active .rc-grp-bar { background:color-mix(in srgb, var(--accent) 34%, transparent); }
+  .rc-grp-label { position:relative; z-index:1; flex:1; min-width:0; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; font-family:ui-monospace,Menlo,monospace; }
+  .rc-grp-n { position:relative; z-index:1; color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .rc-grp.active .rc-grp-n { color:var(--fg); }
+  .rc-more { font:inherit; font-size:11px; color:var(--accent); background:transparent; border:0;
+    cursor:pointer; padding:3px 10px; }
+  .rc-more:hover { text-decoration:underline; }
+  .rc-facets-empty { padding:16px 12px; color:var(--muted); font-size:12px; line-height:1.5; }
+  .rc-main { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
+  #rc-table[hidden], #rc-map[hidden], #rc-map-bar[hidden] { display:none; }
+  .rc-map-bar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:6px; gap:8px; padding:6px var(--gutter);
+    font-size:12px; color:var(--muted); border-bottom:1px solid var(--border); }
+  .rc-map-bar select { font:inherit; font-size:12px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:3px 8px; }
+  .rc-map { flex:1; min-height:0; overflow:auto; padding:10px; }
+  .rc-map svg { display:block; }
+  .rc-map .edge { stroke:var(--border); stroke-width:1.5; fill:none; }
+  .rc-map .gnode { fill:var(--accent); cursor:pointer; }
+  .rc-map .gnode.collapsed { fill:color-mix(in srgb, var(--accent) 50%, var(--panel)); }
+  .rc-map .lnode { fill:var(--muted); cursor:pointer; }
+  .rc-map .rnode { fill:var(--fg); }
+  .rc-map text { fill:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+  .rc-map text.meta { fill:var(--muted); }
+  /* Scrollable, fully-clickable member panel for large expanded groups (no "+N more" dead-end). */
+  .rc-map .rc-mapmore { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; height:100%;
+    box-sizing:border-box; overflow:auto; box-shadow:var(--elev-2); }
+  .rc-map .rc-mapmore-hd { position:sticky; top:0; background:var(--surface-2); color:var(--muted);
+    padding:3px 8px; font-size:10px; border-bottom:1px solid var(--border); }
+  .rc-map .rc-mapmore-item { padding:2px 8px; cursor:pointer; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; }
+  .rc-map .rc-mapmore-item:hover { background:var(--surface-2); color:var(--accent); }
+  /* Kinetic-pan cursor for any node-link map (bxMapPan). */
+  .bx-pannable { cursor:grab; }
+  .bx-pannable.bx-grabbing { cursor:grabbing; user-select:none; }
+  .bx-pannable.bx-grabbing * { cursor:grabbing !important; }
+  /* ── Metasploit "battlestation" module (all scoped to #pane-metasploit) ── */
+  #pane-metasploit.active { display:flex; flex-direction:column; overflow:hidden; }
+  #pane-metasploit { --msf-amber:#f5a623; --msf-hot:#ff5c5c; }
+  .msf-hud { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:14px; padding:10px var(--gutter);
+    background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 8%, var(--panel)), var(--panel));
+    border-bottom:1px solid var(--edge); box-shadow:inset 0 1px 0 var(--bevel-hi), 0 2px 12px -5px var(--glow); }
+  .msf-brand { display:flex; align-items:center; gap:9px; font-weight:800; letter-spacing:.2em;
+    font-size:14px; color:var(--accent); text-shadow:0 0 12px var(--glow); }
+  .msf-led { width:10px; height:10px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .msf-led.on { background:var(--green); box-shadow:0 0 10px var(--green); animation:msf-pulse 2s ease-in-out infinite; }
+  .msf-led.boot { background:var(--msf-amber); box-shadow:0 0 10px var(--msf-amber); animation:msf-pulse 1s ease-in-out infinite; }
+  .msf-led.off { background:var(--msf-hot); box-shadow:0 0 8px var(--msf-hot); }
+  @keyframes msf-pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
+  .msf-ver { font-size:11px; color:var(--muted); font-family:ui-monospace,Menlo,monospace; }
+  .msf-hud .spacer { flex:1; }
+  .msf-stat { display:flex; flex-direction:column; align-items:flex-end; gap:1px; padding:3px 12px;
+    border:1px solid var(--border); border-radius:7px; background:var(--bg); min-width:60px;
+    box-shadow:inset 0 0 14px -7px var(--glow); }
+  .msf-stat .k { font-size:9px; text-transform:uppercase; letter-spacing:.11em; color:var(--muted); }
+  .msf-stat .v { font-size:15px; font-weight:700; color:var(--accent); font-variant-numeric:tabular-nums;
+    text-shadow:0 0 8px var(--glow); line-height:1.1; }
+  .msf-stat.warn .v { color:var(--msf-amber); text-shadow:0 0 8px color-mix(in srgb,var(--msf-amber) 50%,transparent); }
+  .msf-stat.hot .v { color:var(--msf-hot); text-shadow:0 0 8px color-mix(in srgb,var(--msf-hot) 50%,transparent); }
+  .msf-body { flex:1; min-height:0; display:flex; position:relative; }
+  .msf-term { flex:1; min-height:0; display:flex; flex-direction:column; background:#050706; position:relative;
+    border:1px solid var(--edge); border-radius:9px; overflow:hidden;
+    box-shadow:0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent), 0 12px 44px -14px var(--glow); }
+  .msf-term::before { content:""; position:absolute; inset:0; pointer-events:none; z-index:2; opacity:.45;
+    background:repeating-linear-gradient(0deg, transparent 0 2px, color-mix(in srgb, var(--accent) 5%, transparent) 2px 3px); }
+  .msf-term-bar { flex-shrink:0; display:flex; align-items:center; gap:7px; padding:7px 12px; z-index:3;
+    background:#0b0f0d; border-bottom:1px solid #16201a; color:var(--muted); font-size:11px; }
+  .msf-term-bar .dot { width:9px; height:9px; border-radius:50%; }
+  .msf-term-bar .r{background:#ff5f57;} .msf-term-bar .y{background:#febc2e;} .msf-term-bar .g{background:#28c840;}
+  .msf-term-bar .title { margin-left:6px; letter-spacing:.05em; }
+  .msf-out { flex:1; min-height:0; overflow:auto; margin:0; padding:10px 14px; white-space:pre-wrap;
+    word-break:break-word; color:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:12.5px;
+    line-height:1.5; position:relative; z-index:1; }
+  .msf-inrow { flex-shrink:0; display:flex; align-items:center; gap:8px; padding:8px 12px; z-index:3;
+    border-top:1px solid #16201a; background:#070a09; }
+  .msf-prompt { color:var(--accent); font-family:ui-monospace,Menlo,monospace; font-size:12.5px;
+    white-space:nowrap; text-shadow:0 0 8px var(--glow); }
+  .msf-in { flex:1; min-width:0; font:inherit; font-family:ui-monospace,Menlo,monospace; font-size:12.5px;
+    color:var(--fg); background:transparent; border:0; outline:0; }
+  .msf-boot { position:absolute; inset:0; z-index:10; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:16px; text-align:center; padding:24px;
+    background:color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter:blur(2px); }
+  .msf-boot.hidden { display:none; }
+  .msf-boot h3 { margin:0; font-size:15px; letter-spacing:.14em; color:var(--accent); text-shadow:0 0 14px var(--glow); }
+  .msf-boot p { margin:0; color:var(--muted); font-size:12.5px; max-width:470px; line-height:1.6; }
+  .msf-boot-btn { font:inherit; font-size:13px; font-weight:700; letter-spacing:.06em; color:#08131a;
+    background:var(--accent); border:0; border-radius:8px; padding:11px 26px; cursor:pointer; box-shadow:0 0 22px -4px var(--glow); }
+  .msf-boot-btn:hover { filter:brightness(1.08); } .msf-boot-btn:disabled { opacity:.55; cursor:default; }
+  .msf-boot-err { color:var(--msf-hot); font-size:12px; max-width:470px; }
+  .msf-spinner { width:26px; height:26px; border-radius:50%; animation:msf-spin .8s linear infinite;
+    border:3px solid color-mix(in srgb,var(--accent) 22%,transparent); border-top-color:var(--accent); }
+  @keyframes msf-spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .msf-led.on,.msf-led.boot,.msf-spinner { animation:none; } }
+  /* ── Metasploit GUI: full-width workspace, browser-style back-button nav ── */
+  /* While Metasploit is active the whole suite goes full-width: hide the project rail. */
+  body.msf-focus .projects { display:none; }
+  .msf-main { flex:1; min-width:0; position:relative; }
+  .msf-backbtn { font:inherit; font-size:15px; line-height:1; color:var(--accent); background:transparent;
+    border:1px solid var(--border); border-radius:6px; padding:3px 11px; cursor:pointer; }
+  .msf-backbtn:hover { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 10%, transparent); }
+  /* Landing home — the back-button root: search + destinations + live state. */
+  .msf-home { max-width:900px; }
+  .msf-home-sec { font-size:10px; text-transform:uppercase; letter-spacing:.11em; color:var(--muted);
+    font-weight:700; margin:18px 0 8px; } .msf-home-sec:first-child { margin-top:2px; }
+  .msf-home-n { color:var(--accent); font-weight:700; }
+  .msf-home-links { display:flex; flex-wrap:wrap; gap:8px 20px; margin:4px 0 4px; }
+  .msf-home-links a { font-size:13px; color:var(--accent); cursor:pointer; }
+  .msf-home-links a:hover { text-decoration:underline; }
+  .msf-home-live { display:flex; flex-wrap:wrap; gap:26px; }
+  .msf-home-col { flex:1; min-width:240px; }
+  .msf-home-list { border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .msf-home-item { padding:7px 11px; font-size:12.5px; color:var(--muted); border-bottom:1px solid var(--border); cursor:pointer; }
+  .msf-home-item:last-child { border-bottom:0; } .msf-home-item:hover { background:var(--panel); color:var(--fg); }
+  .msf-home-item b { color:var(--accent); font-variant-numeric:tabular-nums; margin-right:4px; }
+  .msf-panel { position:absolute; inset:0; display:flex; flex-direction:column; background:var(--bg); }
+  .msf-panel.hidden { display:none; }
+  .msf-panel-bar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:12px; padding:9px var(--gutter);
+    border-bottom:1px solid var(--edge); background:color-mix(in srgb,var(--accent) 6%, var(--panel)); }
+  .msf-panel-bar .spacer { flex:1; }
+  .msf-back { font:inherit; font-size:12px; color:var(--accent); background:transparent; border:1px solid var(--border);
+    border-radius:6px; padding:5px 11px; cursor:pointer; white-space:nowrap; }
+  .msf-back:hover { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+  .msf-panel-title { font-weight:700; letter-spacing:.04em; color:var(--fg); }
+  /* No TOP padding on the scrollport, or scrolling rows peek through the gap above a sticky header
+     and it looks detached. A scroll-away ::before restores the same initial top spacing instead, so
+     the column header sits flush under the panel bar. */
+  .msf-panel-body { flex:1; min-height:0; overflow:auto; padding:0 16px 14px; }
+  .msf-panel-body::before { content:""; display:block; height:14px; }
+  .msf-chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .msf-chip { font:inherit; font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--border);
+    border-radius:14px; padding:4px 12px; cursor:pointer; }
+  .msf-chip:hover { color:var(--fg); border-color:var(--accent); }
+  .msf-chip.active { color:#08131a; background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .msf-search { width:100%; font:inherit; font-size:13px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:7px; padding:8px 11px; margin-bottom:10px; }
+  .msf-form { display:flex; flex-direction:column; gap:1px; max-width:780px; }
+  .msf-frow { display:grid; grid-template-columns:210px 1fr; gap:12px; align-items:start; padding:7px 0;
+    border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent); }
+  .msf-frow > label { font-size:12.5px; color:var(--fg); font-family:ui-monospace,Menlo,monospace; padding-top:6px; }
+  .msf-frow label .req { color:var(--msf-hot); margin-left:3px; }
+  .msf-frow .desc { font-size:10.5px; color:var(--muted); display:block; margin-top:3px; line-height:1.4; }
+  .msf-frow input[type=text], .msf-frow input[type=number], .msf-frow select {
+    width:100%; font:inherit; font-size:12.5px; color:var(--fg); background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:6px 9px; }
+  .msf-frow input[type=checkbox] { width:16px; height:16px; accent-color:var(--accent); }
+  .msf-frow input:focus, .msf-frow select:focus { outline:0; border-color:var(--accent); }
+  .msf-sec { margin:14px 0 4px; font-size:10px; text-transform:uppercase; letter-spacing:.09em; color:var(--accent);
+    font-weight:700; cursor:pointer; user-select:none; }
+  .msf-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  .msf-btn { font:inherit; font-size:12.5px; font-weight:600; color:#08131a; background:var(--accent); border:0;
+    border-radius:7px; padding:9px 18px; cursor:pointer; box-shadow:0 0 16px -5px var(--glow); }
+  .msf-btn:hover { filter:brightness(1.08); }
+  .msf-btn.ghost { color:var(--fg); background:var(--panel); border:1px solid var(--border); box-shadow:none; }
+  .msf-btn.ghost:hover { border-color:var(--accent); color:var(--accent); }
+  .msf-btn.danger { color:#fff; background:var(--msf-hot); box-shadow:none; }
+  .msf-mod-head .name { font-size:15px; font-weight:700; color:var(--fg); }
+  .msf-mod-head .full { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--accent); margin-left:8px; }
+  .msf-mod-head .rank { font-size:11px; color:var(--msf-amber); text-transform:uppercase; letter-spacing:.05em; margin-left:8px; }
+  .msf-mod-head .desc { margin-top:8px; font-size:12.5px; color:var(--muted); line-height:1.55; max-width:840px; }
+  .msf-note { padding:14px 2px; color:var(--muted); font-size:13px; line-height:1.65; } .msf-note b { color:var(--fg); }
+  .msf-out2 { margin:10px 0 0; padding:10px 12px; background:#050706; border:1px solid var(--edge); border-radius:8px;
+    color:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:12px; white-space:pre-wrap; word-break:break-word;
+    max-height:380px; overflow:auto; }
+  .msf-cmdgrp { margin:2px 0 14px; } .msf-cmdgrp h4 { margin:0 0 7px; font-size:11px; text-transform:uppercase;
+    letter-spacing:.07em; color:var(--accent); }
+  .msf-cmd-row { display:flex; flex-wrap:wrap; gap:6px; }   /* buttons wrap cleanly at any window width */
+  .msf-cmd { font:inherit; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:4px 9px; cursor:pointer; }
+  .msf-cmd:hover { border-color:var(--accent); color:var(--accent); }
+  .msf-rowlink { cursor:pointer; } .msf-rowlink:hover td { color:var(--accent); }
+
+  /* ── Spreadsheet columns, suite-wide: auto-fit width, drag-to-resize, dynamic wrap.
+     rtabEnhance() adds .rtab to EVERY data table (opt out with .rtab-skip) and sets a px
+     width on each header cell (table-layout:fixed). Kept LAST in the sheet so these win
+     source-order ties over per-module table rules, and !important beats their white-space.
+     Widths are layout px, so the global UI zoom already scales every column with the
+     window; the enhancer also re-fits un-dragged columns on window resize. ── */
+  table.rtab { table-layout:fixed; border-collapse:collapse; }
+  table.rtab th, table.rtab td { white-space:normal !important; overflow-wrap:anywhere;
+    word-break:break-word; vertical-align:top;                   /* every column wraps dynamically */
+    min-width:0 !important; max-width:none !important; }          /* our explicit col width is authoritative */
+  /* transient max-content measuring pass (auto layout, no wrapping, ignore width caps) */
+  table.rtab.rtab-measure { table-layout:auto !important; width:auto !important; }
+  table.rtab.rtab-measure th, table.rtab.rtab-measure td {
+    white-space:nowrap !important; overflow-wrap:normal !important; word-break:normal !important;
+    width:auto !important; min-width:0 !important; max-width:none !important; }
+  /* resize handle on each column's right border (th made position:relative in JS unless
+     it is already positioned, e.g. a sticky header — so stickiness is preserved) */
+  .rtab-grip { position:absolute; top:0; right:0; width:9px; height:100%; cursor:col-resize;
+    z-index:5; touch-action:none; user-select:none; }
+  .rtab-grip::after { content:""; position:absolute; top:0; right:0; width:1px; height:100%;
+    background:transparent; transition:background .12s ease; }
+  .rtab-grip:hover::after, .rtab-grip.drag::after { background:var(--accent); width:2px; }
 </style>
 </head>
 <body>
 <canvas id="mrain" aria-hidden="true"></canvas>
+<div id="scanlines" aria-hidden="true"></div>
 <header>
   <div class="menu-wrap">
     <button id="hamburger" class="hamburger" title="Menu" aria-label="Menu">☰</button>
@@ -1647,13 +3321,24 @@ _PAGE = r"""<!doctype html>
         <div id="menu-session-name" class="menu-session-name">—</div>
         <div id="menu-session-path" class="menu-session-path"></div>
       </div>
-      <button class="menu-item" id="menu-rain" data-act="rain">Matrix rain: on</button>
+      <button class="menu-item" id="menu-rain" data-act="rain">Screen FX: on</button>
       <button class="menu-item" data-act="switch">Switch session…</button>
       <button class="menu-item" data-act="new">New session…</button>
       <button class="menu-item" data-act="open">Open session folder…</button>
+      <div class="menu-sep"></div>
+      <div class="menu-scale">
+        <span class="menu-label">Text size</span>
+        <div class="menu-scale-ctl">
+          <button id="scale-dn" class="scale-btn" title="Smaller" aria-label="Decrease text size">A−</button>
+          <button id="scale-val" class="scale-val" title="Reset to 100%">100%</button>
+          <button id="scale-up" class="scale-btn" title="Larger" aria-label="Increase text size">A+</button>
+        </div>
+      </div>
     </div>
   </div>
   <span class="brand"><span class="brand-name">BEATRIX</span></span>
+  <button id="support-btn" type="button"
+    title="Support the developer — Beatrix is free; donations keep it growing">SUPPORT THE DEVELOPER</button>
   <span class="session-chip" id="session-chip" title="Active session"></span>
   <span class="proj-label" id="proj-label">—</span>
   <span class="status"><span class="dot"></span>connected</span>
@@ -1661,17 +3346,68 @@ _PAGE = r"""<!doctype html>
 <div class="body">
   <aside id="projects" class="projects"></aside>
   <div class="workspace">
-    <nav>
-      <button data-tab="dashboard" class="active">Dashboard</button>
-      <button data-tab="issues">Issues<span id="issues-badge" class="badge"></span></button>
-      <button data-tab="scope">Scope</button>
-      <button data-tab="auth">Auth</button>
-      <button data-tab="ghost">Ghost</button>
-      <button data-tab="repeater">Repeater</button>
-      <button data-tab="autorepeater">AutoRepeater</button>
+    <!-- Top nav = the Lockheed Martin Cyber Kill Chain, left→right. Each stage opens
+         a dropdown of its modules; every stage is present (Weaponization / Installation
+         / Command & Control have no modules yet — placeholders for where future ones go).
+         Setup leads as pre-engagement config. Module <button data-tab> ids are unchanged
+         so all existing tab-switching callers keep working. -->
+    <nav id="nav">
+      <div class="stage-wrap" data-stage="setup">
+        <button class="stage" aria-haspopup="true" aria-expanded="false">Setup<span class="caret"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod" data-tab="scope" role="menuitem">Scope</button>
+          <button class="mod" data-tab="auth" role="menuitem">Auth</button>
+        </div>
+      </div>
+      <div class="stage-wrap" data-stage="recon">
+        <button class="stage" aria-haspopup="true" aria-expanded="false">Reconnaissance<span class="caret"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod" data-tab="recon" role="menuitem" title="OSINT — external asset discovery (domains, subdomains, IPs, netblocks, whois)">OSINT</button>
+          <button class="mod" data-tab="network" role="menuitem">Network</button>
+          <button class="mod" data-tab="passive" role="menuitem">Passive Scan</button>
+          <button class="mod" data-tab="sitemap" role="menuitem">Site map</button>
+          <button class="mod" data-tab="packets" role="menuitem">Packets</button>
+        </div>
+      </div>
+      <div class="stage-wrap" data-stage="weaponization">
+        <button class="stage empty" aria-haspopup="true" aria-expanded="false">Weaponization<span class="caret"></span></button>
+        <div class="stage-menu" role="menu"><div class="mod-empty">No modules yet</div></div>
+      </div>
+      <div class="stage-wrap" data-stage="delivery">
+        <button class="stage" aria-haspopup="true" aria-expanded="false">Delivery<span class="caret"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod" data-tab="browser" role="menuitem">Browser</button>
+          <button class="mod" data-tab="http" role="menuitem">HTTP</button>
+        </div>
+      </div>
+      <div class="stage-wrap" data-stage="exploitation">
+        <button class="stage active" aria-haspopup="true" aria-expanded="false">Exploitation<span class="caret"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod active" data-tab="scan" role="menuitem">Active Scan</button>
+          <button class="mod" data-tab="ghost" role="menuitem">Ghost</button>
+          <button class="mod" data-tab="nuclei" role="menuitem">Nuclei</button>
+          <button class="mod" data-tab="repeater" role="menuitem">Repeater</button>
+          <button class="mod" data-tab="autorepeater" role="menuitem">AutoRepeater</button>
+          <button class="mod" data-tab="metasploit" role="menuitem">Metasploit</button>
+        </div>
+      </div>
+      <div class="stage-wrap" data-stage="installation">
+        <button class="stage empty" aria-haspopup="true" aria-expanded="false">Installation<span class="caret"></span></button>
+        <div class="stage-menu" role="menu"><div class="mod-empty">No modules yet</div></div>
+      </div>
+      <div class="stage-wrap" data-stage="c2">
+        <button class="stage empty" aria-haspopup="true" aria-expanded="false">Command &amp; Control<span class="caret"></span></button>
+        <div class="stage-menu" role="menu"><div class="mod-empty">No modules yet</div></div>
+      </div>
+      <div class="stage-wrap" data-stage="actions">
+        <button class="stage" aria-haspopup="false" title="Findings">Actions on Objectives<span id="issues-badge" class="badge"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod" data-tab="issues" role="menuitem">Issues</button>
+        </div>
+      </div>
     </nav>
     <main>
-      <section id="pane-dashboard" class="pane active">
+      <section id="pane-scan" class="pane active">
         <aside class="hunt-controls">
           <h2 style="margin-top:0;">New Scan</h2>
           <p class="sub" style="margin:0 0 12px;">Project: <b id="dash-project">—</b></p>
@@ -1689,6 +3425,16 @@ _PAGE = r"""<!doctype html>
             <a id="h-selnone">clear</a>
           </div>
           <div class="modules" id="h-modules"></div>
+
+          <label class="h-seed-chk" title="Reuse a Site map built by the Passive Scan instead of crawling the target from scratch">
+            <input type="checkbox" id="h-seedmap"> Use site map <span class="dim">(skip re-crawl)</span></label>
+          <div id="h-seed-opts" class="h-seed-opts" style="display:none;">
+            <label><input type="radio" name="h-seedmode" value="confirm" checked> Seed &amp; confirm
+              <span class="dim">— visit known URLs once (forms/tech), no BFS</span></label>
+            <label><input type="radio" name="h-seedmode" value="skip"> Fast — skip crawl
+              <span class="dim">— send known URLs straight to scanners</span></label>
+            <div id="h-seed-hint" class="dim" style="font-size:11px; margin-top:4px;"></div>
+          </div>
 
           <button id="h-run" class="run" style="width:100%; margin-top:14px;">Begin Scan</button>
           <button id="h-stop" class="stop" style="width:100%; margin-top:8px;" disabled>Stop Scan</button>
@@ -1765,7 +3511,9 @@ _PAGE = r"""<!doctype html>
           <h2>Scope</h2>
           <p class="sub">Paste URLs, domains, or IP addresses that are in scope for
             <b id="scope-project">—</b>. Testing (Ghost's tools) and reported findings (Hunt) are
-            limited to these hosts and their subdomains. Leave empty to scan only the target itself.</p>
+            limited to these hosts and their subdomains. Leave empty to scan only the target itself.
+            Anything in <b style="color:var(--red);">Out of scope</b> is strictly excluded — never crawled,
+            tested, tagged in-scope, or reported — even if it matches an in-scope entry (deny wins).</p>
           <div class="card" style="max-width:720px;">
             <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">Add to scope</label>
             <textarea id="scope-input" rows="4"
@@ -1784,6 +3532,26 @@ _PAGE = r"""<!doctype html>
               <a id="scope-clear" style="color:var(--accent); font-size:12px; cursor:pointer;">clear all</a>
             </div>
             <div id="scope-list" class="scope-list"></div>
+          </div>
+          <div class="card scope-ex-card" style="max-width:720px; margin-top:24px;">
+            <label style="display:block; font-size:12px; color:var(--red); margin-bottom:6px;">Out of scope
+              <span style="color:var(--muted);">— strictly excluded (deny wins over in-scope)</span></label>
+            <textarea id="scope-ex-input" rows="3"
+              placeholder="internal.example.com&#10;admin.example.com&#10;staging.example.com"
+              style="width:100%; font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                border:1px solid var(--border); border-radius:6px; padding:8px 10px; resize:vertical;"></textarea>
+            <div style="display:flex; gap:10px; align-items:center; margin-top:8px;">
+              <button id="scope-ex-add" class="run scope-ex-btn">+ Add to out of scope</button>
+              <span id="scope-ex-msg" style="color:var(--muted); font-size:12px;"></span>
+            </div>
+          </div>
+          <div style="max-width:720px; margin-top:14px;">
+            <div style="display:flex; align-items:center; margin-bottom:8px;">
+              <b style="font-size:13px; color:var(--red);">Out of scope (<span id="scope-ex-count">0</span>)</b>
+              <span class="spacer" style="flex:1;"></span>
+              <a id="scope-ex-clear" style="color:var(--red); font-size:12px; cursor:pointer;">clear all</a>
+            </div>
+            <div id="scope-ex-list" class="scope-list scope-ex-list"></div>
           </div>
         </div>
       </section>
@@ -1828,6 +3596,7 @@ _PAGE = r"""<!doctype html>
           <span id="rep-status" class="rep-status"></span>
           <button id="rep-tips" class="rep-tipbtn" title="Hover any header, method, status code, or tag for an explanation">Tips: off</button>
           <button id="rep-pretty" class="rep-tipbtn" title="Pretty-print the response body (JSON / XML / HTML). Headers are left as-is; toggle off for the raw bytes.">Beautify: off</button>
+          <button id="rep-decode" class="rep-tipbtn" title="List every cookie, token, and encoded value in this request/response with its decoded form">Decode: off</button>
           <div class="rep-settings">
             <button id="rep-gear" class="rep-gear" title="Font & colors">Aa ▾</button>
             <div id="rep-pop" class="rep-pop">
@@ -1857,6 +3626,470 @@ _PAGE = r"""<!doctype html>
           <div class="rep-col">
             <div class="rep-colhdr">Response</div>
             <pre id="rep-response" class="rep-resp rep-code"></pre>
+          </div>
+        </div>
+        <div id="rep-decoded" hidden></div>
+      </section>
+
+      <section id="pane-browser" class="pane">
+        <div class="net-toolbar">
+          <button id="br-back" title="Back">‹</button>
+          <button id="br-fwd" title="Forward">›</button>
+          <button id="br-reload" title="Reload">⟳</button>
+          <input id="br-url" type="text" spellcheck="false"
+            placeholder="URL to open — e.g. https://app.example.com">
+          <button id="br-go">Go</button>
+          <span class="pk-vsep"></span>
+          <button id="br-launch" class="run">Launch</button>
+          <button id="br-stop" disabled>Stop</button>
+          <label class="net-cap" title="Pause in-scope requests so you can edit/forward/drop them (Burp Intercept)">
+            <input type="checkbox" id="br-intercept"> intercept</label>
+          <span class="pk-vsep"></span>
+          <button id="br-full" title="Fill the window with the browser view">⛶ Fullscreen</button>
+          <button id="br-pop" title="Open the browser in its own window — browse here while the main window shows HTTP traffic">⇱ Pop out</button>
+          <span class="spacer"></span>
+          <span id="br-status" class="rep-status"></span>
+        </div>
+        <div id="br-intercept-bar" class="http-intercept-bar" hidden>
+          <span id="br-held-label" class="http-held-label"></span>
+          <span class="spacer"></span>
+          <button id="br-held-fwd" class="pk-linkbtn">Forward</button>
+          <button id="br-held-edit" class="pk-linkbtn">Edit…</button>
+          <button id="br-held-drop" class="pk-linkbtn">Drop</button>
+        </div>
+        <div id="br-screen-wrap" class="br-screen-wrap">
+          <canvas id="br-screen" class="br-screen" width="1280" height="800"></canvas>
+          <img id="br-screen-img" class="br-screen" alt="browser" hidden>
+          <div id="br-screen-hint" class="br-screen-hint">Click <b>Launch</b> to open the capture browser. It runs headless and streams here; click and type on the page as usual.</div>
+        </div>
+      </section>
+
+      <section id="pane-http" class="pane">
+        <div class="net-toolbar">
+          <span class="net-cmdlabel">HTTP history</span>
+          <input id="http-search" type="text" spellcheck="false" class="http-search" placeholder="quick filter — URL, note">
+          <label class="net-cap" title="Also search request &amp; response bodies, not just the URL"><input type="checkbox" id="http-bodysearch"> bodies</label>
+          <button id="http-filt-btn" class="sm-filt-btn" title="Open the filter &amp; arrange menu" aria-haspopup="true">Filters<span id="http-filt-badge" class="sm-filt-badge"></span> &#9662;</button>
+          <label class="net-cap" title="Shortcut for the Scope filter — show only in-scope traffic"><input type="checkbox" id="http-scope-only" checked> scope only</label>
+          <button id="http-clear" title="Clear the HTTP history for this project">Clear</button>
+          <span class="spacer"></span>
+          <span id="http-status" class="rep-status"></span>
+        </div>
+        <div id="http-filters" class="sm-pan" role="dialog" aria-label="HTTP filter and arrange menu"></div>
+        <div class="http-main">
+          <div id="http-filterbar" class="http-filterbar" hidden></div>
+          <div class="http-body">
+            <div id="http-list" class="http-list"><div class="net-empty">Launch the browser and start browsing — requests appear here. Right-click a request to send it to another module.</div></div>
+            <div class="http-detail">
+              <div class="http-detailbar">
+                <span class="http-db-label">Request / Response</span>
+                <span class="spacer"></span>
+                <span id="http-detail-status" class="rep-status"></span>
+                <button id="http-tips" class="rep-tipbtn" title="Hover any header, method, status code, or token for an explanation">Tips: off</button>
+                <button id="http-pretty" class="rep-tipbtn" title="Pretty-print JSON / XML / HTML bodies; headers stay raw. Toggle off for the raw bytes.">Beautify: off</button>
+                <button id="http-decode" class="rep-tipbtn" title="List every cookie, token, and encoded value in this request/response with its decoded form">Decode: off</button>
+                <div class="rep-settings"><button id="http-gear" class="rep-gear" title="Font &amp; colors">Aa &#9662;</button></div>
+              </div>
+              <div id="http-findbar" class="http-findbar" hidden>
+                <input id="http-find" type="text" spellcheck="false" placeholder="find in request / response…">
+                <span id="http-find-count" class="dim">0/0</span>
+                <button id="http-find-prev" title="Previous (Shift+Enter)">‹</button>
+                <button id="http-find-next" title="Next (Enter)">›</button>
+                <button id="http-find-close" title="Close (Esc)">✕</button>
+              </div>
+              <div class="http-reqresp">
+                <div class="http-col"><div class="rep-colhdr">Request</div><pre id="http-req" class="rep-code http-pane"></pre></div>
+                <div class="http-col"><div class="rep-colhdr" id="http-resphdr">Response</div><pre id="http-resp" class="rep-code http-pane"></pre></div>
+              </div>
+              <div id="http-decoded" class="rep-decoded" hidden></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-passive" class="pane">
+        <aside class="hunt-controls">
+          <h2 style="margin-top:0;">Passive Scan</h2>
+          <p class="sub" style="margin:0 0 12px;">Build the <b>Site map</b> from passive sources — declared files, the page's own links/JS, and zero-touch OSINT — without an aggressive crawl. Discoveries feed the Site map, which the Active Scan can then reuse.</p>
+
+          <label>Target</label>
+          <input id="pv-target" type="text" placeholder="https://example.com or example.com">
+
+          <label>Presets <span style="font-weight:400; color:var(--muted);">(quick-select)</span></label>
+          <div class="presets" id="pv-presets"></div>
+
+          <div class="mod-actions">
+            <span id="pv-selcount">0 sources</span>
+            <span class="spacer"></span>
+            <a id="pv-selall">select all</a>
+            <a id="pv-selnone">clear</a>
+          </div>
+          <div class="modules" id="pv-sources"></div>
+
+          <label>Options</label>
+          <div class="pv-opts">
+            <label class="mod-row" data-desc="Probe each discovered URL (HEAD→GET, concurrency-limited) to fill status + content-type, so the Site map is color-coded. Uncheck to stay fully passive (discovered-only, no requests).">
+              <input type="checkbox" id="pv-probe" checked> liveness probe <span class="dim">(status / type)</span></label>
+            <label class="mod-row" data-desc="Only keep URLs whose host is in the project's scope (Setup → Scope). Off = keep everything discovered.">
+              <input type="checkbox" id="pv-scope"> in-scope hosts only</label>
+          </div>
+
+          <button id="pv-run" class="run" style="width:100%; margin-top:14px;">Build Site map</button>
+          <button id="pv-stop" class="stop" style="width:100%; margin-top:8px;" disabled>Stop</button>
+          <div id="pv-msg" style="color:var(--muted); font-size:12px; margin-top:8px;"></div>
+        </aside>
+
+        <div class="hunt-terminal-wrap">
+          <div class="ghost-toolbar" style="margin-top:0;">
+            <span>events <b id="pv-count">0</b></span>
+            <span>→ Site map <b id="pv-added">0</b></span>
+            <span id="pv-autoscroll" class="autoscroll-toggle" title="click to toggle">⤓ autoscroll: on</span>
+            <span class="spacer"></span>
+            <button id="pv-viewmap" class="btn" title="Open the Site map to see what was discovered">View Site map →</button>
+          </div>
+          <div class="term-chrome">
+            <div class="term-titlebar">
+              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+              <span class="term-title">beatrix@passive</span>
+            </div>
+            <div id="pv-log" class="terminal"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-sitemap" class="pane">
+        <div class="net-toolbar">
+          <span class="net-cmdlabel">Site map</span>
+          <input id="sm-filter" class="sm-filter" type="text" spellcheck="false" placeholder="quick filter — host or path">
+          <button id="sm-filt-btn" class="sm-filt-btn" title="Open the filter &amp; arrange menu" aria-haspopup="true">Filters<span id="sm-filt-badge" class="sm-filt-badge"></span> ▾</button>
+          <label class="net-cap" title="Shortcut for the Scope filter — show only in-scope endpoints"><input type="checkbox" id="sm-scope-only" checked> scope only</label>
+          <button id="sm-expand" title="Expand every group and folder">Expand all</button>
+          <button id="sm-collapse" title="Collapse to top level">Collapse all</button>
+          <button id="sm-refresh">Refresh</button>
+          <span class="spacer"></span>
+          <span id="sm-status" class="rep-status"></span>
+        </div>
+        <div id="sm-filters" class="sm-pan" role="dialog" aria-label="Site map filter and arrange menu"></div>
+        <div id="sm-hint" class="sm-hint"></div>
+        <div class="sm-legend" id="sm-legend">
+          <span class="sm-leg"><i style="background:var(--red)"></i>5xx</span>
+          <span class="sm-leg"><i style="background:var(--orange)"></i>401/403</span>
+          <span class="sm-leg"><i style="background:var(--yellow)"></i>4xx</span>
+          <span class="sm-leg"><i style="background:var(--blue)"></i>3xx</span>
+          <span class="sm-leg"><i style="background:var(--green)"></i>2xx</span>
+          <span class="sm-legsep"></span>
+          <span class="sm-leg"><span class="sm-m w">POST</span>writes</span>
+          <span class="sm-leg"><span class="sm-kind api">api</span><span class="sm-kind doc">doc</span>kind</span>
+          <span class="sm-leg"><span class="sm-q">?</span>params</span>
+          <span class="sm-leg"><span class="sm-scope"></span>in&nbsp;scope</span>
+        </div>
+        <div id="sm-tree" class="sm-tree"><div class="net-empty">No traffic captured yet. Browse in the HTTP tab to build the map; click a node here to see its requests.</div></div>
+      </section>
+
+      <div id="ctxmenu" class="ctxmenu" hidden></div>
+
+      <section id="pane-network" class="pane">
+        <div class="net-toolbar">
+          <!-- Target: what to scan -->
+          <input id="net-target" type="text" spellcheck="false"
+            placeholder="Target — host, CIDR, or range (e.g. 127.0.0.1, scanme.nmap.org, 10.0.0.0/24)">
+          <span class="pk-vsep"></span>
+          <!-- Quick scan: pick a profile (save/delete it), then run -->
+          <select id="net-profile" title="Scan profile"></select>
+          <button id="net-profile-save" title="Save the current options as a named profile for this project">Save as…</button>
+          <button id="net-profile-del" title="Delete the selected saved profile" hidden>Delete profile</button>
+          <button id="net-scan" class="run">Scan</button>
+          <button id="net-stop" disabled>Stop</button>
+          <span class="pk-vsep"></span>
+          <!-- Full sweep: the one-button resumable sequence -->
+          <select id="net-sweep-mode" title="Full-sweep mode — Passive = non-intrusive recon; Active = also runs brute-force / exploit / DoS scripts (intrusive)">
+            <option value="passive">Passive sweep</option>
+            <option value="active">Active sweep</option>
+          </select>
+          <button id="net-sweep-go" class="sweep" title="Run the full resumable nmap sequence for maximum coverage — every recon function, one step at a time. Stop any time and resume where you left off.">Full sweep &#9656;</button>
+          <span class="pk-vsep"></span>
+          <!-- Options -->
+          <label class="net-cap" title="Also capture this scan's traffic to a pcap (needs sudo)">
+            <input type="checkbox" id="net-capture"> capture traffic</label>
+          <span class="spacer"></span>
+          <!-- Output -->
+          <select id="net-export-fmt" title="Export format for the selected scan">
+            <option value="xml">XML</option><option value="csv">CSV</option><option value="gnmap">gnmap</option></select>
+          <button id="net-export" title="Download the selected scan (or the latest) in this format">Export</button>
+          <span class="pk-vsep"></span>
+          <!-- Help / status -->
+          <button id="net-tips" class="rep-tipbtn" title="Hover any port, state, service, version, NSE script, or OS/CPE value for an explanation">Tips: off</button>
+          <span id="net-status" class="rep-status"></span>
+        </div>
+        <div class="net-cmdrow">
+          <span class="net-cmdlabel">nmap</span>
+          <input id="net-args" type="text" spellcheck="false" placeholder="options — e.g. -sV -T4 -F (edit freely)">
+          <span id="net-tpreview" class="net-tpreview"></span>
+        </div>
+        <div id="net-resume" class="h-resume" style="display:none;"></div>
+        <div class="net-body">
+          <div class="net-left">
+            <div class="net-colhdr">Hosts</div>
+            <input id="net-hostsearch" class="net-hostsearch" type="text" spellcheck="false"
+              placeholder="filter hosts — ip, name, port, service">
+            <div id="net-hostlist" class="net-hostlist"></div>
+            <div class="net-colhdr">Scan history</div>
+            <div id="net-history" class="net-history"></div>
+          </div>
+          <div class="net-right">
+            <div class="net-rtabs">
+              <button data-nt="ports" class="active">Ports / Hosts</button>
+              <button data-nt="services">Services</button>
+              <button data-nt="topology">Topology</button>
+              <button data-nt="details">Host Details</button>
+              <button data-nt="output">Nmap Output</button>
+            </div>
+            <div class="net-rbody">
+              <div id="nt-ports" class="nt-pane active"></div>
+              <div id="nt-services" class="nt-pane"></div>
+              <div id="nt-topology" class="nt-pane"></div>
+              <div id="nt-details" class="nt-pane"></div>
+              <pre id="nt-output" class="nt-pane rep-code"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-packets" class="pane">
+        <div class="pk-toolbar">
+          <select id="pk-capture" title="Stored captures for this project"></select>
+          <button id="pk-open">Open pcap…</button>
+          <input id="pk-file" type="file" accept=".pcap,.pcapng,.cap" hidden>
+          <span class="pk-vsep"></span>
+          <select id="pk-iface" title="Capture interface"></select>
+          <input id="pk-filter" type="text" spellcheck="false"
+            placeholder="display filter — tcp.port==80 && ip.addr==10.0.0.1 · !udp · dns.qname==x.com"
+            title="Viewing a capture: this is a DISPLAY filter — fields (ip.addr, tcp.port, tcp.flags, dns.qname, frame.len), == != < > >= <=, and &&/||/! with ( ).&#10;Pressing Capture: this same box is a libpcap BPF capture filter instead (e.g. 'tcp port 80'), a different syntax.">
+          <button id="pk-capstart" class="run">Capture</button>
+          <button id="pk-capstop" disabled>Stop</button>
+          <span class="pk-vsep"></span>
+          <button id="pk-export" title="Download the packets matching the current display filter as a .pcap (empty filter = the whole capture)">Export…</button>
+          <span class="spacer"></span>
+          <span id="pk-status" class="rep-status"></span>
+        </div>
+        <div class="pk-subtabs">
+          <button data-pk="viewer" class="active">Viewer</button>
+          <button data-pk="stats">Stats</button>
+          <button data-pk="crafter">Crafter</button>
+          <button data-pk="console">Console</button>
+        </div>
+        <div class="pk-body">
+          <div id="pk-viewer" class="pk-pane active">
+            <div id="pk-list" class="pk-list"><div class="net-empty">Open a pcap or start a capture.</div></div>
+            <div class="pk-detailwrap">
+              <div id="pk-detailbar" class="pk-detailbar" hidden>
+                <button id="pk-stream-btn" class="pk-linkbtn">Follow stream ↔</button>
+                <span class="pk-vsep"></span>
+                <button id="pk-resend-btn" class="pk-linkbtn">Resend / edit this packet ✎</button>
+                <span class="pk-detailbar-hint">load it into the Crafter, tweak a field, fire it back out</span>
+              </div>
+              <div id="pk-tree" class="pk-tree"></div>
+              <pre id="pk-hex" class="pk-hex rep-code"></pre>
+            </div>
+            <div id="pk-stream" class="pk-stream" hidden>
+              <div class="pk-stream-head">
+                <span id="pk-stream-title" class="pk-stream-title"></span>
+                <span class="spacer"></span>
+                <span id="pk-stream-legend" class="pk-stream-legend"></span>
+                <button id="pk-stream-close" class="pk-linkbtn">close ✕</button>
+              </div>
+              <div id="pk-stream-body" class="pk-stream-body"></div>
+            </div>
+          </div>
+          <div id="pk-stats" class="pk-pane">
+            <div id="pk-stats-body" class="pk-stats-body">
+              <div class="net-empty">Open a capture, then this tab shows its protocol, conversation and endpoint totals.</div>
+            </div>
+          </div>
+          <div id="pk-crafter" class="pk-pane">
+            <div class="pk-craftrow pk-recipebar">
+              <span class="net-cmdlabel">I want to…</span>
+              <select id="pk-recipe" title="Pick what you want to do — the fields and the packet update to match"></select>
+              <span class="spacer"></span>
+              <button id="pk-recipe-scapy" class="pk-linkbtn" title="Open this as an editable raw scapy expression so you can see and tweak it">see the scapy ✎</button>
+            </div>
+            <div id="pk-recipe-desc" class="pk-recipe-desc"></div>
+            <div id="pk-recipe-fields" class="pk-fields"></div>
+            <div id="pk-scapy-preview" class="pk-scapy-preview" hidden></div>
+            <div class="pk-craftrow pk-optionsrow">
+              <label>send on <select id="pk-craft-iface"></select></label>
+              <label>mode
+                <select id="pk-craft-mode">
+                  <option value="sr1" selected>send &amp; wait for a reply</option>
+                  <option value="send">send only (no reply)</option>
+                </select>
+              </label>
+              <label>wait <input id="pk-craft-timeout" type="number" min="1" max="30" value="3" class="pk-num"> s</label>
+              <label class="pk-chk"><input id="pk-craft-save" type="checkbox"> save to capture</label>
+              <button id="pk-craft-send" class="run">Send</button>
+              <span id="pk-craft-status" class="rep-status"></span>
+            </div>
+            <div id="pk-verdict" class="pk-verdict" hidden></div>
+            <div id="pk-craft-out" class="pk-craft-out"></div>
+            <details class="pk-cheat">
+              <summary>scapy cheat-sheet — the moves behind the recipes</summary>
+              <div class="pk-cheat-body">
+                <p><b>Build a packet by stacking layers with <code>/</code>:</b> the lower layer wraps the one after it.</p>
+                <table>
+                  <tr><td><code>IP(dst="1.2.3.4")/ICMP()</code></td><td>a ping (echo request)</td></tr>
+                  <tr><td><code>IP(dst="x")/TCP(dport=80,flags="S")</code></td><td>a lone TCP SYN</td></tr>
+                  <tr><td><code>IP(dst="x")/UDP(dport=53)/DNS(rd=1,qd=DNSQR(qname="a.com"))</code></td><td>a DNS query</td></tr>
+                  <tr><td><code>Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="x")</code></td><td>ARP who-has (layer 2)</td></tr>
+                </table>
+                <p><b>Send it:</b> <code>send()</code> = layer-3, no reply · <code>sr1()</code> = layer-3, wait for the first reply · <code>sendp()</code>/<code>srp1()</code> = the layer-2 versions (used automatically when the packet has an Ether header).</p>
+                <p><b>TCP flags</b> are letters: <code>S</code>=SYN <code>A</code>=ACK <code>F</code>=FIN <code>R</code>=RST <code>P</code>=PSH <code>U</code>=URG. A reply of <code>SA</code> means the port is open; <code>RA</code>/<code>R</code> means closed.</p>
+                <p>The <b>Console</b> tab is a full scapy REPL if you want to go further — e.g. <code>ls(TCP)</code> lists every TCP field.</p>
+              </div>
+            </details>
+          </div>
+          <div id="pk-console" class="pk-pane">
+            <div class="pk-con-note">scapy console — runs scapy Python <b>as root</b> in this
+              project's worker. For authorized, local testing.</div>
+            <pre id="pk-con-out" class="pk-con-out rep-code"></pre>
+            <div class="pk-craftrow">
+              <input id="pk-con-in" type="text" spellcheck="false" placeholder="scapy &gt;&gt;&gt; (e.g. ls(TCP) or sr1(IP(dst='127.0.0.1')/ICMP()))">
+              <button id="pk-con-run" class="run">Run</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-recon" class="pane">
+        <div class="rc-toolbar">
+          <select id="rc-component" title="OSINT component"></select>
+          <input id="rc-target" type="text" spellcheck="false"
+            placeholder="target — authorized domains / IPs / CIDRs only">
+          <input id="rc-opts" type="text" spellcheck="false"
+            placeholder="options" hidden>
+          <button id="rc-run" class="run">Run</button>
+          <button id="rc-stop" disabled>Stop</button>
+          <span class="pk-vsep"></span>
+          <!-- Full sweep: the one-button resumable maximum-coverage OSINT sequence -->
+          <select id="rc-sweep-mode" title="Full-sweep mode — Standard = zero-touch passive OSINT (CT logs, passive DNS, archives, RDAP/WHOIS, origin-IP); Aggressive = also brute-forces subdomains, attempts DNS zone transfers, and reverse-sweeps discovered netblocks">
+            <option value="standard">Standard sweep</option>
+            <option value="aggressive">Aggressive sweep</option>
+          </select>
+          <button id="rc-sweep-go" class="sweep" title="Run every practical keyless OSINT source for maximum coverage — each stage fans out over the hosts/IPs/netblocks discovered so far. Stop any time and resume where you left off.">Full sweep &#9656;</button>
+          <span class="spacer"></span>
+          <button id="rc-import" title="Import the IPs/hosts the Network (nmap) module found">⬇ nmap IPs</button>
+          <button id="rc-clear" title="Clear this project's OSINT workspace">Clear</button>
+          <span id="rc-status" class="rep-status"></span>
+        </div>
+        <div id="rc-resume" class="h-resume" style="display:none;"></div>
+        <div class="rc-body">
+          <div class="rc-left">
+            <div class="net-colhdr">Workspace</div>
+            <div id="rc-counts" class="rc-counts"></div>
+            <div class="net-colhdr">Activity</div>
+            <pre id="rc-log" class="rc-log rep-code"></pre>
+          </div>
+          <div class="rc-right">
+            <div class="rc-etabs">
+              <button data-rc="ip" class="active">IPs</button>
+              <button data-rc="subdomain">Subdomains</button>
+              <button data-rc="origin">Origins</button>
+              <button data-rc="netblock">Netblocks</button>
+              <button data-rc="contact">Contacts</button>
+              <button data-rc="domain">Domains</button>
+            </div>
+            <div class="rc-ctl">
+              <input id="rc-filter" type="text" spellcheck="false" placeholder="filter rows…">
+              <button id="rc-group-toggle" class="rc-toggle" title="Group & aggregate the current table">⊞ Group</button>
+              <div class="rc-viewtoggle">
+                <button id="rc-view-table" class="active" data-view="table">Table</button>
+                <button id="rc-view-map" data-view="map">Map</button>
+              </div>
+            </div>
+            <div id="rc-chips" class="rc-chips"></div>
+            <div class="rc-viewwrap">
+              <div id="rc-facets" class="rc-facets" hidden></div>
+              <div class="rc-main">
+                <div id="rc-map-bar" class="rc-map-bar" hidden>Group map by
+                  <select id="rc-map-field"></select><span id="rc-map-note"></span></div>
+                <div id="rc-table" class="rc-table"></div>
+                <div id="rc-map" class="rc-map" hidden></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-nuclei" class="pane">
+        <div class="net-toolbar">
+          <input id="nuc-target" type="text" spellcheck="false"
+            placeholder="Target — URL or host (e.g. https://example.com) — authorized only">
+          <input id="nuc-tags" type="text" spellcheck="false" class="nuc-flagin"
+            placeholder="tags — cve,takeover,exposure (optional)" title="nuclei -tags">
+          <input id="nuc-sev" type="text" spellcheck="false" class="nuc-flagin"
+            placeholder="severity — critical,high,…" title="nuclei -severity">
+          <button id="nuc-run" class="run">Run</button>
+          <button id="nuc-stop" disabled>Stop</button>
+          <span class="spacer"></span>
+          <span id="nuc-status" class="rep-status"></span>
+        </div>
+        <div class="net-cmdrow">
+          <input id="nuc-ids" type="text" spellcheck="false" class="nuc-flagin"
+            placeholder="template ids — e.g. http-missing-security-headers (optional)" title="nuclei -id">
+          <label class="net-cap" title="Also run templates from your writable custom dir">
+            <input type="checkbox" id="nuc-custom"> custom templates</label>
+          <span id="nuc-sel" class="net-tpreview"></span>
+        </div>
+        <div class="nuc-subtabs">
+          <button data-nuc="scan" class="active">Scan</button>
+          <button data-nuc="templates">Template browser</button>
+          <button data-nuc="custom">Custom template</button>
+        </div>
+        <div class="nuc-body">
+          <div id="nuc-scan" class="nuc-pane active">
+            <div class="net-body">
+              <div class="net-left">
+                <div class="net-colhdr">Run history</div>
+                <div id="nuc-history" class="net-history"></div>
+              </div>
+              <div class="net-right">
+                <div class="net-rtabs">
+                  <button data-nr="findings" class="active">Findings</button>
+                  <button data-nr="log">Output</button>
+                </div>
+                <div class="net-rbody">
+                  <div id="nr-findings" class="nt-pane active"></div>
+                  <pre id="nr-log" class="nt-pane rep-code"></pre>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="nuc-templates" class="nuc-pane">
+            <div class="nuc-tplbar">
+              <input id="nuc-tpl-q" type="text" spellcheck="false"
+                placeholder="search templates — id · name · path · tag (e.g. cve-2024, log4j, takeover)">
+              <input id="nuc-tpl-sev" type="text" spellcheck="false" class="nuc-flagin"
+                placeholder="severity (optional)">
+              <button id="nuc-tpl-search" class="run">Search</button>
+              <button id="nuc-tpl-browse" class="rep-tipbtn" title="Open the full template explorer — browse the repo as a folder tree by exploit type">⛶ Browse folders</button>
+              <span id="nuc-tpl-status" class="rep-status"></span>
+            </div>
+            <div class="nuc-tplbody">
+              <div id="nuc-tpl-list" class="nuc-tpl-list"><div class="net-empty">Search the on-disk template set.</div></div>
+              <div class="nuc-tpl-pv">
+                <div id="nuc-tpl-meta" class="nuc-tpl-meta"></div>
+                <pre id="nuc-tpl-yaml" class="rep-code nuc-tpl-yaml"></pre>
+              </div>
+            </div>
+          </div>
+          <div id="nuc-custom" class="nuc-pane">
+            <div class="nuc-custom-bar">
+              <input id="nuc-custom-name" type="text" spellcheck="false" placeholder="file name — e.g. my-check">
+              <button id="nuc-custom-save" class="run">Save</button>
+              <span id="nuc-custom-status" class="rep-status"></span>
+            </div>
+            <textarea id="nuc-custom-text" class="nuc-custom-text" spellcheck="false"
+              placeholder="Paste or write a nuclei YAML template here…&#10;id: my-check&#10;info:&#10;  name: My Check&#10;  severity: info&#10;  tags: custom"></textarea>
+            <div class="nuc-custom-note">Saved to your writable custom dir. Tick <b>custom templates</b> on the Scan tab to include it in a run. Authorized targets only.</div>
           </div>
         </div>
       </section>
@@ -1913,6 +4146,51 @@ _PAGE = r"""<!doctype html>
           </div>
         </div>
       </section>
+      <section id="pane-metasploit" class="pane">
+        <div class="msf-hud">
+          <span class="msf-brand"><span id="msf-led" class="msf-led off"></span>METASPLOIT</span>
+          <span id="msf-ver" class="msf-ver"></span>
+          <span class="spacer"></span>
+          <div class="msf-stat" data-msf-open="import" style="cursor:pointer" title="Recon targets (set as RHOSTS) — click to view, from anywhere"><span class="k">Targets</span><span id="msf-tgt" class="v">—</span></div>
+          <div class="msf-stat"><span class="k">Sessions</span><span id="msf-n-sessions" class="v">0</span></div>
+          <div class="msf-stat"><span class="k">Jobs</span><span id="msf-n-jobs" class="v">0</span></div>
+          <div id="msf-stat-db" class="msf-stat hot"><span class="k">Database</span><span id="msf-db" class="v">—</span></div>
+        </div>
+        <div class="msf-body">
+          <div class="msf-main">
+            <div id="msf-panel" class="msf-panel hidden">
+              <div class="msf-panel-bar">
+                <button id="msf-back-btn" class="msf-backbtn" title="Back" style="visibility:hidden">←</button>
+                <span id="msf-panel-title" class="msf-panel-title"></span>
+                <span class="spacer"></span>
+                <span id="msf-panel-tools"></span>
+              </div>
+              <div id="msf-panel-body" class="msf-panel-body"></div>
+            </div>
+            <div id="msf-console-view" class="msf-panel hidden">
+              <div class="msf-panel-bar">
+                <button id="msf-back-btn2" class="msf-backbtn" title="Back" style="visibility:hidden">←</button>
+                <span class="msf-panel-title">Console — <span id="msf-ws">—</span></span>
+              </div>
+              <div class="msf-term">
+                <pre id="msf-out" class="msf-out"></pre>
+                <div class="msf-inrow">
+                  <span id="msf-prompt" class="msf-prompt">msf &gt;</span>
+                  <input id="msf-in" class="msf-in" type="text" spellcheck="false" autocomplete="off"
+                    placeholder="command…  ·  Tab = complete  ·  up/down = history">
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="msf-boot" class="msf-boot">
+            <h3>METASPLOIT</h3>
+            <p>The Metasploit RPC engine isn't running yet. Booting loads the full framework — the
+              first run performs a one-time setup and can take a minute or two.</p>
+            <button id="msf-boot-btn" class="msf-boot-btn">Boot Metasploit</button>
+            <div id="msf-boot-status"></div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </div>
@@ -1920,6 +4198,71 @@ _PAGE = r"""<!doctype html>
 <div id="issue-ctx" class="iss-ctx"></div>
 <div id="mod-tooltip" class="mod-tooltip"></div>
 <div id="rep-tip"></div>
+<div id="nuc-explorer" class="modal-overlay">
+  <div class="modal nuc-exp">
+    <div class="modal-head">
+      <h2>Template explorer</h2>
+      <span id="nuc-exp-sel" class="nuc-exp-sel"></span>
+      <button class="modal-cancel" id="nuc-exp-close">✕</button>
+    </div>
+    <div class="nuc-exp-bar">
+      <input id="nuc-exp-q" type="text" spellcheck="false"
+        placeholder="search all templates — id · name · path · tag">
+      <button id="nuc-exp-search" class="run">Search</button>
+      <button id="nuc-exp-folders" class="rep-tipbtn">⌂ Folders</button>
+      <span id="nuc-exp-status" class="rep-status"></span>
+    </div>
+    <div class="nuc-exp-lenses" id="nuc-exp-lenses"></div>
+    <div class="nuc-exp-body">
+      <div id="nuc-exp-nav" class="nuc-exp-nav"></div>
+      <div class="nuc-exp-pv">
+        <div id="nuc-exp-meta" class="nuc-tpl-meta"></div>
+        <pre id="nuc-exp-yaml" class="rep-code nuc-tpl-yaml"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- Support the developer — donation popup (opened by the header's gold button) -->
+<div id="donate-modal" class="modal-overlay">
+  <div class="modal bx-donate-modal">
+    <div class="modal-head">
+      <h2>Support the developer</h2>
+      <button id="donate-cancel" class="modal-cancel" title="Close">✕</button>
+    </div>
+    <p class="modal-sub">Beatrix is free, and always will be. If it has earned a place in your workflow, a
+      contribution of any size directly funds its continued development — thank you.</p>
+    <div id="donate-wallets" class="bx-wallets"></div>
+    <p class="bx-donate-note">Click a QR code to enlarge it for scanning, or copy an address directly.</p>
+  </div>
+</div>
+
+<!-- Opening title card — shown over everything on every launch -->
+<div id="splash-card" class="splash-overlay">
+  <div class="splash-card">
+    <div class="splash-hero">
+      <img class="splash-logo" src="/assets/beatrix-banner.png" alt="Beatrix — The Black Mamba"
+        onerror="this.style.display='none'">
+      <p class="splash-lead">Beatrix is a complete, free master pentesting super-suite — painstakingly
+        hand-crafted, and the only toolkit of its kind. It is built, maintained, and continually refined by a
+        single developer. If Beatrix has earned a place in your workflow, please consider supporting the
+        person who makes it possible; every contribution, of any size, directly funds its continued growth
+        and refinement.</p>
+    </div>
+    <div class="splash-body">
+      <div class="splash-donate-label">Support the developer</div>
+      <div id="splash-wallets" class="bx-wallets"></div>
+      <button id="splash-exit" type="button" class="splash-exit">Thanks&nbsp;—&nbsp;now let me work&nbsp;&rarr;</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shared QR enlarge overlay (donation popup + splash) -->
+<div id="bx-qr-zoom" class="bx-qr-zoom">
+  <img id="bx-qr-zoom-img" src="" alt="Donation QR code">
+  <div id="bx-qr-zoom-label" class="bx-qr-zoom-label"></div>
+  <div class="bx-qr-zoom-dismiss">Click anywhere to close</div>
+</div>
+
 <div id="session-modal" class="modal-overlay">
   <div class="modal">
     <div class="modal-head">
@@ -1961,24 +4304,117 @@ const TAGS = { thinking:"[thinking]", system_prompt:"[system]", prompt:"[prompt]
   agent_end:"[/agent]", finding:"[finding]", verdict:"[verdict]", done:"[done]" };
 const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const $ = id => document.getElementById(id);
+// Current global UI zoom (set on <html> by BeatrixUI). getBoundingClientRect() and
+// mouse clientX/Y report VISUAL coordinates; dividing them by this maps back into the
+// zoomed element space so JS-positioned overlays land correctly at any UI scale.
+const uiZoom = () => parseFloat(document.documentElement.style.zoom) || 1;
+// Drop a menu as a fixed overlay just under its trigger — escapes any overflow:hidden /
+// scroll container so dropdowns always render cleanly in front, clamped into the viewport.
+function placeFixedUnder(menuEl, anchorEl) {
+  const z = uiZoom(), r = anchorEl.getBoundingClientRect();
+  menuEl.style.position = "fixed"; menuEl.style.right = "auto";
+  menuEl.style.top = Math.round(r.bottom / z) + "px";
+  menuEl.style.left = "0px";                                   // render, measure, then clamp
+  const mw = menuEl.offsetWidth, vw = window.innerWidth / z;
+  let left = r.left / z;
+  if (left + mw > vw) left = Math.max(6, vw - mw - 6);
+  menuEl.style.left = Math.round(left) + "px";
+}
 
-// ── Tabs: swap panes in-place, never open a new tab/port ──
+// ── Tabs: kill-chain STAGES in the bar, their MODULES in click-open dropdowns.
+//    Panes still swap in-place (never a new tab/port). Module <button data-tab>
+//    elements stay inside <nav>, so every existing `nav button[data-tab=...]` caller
+//    — programmatic .click() and .active-state checks alike — keeps working unchanged;
+//    activateTab() is just the shared body those clicks used to run inline. ──
 let authLoaded = false;
-document.querySelectorAll("nav button").forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b === btn));
-    const tab = btn.dataset.tab;
-    document.querySelectorAll(".pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + tab));
-    if (tab === "auth" && !authLoaded) {           // lazy-load the auth GUI iframe once
-      $("pane-auth").innerHTML = '<iframe src="/auth" title="Beatrix Auth"></iframe>';
-      authLoaded = true;
-    }
-    if (tab === "issues") loadIssuesFor(activeProject);   // freshen on view
-    if (tab === "repeater") loadRepeaterFor(activeProject);
-    if (tab === "autorepeater") loadAutoRepeaterFor(activeProject);
-    reclampSplitters();   // a newly-shown pane can now measure itself
-  };
+let activeTab = "scan";
+function activateTab(tab) {
+  activeTab = tab;
+  // Highlight the chosen module and the stage that contains it; scroll that stage into view.
+  document.querySelectorAll("nav .mod").forEach(m => m.classList.toggle("active", m.dataset.tab === tab));
+  document.querySelectorAll(".stage-wrap").forEach(w => {
+    const here = !!w.querySelector('.mod[data-tab="' + tab + '"]');
+    const s = w.querySelector(".stage");
+    if (s) { s.classList.toggle("active", here); if (here) s.scrollIntoView({ inline: "nearest", block: "nearest" }); }
+  });
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + tab));
+  if (tab === "auth" && !authLoaded) {           // lazy-load the auth GUI iframe once
+    $("pane-auth").innerHTML = '<iframe src="/auth" title="Beatrix Auth"></iframe>';
+    authLoaded = true;
+  }
+  if (tab === "ghost") loadGhostViewFor(activeProject);   // re-attach live run on view
+  if (tab === "scan") loadHuntViewFor(activeProject);
+  if (tab === "scope") loadScopeFor(activeProject);
+  if (tab === "issues") loadIssuesFor(activeProject);   // freshen on view
+  if (tab === "browser") loadBrowserFor(activeProject);
+  if (tab === "http") loadHttpFor(activeProject);
+  if (tab === "passive") loadPassiveFor(activeProject);
+  if (tab === "sitemap") loadSitemapFor(activeProject);
+  if (tab === "repeater") loadRepeaterFor(activeProject);
+  if (tab === "autorepeater") loadAutoRepeaterFor(activeProject);
+  if (tab === "network") loadNetworkFor(activeProject);
+  if (tab === "packets") loadPacketsFor(activeProject);
+  if (tab === "recon") loadReconFor(activeProject);
+  if (tab === "nuclei") loadNucleiFor(activeProject);
+  if (tab === "metasploit") loadMetasploitFor(activeProject);
+  document.body.classList.toggle("msf-focus", tab === "metasploit");   // full-width: hide the project rail in Metasploit
+  reclampSplitters();   // a newly-shown pane can now measure itself
+  requestAnimationFrame(rtabScan);   // and its tables can now auto-fit (needed non-zero width)
+  syncNavFades();       // the active stage was just scrolled into view → refresh the edge fades
+}
+
+// Dropdown behaviour for the stage buttons.
+function closeStageMenus() {
+  document.querySelectorAll(".stage-wrap.open").forEach(w => {
+    w.classList.remove("open");
+    const s = w.querySelector(".stage");
+    if (s && s.getAttribute("aria-expanded") === "true") s.setAttribute("aria-expanded", "false");
+  });
+}
+// The nav scrollbar is hidden (it collided with the stage dropdowns); fade whichever edge
+// still has stages scrolled off-screen so the lateral scroll stays discoverable.
+function syncNavFades() {
+  const nav = document.getElementById("nav"); if (!nav) return;
+  const ws = nav.closest(".workspace"); if (!ws) return;
+  const max = nav.scrollWidth - nav.clientWidth;
+  ws.classList.toggle("navscroll-l", nav.scrollLeft > 1);
+  ws.classList.toggle("navscroll-r", nav.scrollLeft < max - 1);
+  ws.style.setProperty("--navh", nav.offsetHeight + "px");   // overlays cover exactly the nav strip
+}
+function openStageMenu(wrap) {
+  const stage = wrap.querySelector(".stage");
+  const menu = wrap.querySelector(".stage-menu");
+  if (menu) {   // position the fixed menu directly under its stage so the bar's overflow never clips it
+    // getBoundingClientRect() reports VISUAL (zoom-scaled) coords, but the menu's own
+    // left/top get scaled by the root zoom again — so divide it back out to land the
+    // menu exactly on the button's on-screen position at any UI scale.
+    const r = stage.getBoundingClientRect();
+    const z = uiZoom();
+    menu.style.left = Math.round(r.left / z) + "px";
+    menu.style.top = Math.round(r.bottom / z) + "px";
+    menu.style.minWidth = Math.round(r.width / z) + "px";
+  }
+  wrap.classList.add("open");
+  if (stage.getAttribute("aria-expanded") === "false") stage.setAttribute("aria-expanded", "true");
+}
+document.querySelectorAll(".stage-wrap").forEach(wrap => {
+  const stage = wrap.querySelector(".stage");
+  const mods = wrap.querySelectorAll(".mod");
+  stage.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (mods.length === 1) { closeStageMenus(); activateTab(mods[0].dataset.tab); return; }   // single module → open it directly
+    const willOpen = !wrap.classList.contains("open");
+    closeStageMenus();
+    if (willOpen) openStageMenu(wrap);   // multi-module and empty stages reveal their dropdown
+  });
+  mods.forEach(m => m.addEventListener("click", (e) => { e.stopPropagation(); closeStageMenus(); activateTab(m.dataset.tab); }));
 });
+document.addEventListener("click", closeStageMenus);                                   // outside click closes
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeStageMenus(); });
+window.addEventListener("resize", closeStageMenus);                                    // a fixed menu would detach on reflow
+window.addEventListener("resize", syncNavFades);
+document.getElementById("nav").addEventListener("scroll", () => { closeStageMenus(); syncNavFades(); });  // …or when the bar scrolls laterally
+syncNavFades();                                                                        // initial state
 
 // ── Resizable panes: a draggable gutter between two flex children ──
 // One reusable splitter for every module. `axis` is "x" for side-by-side
@@ -2016,9 +4452,18 @@ function makeSplitter(container, axis, storeKey) {
     try { const v = parseFloat(localStorage.getItem("beatrix.split." + storeKey));
       if (v > 0) { px = v; first.style.flex = "0 0 " + v + "px"; } } catch (e) {}
   }
-  let drag = false;
+  // Drag: cache the zoom + container origin at pointerdown (both constant during a drag), map the
+  // VISUAL cursor delta back into layout px by dividing by the zoom (so the pane tracks the cursor
+  // 1:1 at any UI scale — without this it drifts by the zoom factor), and coalesce moves to one
+  // apply per animation frame so it never falls behind the pointer.
+  let drag = false, draf = 0, dlast = 0, dz = 1, dorigin = 0;
+  const flushDrag = () => { draf = 0; apply((dlast - dorigin) / dz); };
   g.addEventListener("pointerdown", (e) => {
     drag = true;
+    dz = uiZoom();
+    const r = container.getBoundingClientRect();
+    dorigin = horiz ? r.left : r.top;
+    dlast = horiz ? e.clientX : e.clientY;
     try { g.setPointerCapture(e.pointerId); } catch (_) {}
     document.body.style.cursor = horiz ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
@@ -2026,13 +4471,15 @@ function makeSplitter(container, axis, storeKey) {
   });
   g.addEventListener("pointermove", (e) => {
     if (!drag) return;
-    const r = container.getBoundingClientRect();
-    apply(horiz ? (e.clientX - r.left) : (e.clientY - r.top));
+    dlast = horiz ? e.clientX : e.clientY;
+    if (!draf) draf = requestAnimationFrame(flushDrag);
     e.preventDefault();
   });
   const end = (e) => {
     if (!drag) return;
     drag = false;
+    if (draf) { cancelAnimationFrame(draf); draf = 0; }
+    flushDrag();
     try { g.releasePointerCapture(e.pointerId); } catch (_) {}
     document.body.style.cursor = ""; document.body.style.userSelect = "";
     persist();
@@ -2057,11 +4504,317 @@ function makeSplitter(container, axis, storeKey) {
   _splitters.push({ reclamp });
 }
 function reclampSplitters() { for (const s of _splitters) s.reclamp(); }
+
+// Shared kinetic-pan for any node-link map (OSINT #rc-map, Network #nt-topology, and any
+// future map). Left-drag empty space to pan the web; a flick coasts with friction ("gravity").
+// Pans via the container's own scroll offsets (keeps the existing overflow:auto scrollbars) so it
+// survives the innerHTML re-renders the map renderers do — handlers live on the persistent
+// container, not the SVG. rAF-coalesced and zoom-corrected (÷uiZoom) like makeSplitter; a press
+// that lands on a node, label, or the inner scroll panel is ignored so clicks/scroll still work.
+function bxMapPan(container) {
+  if (!container || container._bxPan) return;
+  container._bxPan = true;
+  container.classList.add("bx-pannable");
+  const reduce = () => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } };
+  const INTERACTIVE = "[data-g],[data-k],a,button,input,select,textarea,.rc-mapmore";
+  let down = false, drag = false, raf = 0, dz = 1;
+  let sx = 0, sy = 0, ssl = 0, sst = 0, lx = 0, ly = 0, samples = [];
+  const stopMomentum = () => { if (container._bxMo) { cancelAnimationFrame(container._bxMo); container._bxMo = 0; } };
+  const flush = () => {
+    raf = 0;
+    container.scrollLeft = ssl - (lx - sx) / dz;
+    container.scrollTop  = sst - (ly - sy) / dz;
+    samples.push({ t: performance.now(), sl: container.scrollLeft, st: container.scrollTop });
+    if (samples.length > 6) samples.shift();
+  };
+  container.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest(INTERACTIVE)) return;        // nodes/labels/scroll-panel keep their own behaviour
+    stopMomentum();
+    down = true; drag = false; dz = uiZoom();
+    sx = lx = e.clientX; sy = ly = e.clientY;
+    ssl = container.scrollLeft; sst = container.scrollTop;
+    samples = [{ t: performance.now(), sl: ssl, st: sst }];
+  });
+  container.addEventListener("pointermove", (e) => {
+    if (!down) return;
+    lx = e.clientX; ly = e.clientY;
+    if (!drag && Math.hypot(lx - sx, ly - sy) < 4) return;   // threshold: click vs. pan
+    if (!drag) {
+      drag = true; container.classList.add("bx-grabbing");
+      try { container.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    if (!raf) raf = requestAnimationFrame(flush);
+    e.preventDefault();
+  });
+  const end = (e) => {
+    if (!down) return;
+    down = false;
+    if (raf) { cancelAnimationFrame(raf); raf = 0; flush(); }
+    container.classList.remove("bx-grabbing");
+    try { container.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (!drag || reduce()) return;
+    // Flick momentum: velocity (px/ms) over the most recent ~120 ms of scroll, glide with friction.
+    const now = performance.now();
+    let a = samples[0];
+    for (const s of samples) { if (now - s.t <= 120) { a = s; break; } }
+    const b = samples[samples.length - 1], dt = Math.max(1, b.t - a.t);
+    let vSL = (b.sl - a.sl) / dt, vST = (b.st - a.st) / dt;
+    if (Math.abs(vSL) < 0.03 && Math.abs(vST) < 0.03) return;
+    let last = now;
+    const step = (ts) => {
+      const d = Math.min(48, ts - last); last = ts;
+      container.scrollLeft += vSL * d; container.scrollTop += vST * d;
+      const decay = Math.pow(0.94, d / 16.7); vSL *= decay; vST *= decay;
+      if (Math.abs(vSL) < 0.015 && Math.abs(vST) < 0.015) { container._bxMo = 0; return; }
+      container._bxMo = requestAnimationFrame(step);
+    };
+    container._bxMo = requestAnimationFrame(step);
+  };
+  container.addEventListener("pointerup", end);
+  container.addEventListener("pointercancel", end);
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Spreadsheet columns, suite-wide. Every data <table> (except .rtab-skip) becomes
+   a fixed-layout grid whose columns:
+     • open AUTO-FIT to the longest string they contain (clamped [48,460] layout px),
+     • WRAP dynamically within their width (text reflows, the row grows),
+     • SCALE with the window — widths are layout px, so the global UI zoom already
+       shrinks/grows every column with the browser size; on top of that un-dragged
+       columns re-fit on a (debounced) window resize, and
+     • can be CLICK-DRAGGED at their right border to any width.
+   A single MutationObserver applies this to every table — however and whenever it is
+   rendered (innerHTML swaps, thead/tbody rebuilds, future modules) — so the behaviour
+   is identical everywhere. Dragged widths persist per column (localStorage); auto
+   widths are re-measured each load so they always fit the current content/scale.
+   Mirrors the pane-splitter pointer-drag idiom above. ─────────────────────────── */
+const RTAB_MIN = 48, RTAB_MAX = 460, RTAB_DRAG_MIN = 36;
+const rtabMem = Object.create(null);          // key -> { w:[px], manual:[bool] }  (session cache)
+let rtabScanPending = false, _rtabIO = null, _rtabResizeT = null, rtabDragging = false;
+
+function rtabHeaderCells(table) {              // the row whose cells define the columns
+  if (table.tHead && table.tHead.rows.length) return Array.prototype.slice.call(table.tHead.rows[0].cells);
+  const r = table.rows[0];
+  return r ? Array.prototype.slice.call(r.cells) : [];
+}
+function rtabVisible(el) { return el.clientWidth > 0 && el.getClientRects().length > 0; }
+
+// Stable identity across re-renders/sorts/polls: host id + column count + header labels
+// (arrows/grips stripped so a sort direction change does not look like a new table).
+function rtabKey(table) {
+  const host = table.closest("[id]"), base = host ? host.id : "tbl";
+  const labels = rtabHeaderCells(table).map(c => {
+    const cl = c.cloneNode(true);
+    cl.querySelectorAll(".rtab-grip, .rc-arr").forEach(e => e.remove());
+    return (cl.textContent || "").trim().slice(0, 28);
+  }).join("␟");
+  return base + "::" + rtabHeaderCells(table).length + "::" + labels;
+}
+
+// Measure each column's max-content width (layout px). getBoundingClientRect reports
+// VISUAL px under CSS zoom, so divide by uiZoom() to land in the layout px that
+// style.width uses. One synchronous reflow; restores the table untouched.
+function rtabMeasure(table) {
+  const cells = rtabHeaderCells(table);
+  if (!cells.length) return null;
+  const z = uiZoom();
+  const prevW = cells.map(c => c.style.width), prevTL = table.style.tableLayout, prevTW = table.style.width;
+  cells.forEach(c => { c.style.width = ""; });
+  table.style.width = ""; table.style.tableLayout = "auto";
+  table.classList.add("rtab-measure");
+  const out = cells.map(c => {
+    const w = c.getBoundingClientRect().width / z;
+    return Math.max(RTAB_MIN, Math.min(RTAB_MAX, Math.ceil(w) + 1));
+  });
+  table.classList.remove("rtab-measure");
+  table.style.tableLayout = prevTL; table.style.width = prevTW;
+  cells.forEach((c, i) => { c.style.width = prevW[i]; });
+  return out;
+}
+
+function rtabApply(table, w) {
+  // Fill the container: interior columns take their auto-fit/dragged px, the LAST column is left
+  // auto so it flexes out to the right wall. The far ends (left wall, right wall) are thus fixed
+  // anchors = the baseline the whole table scales between as the window/zoom changes.
+  const cells = rtabHeaderCells(table), last = cells.length - 1;
+  table.style.tableLayout = "fixed";
+  table.style.width = "100%";
+  cells.forEach((c, i) => { c.style.width = (i === last) ? "" : Math.round(w[i]) + "px"; });
+}
+
+function rtabLSKey(key) { return "beatrix.rtab." + key; }
+function rtabLoadManual(key) {
+  try { const raw = localStorage.getItem(rtabLSKey(key)); if (raw) return JSON.parse(raw) || {}; } catch (e) {}
+  return {};
+}
+function rtabSaveManual(key, idx, px) {
+  const m = rtabLoadManual(key); m[idx] = Math.round(px);
+  try { localStorage.setItem(rtabLSKey(key), JSON.stringify(m)); } catch (e) {}
+}
+function rtabClearManual(key, idx) {
+  const m = rtabLoadManual(key); delete m[idx];
+  try { localStorage.setItem(rtabLSKey(key), JSON.stringify(m)); } catch (e) {}
+}
+
+// Session widths for a key: measured auto widths with any persisted manual overrides laid on top.
+function rtabEnsureMem(table, key) {
+  const ncol = rtabHeaderCells(table).length;
+  let mem = rtabMem[key];
+  if (mem && mem.w.length === ncol) return mem;
+  const auto = rtabMeasure(table);
+  if (!auto) return null;
+  const manualMap = rtabLoadManual(key), w = auto.slice(), manual = auto.map(() => false);
+  for (const k in manualMap) { const i = +k; if (i >= 0 && i < ncol) { w[i] = manualMap[k]; manual[i] = true; } }
+  mem = { w, manual }; rtabMem[key] = mem;
+  return mem;
+}
+
+function rtabAutofitCol(table, key, i) {
+  const auto = rtabMeasure(table); if (!auto) return;
+  const mem = rtabMem[key];
+  if (mem) { mem.w[i] = auto[i]; mem.manual[i] = false; }
+  rtabClearManual(key, i);                                 // forget the stored manual width (revert to auto)
+  rtabApply(table, mem ? mem.w : auto);                    // re-apply all columns so the table reflows cleanly
+}
+function rtabAddGrips(table, key) {
+  const cells = rtabHeaderCells(table), last = cells.length - 1;
+  cells.forEach((th, i) => {
+    if (i === last) return;                                           // far-right wall is NOT draggable (mirrors the far-left wall)
+    if (getComputedStyle(th).position === "static") th.style.position = "relative";   // keep sticky th sticky
+    if (th.querySelector(".rtab-grip")) return;
+    const grip = document.createElement("div");
+    grip.className = "rtab-grip";
+    grip.title = "Drag to resize · double-click to auto-fit";
+    th.appendChild(grip);
+    grip.addEventListener("click", e => e.stopPropagation());        // a resize must never trigger the sort
+    grip.addEventListener("dblclick", e => { e.preventDefault(); e.stopPropagation(); });  // no text-select; we detect dbl ourselves
+    grip.addEventListener("pointerdown", e => {
+      e.preventDefault(); e.stopPropagation();
+      const z = uiZoom(), startX = e.clientX, startW = th.getBoundingClientRect().width / z, mem = rtabMem[key];
+      // A drag only begins once the pointer MOVES, so a plain click never marks the column
+      // manual — and two no-move presses within 350 ms auto-fit it (native dblclick is
+      // unreliable under setPointerCapture, so we detect the double-click ourselves).
+      const now = Date.now(), isDbl = grip._rtabLastDown && (now - grip._rtabLastDown) < 350;
+      grip._rtabLastDown = now;
+      let raf = 0, lastX = startX, moved = false;
+      try { grip.setPointerCapture(e.pointerId); } catch (_) {}
+      const flush = () => {
+        raf = 0;
+        const w = Math.round(Math.max(RTAB_DRAG_MIN, startW + (lastX - startX) / z));  // visual delta → layout px
+        th.style.width = w + "px"; if (mem) mem.w[i] = w;
+      };
+      const move = ev => {
+        lastX = ev.clientX;
+        if (!moved && Math.abs(lastX - startX) > 3) {                // crossed the drag threshold
+          moved = true; rtabDragging = true; grip.classList.add("drag");
+          document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
+        }
+        if (moved && !raf) raf = requestAnimationFrame(flush);
+      };
+      const up = ev => {
+        if (raf) { cancelAnimationFrame(raf); raf = 0; }
+        grip.removeEventListener("pointermove", move);
+        grip.removeEventListener("pointerup", up);
+        grip.removeEventListener("pointercancel", up);
+        try { grip.releasePointerCapture(ev.pointerId); } catch (_) {}
+        grip.classList.remove("drag");
+        document.body.style.cursor = ""; document.body.style.userSelect = "";
+        if (moved) {                                                 // finished a real drag → persist the width
+          flush();
+          const px = parseFloat(th.style.width) || startW;
+          if (mem) { mem.w[i] = px; mem.manual[i] = true; }
+          rtabSaveManual(key, i, px);
+          rtabDragging = false;
+          requestAnimationFrame(rtabScan);
+        } else if (isDbl) {                                          // double-click, no drag → auto-fit this column
+          grip._rtabLastDown = 0;
+          rtabAutofitCol(table, key, i);
+        }
+      };
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", up);
+      grip.addEventListener("pointercancel", up);
+    });
+  });
+}
+
+function rtabEnhance(table) {
+  if (!table || table.classList.contains("rtab-skip")) return;
+  if (!rtabHeaderCells(table).length) return;
+  if (!rtabVisible(table)) { rtabDeferVisible(table); return; }      // hidden pane → enhance when first shown
+  const first = rtabHeaderCells(table)[0];
+  if (table.dataset.rtab === "1" && first && first.querySelector(".rtab-grip")) return;  // already done
+  table.classList.add("rtab");
+  const key = rtabKey(table), mem = rtabEnsureMem(table, key);
+  if (!mem) return;
+  table._rtabKey = key;
+  rtabApply(table, mem.w);
+  rtabAddGrips(table, key);
+  table.dataset.rtab = "1";
+}
+
+function rtabDeferVisible(table) {
+  if (table._rtabDeferred) return;
+  table._rtabDeferred = true;
+  if (!_rtabIO) _rtabIO = new IntersectionObserver(ents => ents.forEach(en => {
+    if (en.isIntersecting) { _rtabIO.unobserve(en.target); en.target._rtabDeferred = false; rtabEnhance(en.target); }
+  }));
+  _rtabIO.observe(table);
+}
+
+function rtabScan() {
+  const t = document.querySelectorAll("table:not(.rtab-skip)");
+  for (let i = 0; i < t.length; i++) rtabEnhance(t[i]);
+}
+function rtabScanFlush() { rtabScanPending = false; rtabScan(); }
+
+function rtabOnResize() { clearTimeout(_rtabResizeT); _rtabResizeT = setTimeout(rtabRefit, 160); }
+function rtabRefit() {                                               // re-fit only the columns the user has not dragged
+  const t = document.querySelectorAll('table.rtab[data-rtab="1"]');
+  for (let i = 0; i < t.length; i++) {
+    const table = t[i];
+    if (!rtabVisible(table)) continue;
+    const mem = rtabMem[table._rtabKey]; if (!mem) continue;
+    if (rtabHeaderCells(table).length !== mem.w.length) continue;
+    const auto = rtabMeasure(table); if (!auto) continue;
+    let changed = false;
+    for (let c = 0; c < mem.w.length; c++)
+      if (!mem.manual[c] && Math.round(auto[c]) !== Math.round(mem.w[c])) { mem.w[c] = auto[c]; changed = true; }
+    if (changed) rtabApply(table, mem.w);
+  }
+}
+
+function rtabInit() {
+  const mo = new MutationObserver(muts => {
+    if (rtabScanPending || rtabDragging) return;      // never re-enhance mid-drag (a catch-up scan runs on release)
+    for (let i = 0; i < muts.length; i++) {
+      const an = muts[i].addedNodes;
+      for (let j = 0; j < an.length; j++) {
+        const n = an[j];
+        if (n.nodeType !== 1) continue;
+        const t = n.tagName;
+        if (t === "TABLE" || t === "TBODY" || t === "THEAD" || t === "TR" || t === "TH" || t === "TD"
+            || (n.firstElementChild && n.querySelector("table"))) {
+          rtabScanPending = true; requestAnimationFrame(rtabScanFlush); return;
+        }
+      }
+    }
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
+  window.addEventListener("resize", rtabOnResize);
+  rtabScan();
+}
+rtabInit();
+
 function initSplitters() {
+  makeSplitter(document.querySelector("#pane-network .net-body"), "x", "net-hosts");   // Hosts ↔ results
   makeSplitter(document.querySelector(".iss-split"), "y", "iss");        // list / advisory
   makeSplitter(document.querySelector(".rep-split"), "x", "rep");        // request / response
   makeSplitter(document.querySelector(".ar-config"), "x", "ar-config");  // template / payloads
   makeSplitter(document.querySelector(".ar-results"), "x", "ar-results");// results / detail
+  makeSplitter(document.querySelector("#pane-http .http-body"), "y", "http-ld");   // HTTP list / detail
+  makeSplitter(document.querySelector("#pane-http .http-reqresp"), "x", "http-rr");// HTTP request / response
 }
 window.addEventListener("resize", reclampSplitters);
 initSplitters();
@@ -2071,7 +4824,7 @@ initSplitters();
 // poll checks it's still current before rendering or rescheduling, so a run
 // left going in another project can never leak into (or get cut off by
 // switching away from) the one currently on screen.
-let since = 0, pollProject = null;
+let since = 0, pollProject = null, ghostPollTimer = null;
 // `autoscroll` is a UI preference, not run data — it's intentionally NOT reset
 // on project switch, matching the standalone GHOST v2 dashboard.
 let ghostTools = 0, autoscroll = true, ghostStarted = null;
@@ -2091,7 +4844,7 @@ async function poll(id) {
   let r;
   try {
     r = await (await fetch("/ghost/events?since=" + since + "&project=" + id)).json();
-  } catch (e) { setTimeout(() => poll(id), 600); return; }
+  } catch (e) { clearTimeout(ghostPollTimer); ghostPollTimer = setTimeout(() => poll(id), 600); return; }
   if (id !== pollProject) return;                // switched away while this fetch was in flight
   for (const ev of r.events) { renderEvent(ev); since = ev.seq; }
   $("g-count").textContent = since;
@@ -2100,13 +4853,14 @@ async function poll(id) {
   if (r.done) { $("g-run").disabled = false; $("g-stop").disabled = true;
     $("g-msg").textContent = "Run finished."; return; }
   $("g-run").disabled = true; $("g-stop").disabled = false;
-  setTimeout(() => poll(id), 600);
+  clearTimeout(ghostPollTimer); ghostPollTimer = setTimeout(() => poll(id), 600);
 }
 // Rebuild the Ghost pane for `id`: clear the shared log DOM, then replay that
 // project's own event history from the server (not from memory — the whole
 // point is this survives having been switched away from) and resume polling
 // if it's still running.
 async function loadGhostViewFor(id) {
+  clearTimeout(ghostPollTimer);                   // supersede any prior poll chain (idempotent reload)
   $("ghost-log").innerHTML = ""; since = 0; ghostTools = 0; ghostStarted = null;
   $("g-count").textContent = "0"; $("g-tools").textContent = "0"; $("g-elapsed").textContent = "0s";
   pollProject = id;
@@ -2169,10 +4923,10 @@ function saveGhostHtml() {
 <title>GHOST v2 — ${esc(projName)} — ${esc(target)}</title>
 <style>
   :root { --bg:#0a0f0c; --panel:#0e150f; --border:#1e2b22; --fg:#d3ddd2; --muted:#6f8175;
-    --accent:#35d07e; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; }
+    --accent:#35d07e; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; --orange:#ff9f43; }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f5f8f4; --panel:#ffffff; --border:#d7e0d5; --fg:#1c2620; --muted:#5f7167;
-      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; } }
+      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; --orange:#c25a00; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
     font:14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding:20px 24px 60px; }
@@ -2215,7 +4969,7 @@ $("g-save").onclick = saveGhostHtml;
 const HUNT_TAGS = { phase:"phase", phase_done:"✓ phase", scanner_start:"▸ scanner",
   scanner_done:"result", scanner_error:"✗ error", finding:"finding",
   verdict:"verdict", info:"ℹ info", debug:"http" };
-let hSince = 0, hPollProject = null, hFindings = 0, hAutoscroll = true, hStarted = null, hDebug = false;
+let hSince = 0, hPollProject = null, hFindings = 0, hAutoscroll = true, hStarted = null, hDebug = false, hPollTimer = null;
 let hCatalog = { modules: [], presets: [] };
 let hSelected = new Set();
 
@@ -2233,7 +4987,7 @@ async function hPoll(id) {
   if (id !== hPollProject) return;
   let r;
   try { r = await (await fetch("/hunt/events?since=" + hSince + "&project=" + id)).json(); }
-  catch (e) { setTimeout(() => hPoll(id), 600); return; }
+  catch (e) { clearTimeout(hPollTimer); hPollTimer = setTimeout(() => hPoll(id), 600); return; }
   if (id !== hPollProject) return;
   for (const ev of r.events) { renderHuntEvent(ev); hSince = ev.seq; }
   $("h-count").textContent = hSince;
@@ -2248,9 +5002,10 @@ async function hPoll(id) {
     return;
   }
   $("h-run").disabled = true; $("h-stop").disabled = false;
-  setTimeout(() => hPoll(id), 600);
+  clearTimeout(hPollTimer); hPollTimer = setTimeout(() => hPoll(id), 600);
 }
 async function loadHuntViewFor(id) {
+  clearTimeout(hPollTimer);                        // supersede any prior poll chain (idempotent reload)
   $("hunt-log").innerHTML = ""; hSince = 0; hFindings = 0; hStarted = null;
   $("h-count").textContent = "0"; $("h-findings").textContent = "0"; $("h-elapsed").textContent = "0s";
   hPollProject = id;
@@ -2314,8 +5069,8 @@ async function resumeHunt() {
 function showModTooltip(x, y, text) {
   const t = $("mod-tooltip");
   t.textContent = text;
-  t.style.left = (x + 14) + "px"; t.style.top = (y + 14) + "px";
   t.style.display = "block";
+  placeCursorTip(t, x, y);                              // bottom-right of the cursor, clear of the pointer
 }
 function hideModTooltip() { $("mod-tooltip").style.display = "none"; }
 
@@ -2407,7 +5162,7 @@ try { setHuntDebug(localStorage.getItem("beatrix.hunt.debug") === "1"); } catch 
 
 // Clear log — the explicit reset for the persisted event transcript.
 $("h-clearlog").onclick = async () => {
-  if (!confirm("Clear the saved event log for this project?")) return;
+  if (!(await confirmDialog({ title: "Clear the scan log?", body: "This clears the saved event transcript for this project. Findings in the Issues tab are not affected.", danger: true, confirmLabel: "Clear log" }))) return;
   let r = {};
   try { r = await (await fetch("/hunt/clear", { method:"POST",
     body: JSON.stringify({ project: activeProject }) })).json(); } catch (e) {}
@@ -2432,6 +5187,8 @@ $("h-run").onclick = async () => {
     const r = await (await fetch("/hunt/run", { method:"POST", body: JSON.stringify({
       target, modules: Array.from(hSelected), preset: matchedPreset ? matchedPreset.key : "custom",
       project: activeProject, debug: hDebug,
+      seed_from_sitemap: $("h-seedmap").checked,
+      seed_mode: (document.querySelector('input[name="h-seedmode"]:checked') || {}).value || "confirm",
     }) })).json();
     if (!r.ok) { $("h-msg").textContent = "Error: " + (r.error || "could not start"); $("h-run").disabled = false; return; }
     $("h-stop").disabled = false;
@@ -2448,6 +5205,159 @@ $("h-stop").onclick = async () => {
   } catch (e) { $("h-msg").textContent = "Error: " + e; $("h-stop").disabled = false; }
 };
 
+// ── "Use site map" seeding toggle (Active Scan) — reveal modes + preview the seed count ──
+$("h-seedmap").onchange = async () => {
+  const on = $("h-seedmap").checked;
+  $("h-seed-opts").style.display = on ? "block" : "none";
+  if (!on) return;
+  const hint = $("h-seed-hint"); hint.textContent = "counting Site-map URLs…";
+  try {
+    const d = await (await fetch("/http/sitemap?scope=0&project=" + activeProject)).json();
+    let n = 0; const walk = x => { if (x.leaf) n++; (x.children || []).forEach(walk); };
+    (d.hosts || []).forEach(h => { if (h.leaf) n++; (h.children || []).forEach(walk); });
+    hint.textContent = n
+      ? (n + " endpoint(s) in the Site map will seed this scan.")
+      : "Site map is empty — run a Passive Scan first, or this falls back to a normal crawl.";
+  } catch (e) { hint.textContent = ""; }
+};
+
+// ── Passive Scan module (builds the Site map from passive sources) ──
+let pvInited = false, pvCatalog = null, pvSources = new Set(), pvSince = 0, pvTimer = null,
+    pvAutoscroll = true, pvAdded = 0, pvPollProject = null;
+function pvSelCount() { $("pv-selcount").textContent = pvSources.size + " source" + (pvSources.size === 1 ? "" : "s"); }
+function pvRenderSources() {
+  const wrap = $("pv-sources"); wrap.innerHTML = "";
+  for (const s of pvCatalog.sources) {
+    const row = document.createElement("label");
+    row.className = "mod-row";
+    row.dataset.desc = s.desc + (s.zero_touch ? "   ◦ zero-touch — no requests to the target" : "");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.dataset.key = s.id; cb.checked = pvSources.has(s.id);
+    cb.onchange = () => { if (cb.checked) pvSources.add(s.id); else pvSources.delete(s.id); pvSelCount(); pvSyncPresets(); };
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(" " + s.label + (s.zero_touch ? " ◦" : "")));
+    wrap.appendChild(row);
+  }
+  wrap.onmouseover = e => { const r = e.target.closest(".mod-row"); if (r) showModTooltip(e.clientX, e.clientY, r.dataset.desc); };
+  wrap.onmousemove = wrap.onmouseover;
+  wrap.onmouseout = hideModTooltip;
+  pvSelCount();
+}
+function pvRenderPresets() {
+  const wrap = $("pv-presets"); wrap.innerHTML = "";
+  for (const p of pvCatalog.presets) {
+    const chip = document.createElement("button");
+    chip.type = "button"; chip.className = "preset-chip"; chip.dataset.key = p.id;
+    chip.textContent = p.label;
+    chip.onclick = () => { pvApply(p.sources); if ("probe" in p) $("pv-probe").checked = !!p.probe; };
+    wrap.appendChild(chip);
+  }
+}
+function pvApply(src) {
+  pvSources = new Set(src);
+  $("pv-sources").querySelectorAll("input[type=checkbox]").forEach(cb => cb.checked = pvSources.has(cb.dataset.key));
+  pvSelCount(); pvSyncPresets();
+}
+function pvSyncPresets() {
+  $("pv-presets").querySelectorAll(".preset-chip").forEach(chip => {
+    const p = pvCatalog.presets.find(x => x.id === chip.dataset.key);
+    const match = p && p.sources.length === pvSources.size && p.sources.every(s => pvSources.has(s));
+    chip.classList.toggle("active", !!match);
+  });
+}
+async function initPassive() {
+  if (pvInited) return; pvInited = true;
+  try { pvCatalog = await (await fetch("/passive/catalog")).json(); } catch (e) { return; }
+  pvRenderPresets(); pvRenderSources();
+  const rec = pvCatalog.presets.find(p => p.id === "recommended");
+  if (rec) { pvApply(rec.sources); $("pv-probe").checked = !!rec.probe; }
+  $("pv-selall").onclick = e => { e.preventDefault(); pvApply(pvCatalog.sources.map(s => s.id)); };
+  $("pv-selnone").onclick = e => { e.preventDefault(); pvApply([]); };
+  $("pv-autoscroll").onclick = () => { pvAutoscroll = !pvAutoscroll; $("pv-autoscroll").textContent = "⤓ autoscroll: " + (pvAutoscroll ? "on" : "off"); };
+  $("pv-viewmap").onclick = () => document.querySelector('nav button[data-tab="sitemap"]').click();
+  $("pv-run").onclick = pvRun;
+  $("pv-stop").onclick = async () => {
+    $("pv-stop").disabled = true;
+    try { await fetch("/passive/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) }); } catch (e) {}
+  };
+  $("pv-target").addEventListener("keydown", e => { if (e.key === "Enter") pvRun(); });
+}
+async function loadPassiveFor(pid) {
+  if (pid === null) return;
+  initPassive();
+  if (!$("pv-target").value) {
+    const t = ($("h-target") && $("h-target").value) || "";
+    if (t) $("pv-target").value = t;
+  }
+  // Re-attach to a passive scan still running in this project: replay its log
+  // from the server broker and resume polling (so switching away never "stops" it).
+  clearTimeout(pvTimer); pvTimer = null;
+  let d;
+  try { d = await (await fetch("/passive/events?since=0&project=" + pid)).json(); }
+  catch (e) { return; }
+  if (pid !== activeProject) return;
+  $("pv-log").innerHTML = ""; pvSince = 0; pvAdded = 0;
+  for (const ev of d.events || []) {
+    if (ev.seq != null) pvSince = ev.seq;
+    pvLog(ev);
+    const m = (ev.text || "").match(/(\d+) endpoint\(s\) → Site map/);
+    if (m) pvAdded = +m[1];
+  }
+  $("pv-count").textContent = String(pvSince);
+  $("pv-added").textContent = String(pvAdded);
+  if (!d.done) {
+    pvPollProject = pid;
+    $("pv-run").disabled = true; $("pv-stop").disabled = false; $("pv-msg").textContent = "Scanning…";
+    pvPoll(pid);
+  } else {
+    $("pv-run").disabled = false; $("pv-stop").disabled = true;
+  }
+}
+function pvLog(ev) {
+  const d = document.createElement("div");
+  d.className = "tline " + (ev.type === "error" ? "l-err" : ev.type === "phase" ? "l-phase" : ev.type === "done" ? "l-done" : "");
+  d.textContent = ev.text || "";
+  $("pv-log").appendChild(d);
+  if (pvAutoscroll) $("pv-log").scrollTop = $("pv-log").scrollHeight;
+}
+async function pvRun() {
+  const target = $("pv-target").value.trim();
+  if (!target) { $("pv-msg").textContent = "Enter a target."; return; }
+  if (!pvSources.size) { $("pv-msg").textContent = "Enable at least one source."; return; }
+  $("pv-run").disabled = true; $("pv-msg").textContent = "Starting…";
+  $("pv-log").innerHTML = ""; pvSince = 0; pvAdded = 0; $("pv-count").textContent = "0"; $("pv-added").textContent = "0";
+  pvPollProject = activeProject;
+  try {
+    const r = await (await fetch("/passive/run", { method: "POST", body: JSON.stringify({
+      project: activeProject, target, sources: Array.from(pvSources),
+      opts: { probe: $("pv-probe").checked, scope_only: $("pv-scope").checked },
+    }) })).json();
+    if (!r.ok) { $("pv-msg").textContent = "Error: " + (r.error || "could not start"); $("pv-run").disabled = false; return; }
+    $("pv-stop").disabled = false; $("pv-msg").textContent = "Scanning: " + target;
+    pvPoll(activeProject);
+  } catch (e) { $("pv-msg").textContent = "Error: " + e; $("pv-run").disabled = false; }
+}
+async function pvPoll(pid) {
+  if (pvTimer) clearTimeout(pvTimer);
+  let d;
+  try { d = await (await fetch("/passive/events?since=" + pvSince + "&project=" + pid)).json(); }
+  catch (e) { pvTimer = setTimeout(() => pvPoll(pid), 1000); return; }
+  if (pid !== pvPollProject) return;
+  for (const ev of d.events || []) {
+    if (ev.seq != null) pvSince = ev.seq;
+    pvLog(ev);
+    const m = (ev.text || "").match(/(\d+) endpoint\(s\) → Site map/);
+    if (m) { pvAdded = +m[1]; $("pv-added").textContent = String(pvAdded); }
+  }
+  $("pv-count").textContent = String(pvSince);
+  if (d.done) {
+    $("pv-run").disabled = false; $("pv-stop").disabled = true;
+    if (!/Error|failed/.test($("pv-msg").textContent)) $("pv-msg").textContent = "Done — " + pvAdded + " endpoint(s) added. Open the Site map →";
+    return;
+  }
+  pvTimer = setTimeout(() => pvPoll(pid), 800);
+}
+
 function saveHuntHtml() {
   const projName = projectName(activeProject);
   const target = $("h-target").value || "—";
@@ -2458,10 +5368,10 @@ function saveHuntHtml() {
 <title>Hunt — ${esc(projName)} — ${esc(target)}</title>
 <style>
   :root { --bg:#0a0f0c; --panel:#0e150f; --border:#1e2b22; --fg:#d3ddd2; --muted:#6f8175;
-    --accent:#35d07e; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; }
+    --accent:#35d07e; --red:#ff6b6b; --green:#57d98a; --yellow:#f5c451; --violet:#b98cff; --blue:#5aa9ff; --orange:#ff9f43; }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f5f8f4; --panel:#ffffff; --border:#d7e0d5; --fg:#1c2620; --muted:#5f7167;
-      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; } }
+      --accent:#12864e; --red:#c0392b; --green:#1a7f47; --yellow:#9a7b12; --violet:#7a3ff2; --blue:#0969da; --orange:#c25a00; } }
   * { box-sizing:border-box; }
   body { margin:0; background:#050607; color:var(--fg);
     font:14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding:20px 24px 60px; }
@@ -2499,9 +5409,10 @@ $("h-save").onclick = saveHuntHtml;
 async function loadScopeFor(id) {
   const ap = projects.find(p => p.id === id);
   $("scope-project").textContent = ap ? ap.name : "—";
-  let entries = [];
-  try { entries = (await (await fetch("/scope?project=" + id)).json()).scope || []; } catch (e) {}
-  renderScopeList(entries);
+  let d = { scope: [], exclude: [] };
+  try { d = await (await fetch("/scope?project=" + id)).json(); } catch (e) {}
+  renderScopeList(d.scope || []);
+  renderExcludeList(d.exclude || []);
 }
 function renderScopeList(entries) {
   const wrap = $("scope-list");
@@ -2541,9 +5452,53 @@ async function removeScopeEntry(host) {
 }
 $("scope-add").onclick = addScopeEntries;
 $("scope-clear").onclick = async () => {
+  if (!(await confirmDialog({ title: "Clear the in-scope list?", body: "This removes every in-scope entry for this project.", danger: true, confirmLabel: "Clear scope" }))) return;
   const r = await (await fetch("/scope/clear", { method: "POST",
     body: JSON.stringify({ project: activeProject }) })).json();
   if (r.ok) renderScopeList(r.scope);
+};
+// ── Out-of-scope (strict exclusions) — parallel to the in-scope list ──
+function renderExcludeList(entries) {
+  const wrap = $("scope-ex-list");
+  $("scope-ex-count").textContent = entries.length;
+  if (!entries.length) {
+    wrap.innerHTML = '<div class="scope-empty">Nothing excluded — add hosts to keep them strictly out of scope.</div>';
+    return;
+  }
+  wrap.innerHTML = "";
+  for (const host of entries) {
+    const row = document.createElement("div");
+    row.className = "scope-item";
+    const span = document.createElement("span");
+    span.className = "host"; span.textContent = host;
+    const btn = document.createElement("button");
+    btn.textContent = "\u2715 remove";
+    btn.onclick = () => removeExcludeEntry(host);
+    row.appendChild(span); row.appendChild(btn);
+    wrap.appendChild(row);
+  }
+}
+async function addExcludeEntries() {
+  const text = $("scope-ex-input").value;
+  if (!text.trim()) { $("scope-ex-msg").textContent = "Paste a URL, domain, or IP first."; return; }
+  try {
+    const r = await (await fetch("/scope/exclude/add", { method: "POST",
+      body: JSON.stringify({ project: activeProject, text }) })).json();
+    if (!r.ok) { $("scope-ex-msg").textContent = "Error: " + (r.error || "could not add"); return; }
+    $("scope-ex-input").value = ""; $("scope-ex-msg").textContent = "";
+    renderExcludeList(r.exclude);
+  } catch (e) { $("scope-ex-msg").textContent = "Error: " + e; }
+}
+async function removeExcludeEntry(host) {
+  const r = await (await fetch("/scope/exclude/remove", { method: "POST",
+    body: JSON.stringify({ project: activeProject, entry: host }) })).json();
+  if (r.ok) renderExcludeList(r.exclude);
+}
+$("scope-ex-add").onclick = addExcludeEntries;
+$("scope-ex-clear").onclick = async () => {
+  const r = await (await fetch("/scope/exclude/clear", { method: "POST",
+    body: JSON.stringify({ project: activeProject }) })).json();
+  if (r.ok) renderExcludeList(r.exclude);
 };
 
 // ── Issues: Burp-style master/detail. Every finding from a Hunt or Ghost run
@@ -2695,6 +5650,10 @@ function renderIssueDetail() {
       $("iss-to-rep").onclick = () => sendIssueToRepeater(d);
       let arTarget = ""; try { arTarget = new URL(d.url).origin; } catch (e) {}
       $("iss-to-ar").onclick = () => sendToAutoRepeater(d.request, arTarget);
+      box.oncontextmenu = (e) => {     // shared Send-to / Copy / Scope routing for this finding
+        e.preventDefault();
+        showCtxMenu(e.clientX, e.clientY, routeReqMenu({ raw: d.request, url: d.url, response: d.response || "" }));
+      };
     }
   } else if (issueDetailTab === "response") {
     box.innerHTML = reqRespView("HTTP response", d.response, d.response_synthesized,
@@ -2715,12 +5674,12 @@ document.querySelectorAll("#iss-dtabs button").forEach(b => {
   };
 });
 $("iss-sort").onchange = () => { issueSort.key = $("iss-sort").value; issueSort.dir = 1; renderIssues(); };
-$("iss-clear").onclick = async () => {
-  if (!issuesData.length) return;
-  if (!confirm("Delete all " + issuesData.length + " issue(s) in this project?")) return;
-  await fetch("/issues/clear", { method:"POST", body: JSON.stringify({ project: activeProject }) });
-  selectedIssue = null; issueDetail = null; renderIssueDetail();
-  loadIssuesFor(activeProject);
+$("iss-clear").onclick = () => {
+  if (!issuesData.length) { toast("No findings to clear."); return; }
+  clearWithUndo("issues", "Clear all findings?",
+    "This removes all " + issuesData.length + " finding(s) in this project.", "Clear findings",
+    async () => { const r = await (await fetch("/issues/clear", { method:"POST", body: JSON.stringify({ project: activeProject }) })).json(); return { ok: r.ok !== false, count: issuesData.length }; },
+    async () => { selectedIssue = null; issueDetail = null; renderIssueDetail(); await loadIssuesFor(activeProject); });
 };
 
 // ── Send issues to Ghost for validation (individual, all, by severity, by module) ──
@@ -2768,7 +5727,7 @@ function buildGhostMenu() {
 $("iss-ghost-btn").onclick = (e) => {
   e.stopPropagation();
   const m = $("iss-ghost-menu");
-  if (m.classList.toggle("open")) buildGhostMenu();
+  if (m.classList.toggle("open")) { buildGhostMenu(); placeFixedUnder(m, $("iss-ghost-btn")); }
 };
 $("iss-ghost-menu").onclick = (e) => e.stopPropagation();
 document.addEventListener("click", () => $("iss-ghost-menu").classList.remove("open"));
@@ -2789,11 +5748,12 @@ function showIssueCtx(e, id) {
     `<hr><button class="fp" data-act="fp" data-v="${it.false_positive ? "0" : "1"}">${fpLabel}</button>` +
     `<button class="del" data-act="del">Delete issue</button>`;
   m.dataset.iid = id;
-  m.style.display = "block"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
+  const z = uiZoom();                                  // cursor + measured rect are visual; map into the zoomed space
+  m.style.display = "block"; m.style.left = (e.clientX / z) + "px"; m.style.top = (e.clientY / z) + "px";
   // keep the menu on-screen
   const r = m.getBoundingClientRect();
-  if (r.right > innerWidth) m.style.left = (innerWidth - r.width - 6) + "px";
-  if (r.bottom > innerHeight) m.style.top = (innerHeight - r.height - 6) + "px";
+  if (r.right > innerWidth) m.style.left = ((innerWidth - r.width) / z - 6) + "px";
+  if (r.bottom > innerHeight) m.style.top = ((innerHeight - r.height) / z - 6) + "px";
   m.querySelectorAll("[data-act]").forEach(el => {
     el.onclick = async (ev) => {
       ev.stopPropagation();
@@ -2835,6 +5795,7 @@ function renderProjects() {
   for (const p of projects) {
     const b = document.createElement("button");
     b.className = "proj" + (p.id === activeProject ? " active" : "");
+    b.dataset.pid = p.id;
     b.textContent = p.label != null ? p.label : p.id; b.title = p.name;
     b.onclick = () => selectProject(p.id);
     b.oncontextmenu = (e) => { e.preventDefault(); showCtx(e, p.id); };
@@ -2864,21 +5825,115 @@ async function deleteProject(id) {
   if (d.ok) { applyState(d); onProjectSwitch(); }
 }
 function onProjectSwitch() {
-  // Rebuild (never just clear) the per-project tool views from server state,
-  // so a run left going in another project stays visible when you switch back.
-  loadGhostViewFor(activeProject);
-  loadHuntViewFor(activeProject);
-  loadScopeFor(activeProject);
+  // Tear down every module's UI poller + transient view state so nothing from the
+  // previous project bleeds through. Server-side runs are NOT stopped — only their
+  // UI pollers; the on-screen module re-attaches on reload, and other modules
+  // re-attach lazily when navigated to (activateTab). This is also what fixes a
+  // switch leaving a module (e.g. the Site map) showing the previous project.
+  teardownProjectViews();
   selectedIssue = null; issueDetail = null; renderIssueDetail();
-  loadIssuesFor(activeProject);
-  loadRepeaterFor(activeProject);
-  loadAutoRepeaterFor(activeProject);
+  loadIssuesFor(activeProject);     // keep the Actions-on-Objectives findings badge correct
+  refreshActivity();                // cross-project scanning glow on project tabs + nav modules
+  reloadActiveModule();             // the visible module updates + re-attaches any live run
+}
+
+// Reload just the currently-visible module for the active project (re-attaching
+// any live run). Mirrors activateTab's dispatch plus the 3 tabs it omits.
+function reloadActiveModule() {
+  const t = activeTab, p = activeProject;
+  if (t === "ghost") loadGhostViewFor(p);
+  else if (t === "scan") loadHuntViewFor(p);
+  else if (t === "scope") loadScopeFor(p);
+  else if (t === "issues") loadIssuesFor(p);
+  else if (t === "browser") loadBrowserFor(p);
+  else if (t === "http") loadHttpFor(p);
+  else if (t === "passive") loadPassiveFor(p);
+  else if (t === "sitemap") loadSitemapFor(p);
+  else if (t === "repeater") loadRepeaterFor(p);
+  else if (t === "autorepeater") loadAutoRepeaterFor(p);
+  else if (t === "network") loadNetworkFor(p);
+  else if (t === "packets") loadPacketsFor(p);
+  else if (t === "recon") loadReconFor(p);
+  else if (t === "nuclei") loadNucleiFor(p);
+  else if (t === "metasploit") loadMetasploitFor(p);
+}
+
+// Cross-project scan-activity indicators: a radioactive glow on any project tab
+// that has a live run, and on the running nav module(s) of the active project.
+// Cheap low-frequency poll of /activity (reads broker done-flags server-side).
+let actTimer = null;
+async function refreshActivity() {
+  let d;
+  try { d = await (await fetch("/activity")).json(); } catch (e) { return; }
+  const byProj = d.projects || {};
+  document.querySelectorAll("#projects .proj[data-pid]").forEach(b => {
+    b.classList.toggle("scanning", (byProj[b.dataset.pid] || []).length > 0);
+  });
+  const activeMods = byProj[String(activeProject)] || [];
+  document.querySelectorAll("nav .mod[data-tab]").forEach(m => {
+    m.classList.toggle("scanning", activeMods.indexOf(m.dataset.tab) >= 0);
+  });
+}
+function startActivityPolling() {
+  if (actTimer) return;
+  refreshActivity();
+  actTimer = setInterval(refreshActivity, 4000);
+}
+
+// Stop EVERY module's UI poller and reset its transient single-project view state,
+// so a project switch leaves no cross-project bleed and exactly one poller per
+// module ever runs. Server-side runs keep going — a loader re-attaches them.
+function teardownProjectViews() {
+  // Ghost + Hunt poll chains
+  clearTimeout(ghostPollTimer); ghostPollTimer = null; pollProject = null;
+  clearTimeout(hPollTimer); hPollTimer = null; hPollProject = null;
+  // Network
+  clearInterval(netPollTimer); netPollTimer = null;
+  netSince = 0; netActiveScanId = null; netLinkedCap = null;
+  netOutput = ""; netResult = { hosts: [] }; netSelHost = null;
+  setNetScanning(false);
+  const ntOut = $("nt-output"); if (ntOut) ntOut.textContent = "";
+  // Packets
+  clearInterval(pkCapTimer); pkCapTimer = null;
+  pkCapturing = false; pkCapSince = 0; pkCurrentCap = null; pkPackets = [];
+  ["pk-list", "pk-tree"].forEach(id => { const e = $(id); if (e) e.innerHTML = ""; });
+  const pkHex = $("pk-hex"); if (pkHex) pkHex.textContent = "";
+  const pkCapStop = $("pk-capstop"); if (pkCapStop) pkCapStop.disabled = true;
+  const pkStat = $("pk-status"); if (pkStat) pkStat.innerHTML = "";
+  // Recon
+  clearInterval(rcPollTimer); rcPollTimer = null;
+  rcSince = 0; rcLog = "";
+  const rcLogEl = $("rc-log"); if (rcLogEl) rcLogEl.textContent = "";
+  setReconRunning(false);
+  // Nuclei
+  clearInterval(nucPollTimer); nucPollTimer = null;
+  nucSince = 0; nucActiveRun = null; nucSelRun = null; nucLog = "";
+  setNucRunning(false);
+  const nrl = $("nr-log"); if (nrl) nrl.textContent = "";
+  const nrf = $("nr-findings"); if (nrf) nrf.innerHTML = "";
+  // HTTP (history + its event poll — the httpTimer setInterval otherwise leaks forever)
+  if (httpTimer) { clearInterval(httpTimer); httpTimer = null; }
+  httpRows = []; httpSince = 0; httpSelId = null; httpSiteFilter = null; httpHeld = [];
+  // Site map (view state; smF filter prefs persist via localStorage by design)
+  smData = null; smView = []; smForce = false;
+  for (const k in smExpanded) delete smExpanded[k];
+  // Passive Scan
+  clearTimeout(pvTimer); pvTimer = null; pvSince = 0; pvPollProject = null;
+  // Browser — detach the live screencast UI only (the server-side session persists)
+  try { if (brWS) { brWS.onclose = null; brWS.close(); } } catch (e) {}
+  brWS = null; if (brFbTimer) { clearTimeout(brFbTimer); brFbTimer = null; }
+  brRunning = false; brGotFrame = false; brTransport = null;
+  // Metasploit poll timers
+  if (msfStatusTimer) { clearTimeout(msfStatusTimer); msfStatusTimer = null; }
+  if (msfConsoleTimer) { clearTimeout(msfConsoleTimer); msfConsoleTimer = null; }
+  if (msfSeshTimer) { clearTimeout(msfSeshTimer); msfSeshTimer = null; }
 }
 
 // Context menu
 function showCtx(e, id) {
   const m = $("ctxmenu");
-  m.style.display = "block"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
+  const z = uiZoom();                                  // map cursor (visual) coords into the zoomed space
+  m.style.display = "block"; m.style.left = (e.clientX / z) + "px"; m.style.top = (e.clientY / z) + "px";
   m.dataset.pid = id;
 }
 document.addEventListener("click", () => {
@@ -2910,6 +5965,67 @@ function repBytes(n) {
 // to scan. Everything is escaped via esc() before it reaches innerHTML.
 function repSpan(cls, s) { return '<span class="' + cls + '">' + esc(s) + '</span>'; }
 function escAttr(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+// ── Shared data-safety UI: an undo toast + an "are you sure?" confirm dialog ──
+// Used by every destructive Clear/Delete so a button press (on purpose or by accident)
+// is always confirmed and always reversible. See the server /data/* + _UndoableStore.
+function toast(msg, opts) {
+  opts = opts || {};
+  let host = $("bx-toasts");
+  if (!host) { host = document.createElement("div"); host.id = "bx-toasts"; document.body.appendChild(host); }
+  const el = document.createElement("div"); el.className = "bx-toast";
+  const span = document.createElement("span"); span.textContent = msg; el.appendChild(span);
+  let timer = null;
+  const dismiss = () => { if (timer) { clearTimeout(timer); timer = null; } if (el.parentNode) el.remove(); };
+  if (opts.label && opts.fn) {
+    const b = document.createElement("button"); b.className = "bx-toast-act"; b.textContent = opts.label;
+    b.onclick = () => { dismiss(); try { opts.fn(); } catch (e) {} };
+    el.appendChild(b);
+  }
+  const x = document.createElement("button"); x.className = "bx-toast-act bx-toast-x"; x.textContent = "\u2715";
+  x.title = "Dismiss"; x.onclick = dismiss; el.appendChild(x);
+  host.appendChild(el);
+  timer = setTimeout(dismiss, opts.ms || 6500);
+  return dismiss;
+}
+function confirmDialog(opts) {
+  opts = opts || {};
+  return new Promise(resolve => {
+    const ov = document.createElement("div"); ov.className = "modal-overlay open";
+    ov.innerHTML = '<div class="modal" role="dialog" aria-modal="true" style="width:min(460px,92vw)">' +
+      '<div class="modal-head"><h2>' + esc(opts.title || "Are you sure?") + '</h2>' +
+      '<button class="modal-cancel" data-act="cancel" title="Cancel">\u2715</button></div>' +
+      '<div class="modal-sub">' + (opts.bodyHtml || esc(opts.body || "")) + '</div>' +
+      (opts.extraHtml || "") +
+      '<div class="bx-confirm-btns"><button data-act="cancel">Cancel</button>' +
+      '<button class="' + (opts.danger ? "stop" : "run") + '" data-act="ok">' + esc(opts.confirmLabel || "Confirm") + '</button></div></div>';
+    const confirmVal = () => (opts.collect ? opts.collect(ov) : true);
+    const done = v => { ov.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
+    const onKey = e => { if (e.key === "Escape") done(false); else if (e.key === "Enter") done(confirmVal()); };
+    ov.addEventListener("click", e => {
+      if (e.target === ov) return done(false);
+      const act = e.target.closest("[data-act]"); if (!act) return;
+      done(act.getAttribute("data-act") === "ok" ? confirmVal() : false);
+    });
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(ov);
+    const ok = ov.querySelector('[data-act="ok"]'); if (ok) ok.focus();
+  });
+}
+// Clear/delete with confirm + undo, for any /data store. clearFn does the server op and
+// returns a count; on success an undo toast offers /data/undo for that store.
+async function clearWithUndo(store, title, body, confirmLabel, doFn, after) {
+  const ok = await confirmDialog({ title: title, body: body, danger: true, confirmLabel: confirmLabel || "Clear" });
+  if (!ok) return;
+  let r; try { r = await doFn(); } catch (e) { toast("Couldn't complete that."); return; }
+  if (r && r.ok === false) { toast(r.error || "Nothing to do."); return; }
+  if (after) try { await after(); } catch (e) {}
+  const n = (r && (r.deleted != null ? r.deleted : r.count)) || null;
+  toast((n != null ? ("Cleared " + n + " item" + (n === 1 ? "" : "s")) : "Cleared") + ".",
+    { label: "Undo", ms: 9000, fn: async () => {
+      const u = await (await fetch("/data/undo", { method: "POST", body: JSON.stringify({ store: store, project: activeProject }) })).json();
+      if (u.ok) { if (after) await after(); toast("Restored."); } else toast(u.error || "Nothing to undo.");
+    } });
+}
 // Like repSpan, but stamps a data-tip key so HTTP Tips can explain the token.
 function repSpanTip(cls, s, tip) { return '<span class="' + cls + '" data-tip="' + escAttr(tip) + '">' + esc(s) + '</span>'; }
 
@@ -2917,7 +6033,7 @@ function hlReqLine(line) {
   const m = line.match(/^(\S+)(\s+)(\S+)(\s*)(.*)$/);
   if (!m) return esc(line);
   return repSpanTip("tok-method", m[1], "m:" + m[1].toLowerCase()) + m[2] +
-    repSpan("tok-path", m[3]) + m[4] + (m[5] ? repSpan("tok-version", m[5]) : "");
+    hlPath(m[3]) + m[4] + (m[5] ? repSpan("tok-version", m[5]) : "");
 }
 function hlStatusLine(line) {
   const m = line.match(/^(\S+)(\s+)(\d{3})(\s*)(.*)$/);
@@ -2928,12 +6044,17 @@ function hlStatusLine(line) {
   return repSpan("tok-version", m[1]) + m[2] + repSpanTip(cls, m[3], "s:" + m[3]) + m[4] +
     (m[5] ? repSpan("tok-reason", m[5]) : "");
 }
-function hlHeaderLine(line) {
+function hlHeaderLine(line, ctx) {
   const m = line.match(/^([^:\s][^:]*)(:)(\s?)(.*)$/);
   if (!m) return esc(line);
   const nameLower = m[1].trim().toLowerCase();
-  return repSpanTip("tok-hname", m[1], "h:" + nameLower) +
-    repSpan("tok-hsep", m[2]) + m[3] + hlHeaderValue(nameLower, m[4]);
+  // Cross-line callout: Content-Length AND Transfer-Encoding on one message is
+  // the classic request-smuggling / desync setup — flag it on either name.
+  const nameTip = (ctx && ctx.desync &&
+      (nameLower === "content-length" || nameLower === "transfer-encoding"))
+    ? "corr:desync" : "h:" + nameLower;
+  return repSpanTip("tok-hname", m[1], nameTip) +
+    repSpan("tok-hsep", m[2]) + m[3] + hlHeaderValue(nameLower, m[4], ctx || {});
 }
 
 // Wrap regex matches in tip spans while emitting the gaps verbatim (escaped), so
@@ -2952,39 +6073,125 @@ function hlTokens(value, re, decide) {
 }
 // Highlight the VALUE side of a header, adding value-level tips for the headers
 // whose values carry structured, security-relevant tokens.
-function hlHeaderValue(nameLower, value) {
+function hlHeaderValue(nameLower, value, ctx) {
   switch (nameLower) {
     case "set-cookie": case "cookie": return hlCookie(value);
     case "content-security-policy": case "content-security-policy-report-only": return hlCsp(value);
     case "authorization": return hlAuth(value);
+    case "access-control-allow-origin": return hlAcao(value, ctx || {});
+    case "access-control-allow-credentials": return hlAcac(value, ctx || {});
     case "cache-control":
       return hlTokens(value, /[a-zA-Z][a-zA-Z-]*/g, m => {
         const k = m[0].toLowerCase(); return HTTP_TIPS.cc[k] ? { tip: "cc:" + k } : null; });
     case "strict-transport-security":
       return hlTokens(value, /[a-zA-Z][a-zA-Z-]*/g, m => {
         const k = m[0].toLowerCase(); return HTTP_TIPS.hsts[k] ? { tip: "hsts:" + k } : null; });
-    case "content-type":
-      return hlTokens(value, /[a-z0-9.+-]+\/[a-z0-9.+-]+/gi, m => {
-        const k = m[0].toLowerCase(); return HTTP_TIPS.ct[k] ? { tip: "ct:" + k } : null; });
+    case "content-type": return hlContentType(value);
+    case "vary": return hlWords(value, HTTP_TIPS.vary, "vary");
+    case "referrer-policy": return hlWords(value, HTTP_TIPS.refpol, "refpol");
+    case "content-disposition": return hlContentDisposition(value);
+    case "www-authenticate": return hlWwwAuth(value);
+    case "server": case "x-powered-by": case "x-aspnet-version":
+    case "x-aspnetmvc-version": case "x-generator":
+      return hlServer(value);
+    case "content-encoding": case "accept-encoding": return hlWords(value, HTTP_TIPS.ce, "ce");
+    case "transfer-encoding": return hlWords(value, HTTP_TIPS.tenc, "tenc");
+    case "connection": return hlWords(value, HTTP_TIPS.conn, "conn");
+    case "permissions-policy": case "permissions-policy-report-only":
+    case "feature-policy": return hlWords(value, HTTP_TIPS.pp, "pp");
+    case "alt-svc": return hlAltSvc(value);
+    case "clear-site-data": return hlWords(value, HTTP_TIPS.csd, "csd");
+    case "x-frame-options": return hlWords(value, HTTP_TIPS.xfo, "xfo");
+    case "x-content-type-options": return hlWords(value, HTTP_TIPS.xcto, "xcto");
+    case "cross-origin-opener-policy": return hlWords(value, HTTP_TIPS.coop, "coop");
+    case "cross-origin-embedder-policy": case "cross-origin-embedder-policy-report-only":
+      return hlWords(value, HTTP_TIPS.coep, "coep");
+    case "cross-origin-resource-policy": return hlWords(value, HTTP_TIPS.corp, "corp");
+    case "sec-fetch-site": return hlWords(value, HTTP_TIPS.sfs, "sfs");
+    case "sec-fetch-mode": return hlWords(value, HTTP_TIPS.sfm, "sfm");
+    case "sec-fetch-dest": return hlWords(value, HTTP_TIPS.sfd, "sfd");
+    case "cf-cache-status": case "x-cache": return hlWords(value, HTTP_TIPS.cachestatus, "cachestatus");
     default: return hlValueMaybeJwt(value);
   }
 }
+// Access-Control-Allow-Origin — flagged when it combines dangerously with
+// credentials or reflects the caller's Origin (the cross-line heart of a CORS
+// misconfig). `ctx.acac` is whether Allow-Credentials: true rode along, and
+// `ctx.reqOrigin` is the Origin the request sent (for the reflection check).
+function hlAcao(value, ctx) {
+  const v = value.trim(), lv = v.toLowerCase();
+  let tip = null;
+  if (lv === "*") tip = ctx.acac ? "corr:cors-star-creds" : "corr:cors-star";
+  else if (lv === "null") tip = ctx.acac ? "corr:cors-null-creds" : "corr:cors-null";
+  else if (ctx.reqOrigin && v === ctx.reqOrigin) tip = ctx.acac ? "corr:cors-reflect-creds" : "corr:cors-reflect";
+  return tip ? repSpanTip("tok-kw", value, tip) : esc(value);
+}
+// Access-Control-Allow-Credentials — flagged `true` only when the Allow-Origin
+// on the same message is permissive (that pairing is what makes it readable).
+function hlAcac(value, ctx) {
+  const istrue = value.trim().toLowerCase() === "true";
+  const acao = (ctx.acao || "").trim(), acaoLower = acao.toLowerCase();
+  const permissive = acaoLower === "*" || acaoLower === "null" ||
+    (ctx.reqOrigin && acao && acao === ctx.reqOrigin);
+  return (istrue && permissive) ? repSpanTip("tok-kw", value, "corr:cors-creds") : esc(value);
+}
+// Cookie / Set-Cookie: colour the cookie NAME (param) and its VALUE (sensitive —
+// it's session material, decoded on hover if it's a JWT/encoded blob), while the
+// attributes (Path, Secure, SameSite=…) keep their keyword tips. Every delimiter
+// is preserved verbatim so the request overlay stays aligned.
+const COOKIE_ATTRS = { httponly: "httponly", secure: "secure", samesite: "samesite",
+  domain: "domain", path: "path", "max-age": "max-age", expires: "expires", partitioned: "partitioned" };
+function hlCookieValue(val) {
+  if (!val) return "";
+  if (/^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./.test(val)) return repSpanTip("tok-sensitive", val, "jwt:" + val);
+  const et = encTipFor(val);
+  if (et) return repSpanTip("tok-sensitive", val, et);
+  return repSpan("tok-sensitive", val);
+}
 function hlCookie(value) {
-  // Cookie attributes, SameSite values, and any embedded JWT (session tokens).
-  const re = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*|(__(?:Host|Secure)-)|\b(HttpOnly|Secure|SameSite|Domain|Path|Max-Age|Expires|Partitioned)\b|\b(Strict|Lax|None)\b/gi;
-  return hlTokens(value, re, m => {
-    if (m[0].slice(0, 3).toLowerCase() === "eyj") return { tip: "jwt:" + m[0] };
-    if (m[1]) return { tip: "cookie:" + (m[1].toLowerCase() === "__host-" ? "host-prefix" : "secure-prefix") };
-    if (m[2]) return { tip: "cookie:" + m[2].toLowerCase() };
-    if (m[3]) return { tip: "cookie:samesite-" + m[3].toLowerCase() };
-    return null;
-  });
+  const segs = String(value).split(/(;)/);         // keep ';' as its own token
+  let out = "";
+  for (const part of segs) {
+    if (part === ";") { out += repSpan("tok-json-punct", ";"); continue; }
+    const lead = (part.match(/^\s*/) || [""])[0];
+    const rest = part.slice(lead.length);
+    out += esc(lead);
+    if (!rest) continue;
+    const eq = rest.indexOf("=");
+    const rawName = eq < 0 ? rest : rest.slice(0, eq);
+    const nameLc = rawName.trim().toLowerCase();
+    if (COOKIE_ATTRS[nameLc]) {                     // a cookie attribute
+      out += repSpanTip("tok-kw", rawName, "cookie:" + COOKIE_ATTRS[nameLc]);
+      if (eq >= 0) {
+        const val = rest.slice(eq + 1);
+        out += repSpan("tok-json-punct", "=");
+        const sv = val.trim().toLowerCase();
+        out += (nameLc === "samesite" && (sv === "strict" || sv === "lax" || sv === "none"))
+          ? repSpanTip("tok-kw", val, "cookie:samesite-" + sv) : esc(val);
+      }
+    } else {                                        // a real name=value cookie
+      const pfx = rawName.match(/^(__Host-|__Secure-)/i);
+      if (pfx) {
+        const pk = pfx[1].toLowerCase() === "__host-" ? "host-prefix" : "secure-prefix";
+        out += repSpanTip("tok-param", pfx[1], "cookie:" + pk) + repSpan("tok-param", rawName.slice(pfx[1].length));
+      } else {
+        out += repSpan("tok-param", rawName);
+      }
+      if (eq >= 0) out += repSpan("tok-json-punct", "=") + hlCookieValue(rest.slice(eq + 1));
+    }
+  }
+  return out;
 }
 function hlCsp(value) {
   const re = /'[^']*'|[a-zA-Z][a-zA-Z0-9-]*|\*/g;
   return hlTokens(value, re, m => {
     const t = m[0].toLowerCase();
-    if (t[0] === "'") { const kw = t.slice(1, -1); return HTTP_TIPS.csp["kw-" + kw] ? { tip: "csp:kw-" + kw } : null; }
+    if (t[0] === "'") {
+      const kw = t.slice(1, -1);
+      if (kw.indexOf("nonce-") === 0) return { tip: "csp:nonce" };
+      if (/^sha(256|384|512)-/.test(kw)) return { tip: "csp:hash" };
+      return HTTP_TIPS.csp["kw-" + kw] ? { tip: "csp:kw-" + kw } : null;
+    }
     if (t === "*") return HTTP_TIPS.csp["star"] ? { tip: "csp:star" } : null;
     return HTTP_TIPS.csp[t] ? { tip: "csp:" + t } : null;
   });
@@ -2997,11 +6204,30 @@ function hlAuth(value) {
     "aws4-hmac-sha256", "hawk", "signature"];
   const schemeHtml = known.includes(scheme)
     ? repSpanTip("tok-kw", m[2], "auth:" + scheme) : esc(m[2]);
-  return esc(m[1]) + schemeHtml + esc(m[3]) + hlValueMaybeJwt(m[4]);
+  // The credential is sensitive — colour it as such. Basic decodes to user:pass
+  // live on hover; a Bearer JWT/encoded token gets its decode tip; multi-param
+  // schemes (Digest, …) fall back to the generic value highlighter.
+  const cred = m[4], t = cred.trim();
+  let credHtml;
+  if (scheme === "basic") {
+    credHtml = t ? repSpanTip("tok-sensitive", cred, "basic:" + t) : esc(cred);
+  } else if (scheme === "bearer") {
+    const tip = /^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./.test(t) ? "jwt:" + t : encTipFor(t);
+    credHtml = t ? (tip ? repSpanTip("tok-sensitive", cred, tip) : repSpan("tok-sensitive", cred)) : esc(cred);
+  } else {
+    credHtml = hlValueMaybeJwt(cred);
+  }
+  return esc(m[1]) + schemeHtml + esc(m[3]) + credHtml;
 }
 function hlValueMaybeJwt(value) {
-  return hlTokens(value, /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
-    m => ({ tip: "jwt:" + m[0] }));
+  // JWT first (owns eyJ…·…·…), then encoded blobs — percent, hex, base64 — each
+  // gated by a real decode so only tamperable, readable values get a tip.
+  const re = /(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)|([A-Za-z0-9._~/+=-]*%[0-9A-Fa-f]{2}(?:[A-Za-z0-9._~/+=-]|%[0-9A-Fa-f]{2})*)|\b([A-Fa-f0-9]{16,})\b|([A-Za-z0-9+/_-]{16,}={0,2})/g;
+  return hlTokens(value, re, m => {
+    if (m[1]) return { cls: "tok-sensitive", tip: "jwt:" + m[1] };
+    const tok = m[0];
+    return encWorthStamping(analyzeEncoding(tok)) ? { cls: "tok-sensitive", tip: "enc:" + tok } : null;
+  });
 }
 // Which HTML attributes deserve a tip. Any on* event handler → the generic "on".
 function attrTipKey(name) {
@@ -3014,21 +6240,276 @@ function attrTipKey(name) {
     "loading"];
   return known.includes(n) ? "attr:" + n : null;
 }
+// Normalize a JSON key / query-param name for lookup: lowercase, drop the
+// separators that are just style (user_id / userId / user-id → userid).
+function normKey(s) { return String(s).toLowerCase().replace(/[_\-]/g, ""); }
+
+// ── Encodings: decode opaque base64 / hex / percent blobs on hover ──
+// The gate is the PRINTABLE RATIO of the decoded bytes: a blob that decodes to
+// mostly-readable text is worth showing (it probably hides an id / path / flag
+// you can tamper with); one that decodes to binary noise gets no tip at all,
+// which is what keeps random tokens and hashes from lighting up everywhere.
+// Decode raw bytes (a "binary string", char codes 0-255) as STRICT UTF-8: returns
+// text only if the bytes are valid UTF-8, else null. This is the reliability
+// gate — random / signature / compressed bytes are not valid UTF-8, so they are
+// correctly rejected as "not text" instead of being shown as mojibake.
+function binToUtf8(bin) {
+  try {
+    let pct = "";
+    for (let i = 0; i < bin.length; i++) {
+      const c = bin.charCodeAt(i);
+      if (c > 255) return null;
+      pct += "%" + (c < 16 ? "0" : "") + c.toString(16);
+    }
+    return decodeURIComponent(pct);
+  } catch (e) { return null; }
+}
+// A decoded STRING is "readable" when it is essentially free of control bytes.
+// (After a strict UTF-8 decode, that is a strong signal it is real text.)
+function encReadable(s) {
+  if (!s || s.length < 2) return false;
+  let ctrl = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13) continue;
+    if (c < 32 || c === 0x7f) ctrl++;
+  }
+  return ctrl / s.length <= 0.02;
+}
+function b64ToBin(b) {
+  let t = String(b).replace(/-/g, "+").replace(/_/g, "/");
+  while (t.length % 4) t += "=";
+  try { return atob(t); } catch (e) { return null; }
+}
+// Each of these returns readable TEXT or null. The "binary but valid encoding"
+// case is handled in encDecodeLayer, which can report byte counts.
+function encDecodeB64(b) {
+  const bin = b64ToBin(b);
+  if (bin === null) return null;
+  const txt = binToUtf8(bin);
+  return (txt && encReadable(txt)) ? txt : null;
+}
+function encDecodeHex(b) {
+  if (b.length % 2 || b.length < 8) return null;
+  let bin = "";
+  for (let i = 0; i < b.length; i += 2) {
+    const n = parseInt(b.slice(i, i + 2), 16);
+    if (isNaN(n)) return null;
+    bin += String.fromCharCode(n);
+  }
+  const txt = binToUtf8(bin);
+  return (txt && encReadable(txt)) ? txt : null;
+}
+function encDecodeUrl(b) {
+  try { const d = decodeURIComponent(b); return (d !== b && d.length >= 2 && encReadable(d)) ? d : null; }
+  catch (e) { return null; }
+}
+function decodeHtmlEntities(s) {
+  return s.replace(/&#x([0-9a-fA-F]+);/g, (w, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return w; } })
+          .replace(/&#(\d+);/g, (w, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch (e) { return w; } })
+          .replace(/&(amp|lt|gt|quot|apos|nbsp);/g, (w, n) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }[n]));
+}
+function decodeUnicodeEscapes(s) {
+  return s.replace(/\\u\{([0-9a-fA-F]+)\}/g, (w, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return w; } })
+          .replace(/\\u([0-9a-fA-F]{4})/g, (w, h) => String.fromCharCode(parseInt(h, 16)))
+          .replace(/\\x([0-9a-fA-F]{2})/g, (w, h) => String.fromCharCode(parseInt(h, 16)));
+}
+// Peel ONE encoding layer off a string. Order matters: transforms that leave
+// obvious markers (%, &…;, \u) are tried before the "shape" codecs (hex/base64)
+// so a value is read the way it was most likely produced.
+function encDecodeLayer(s) {
+  if (!s || s.length < 4) return null;
+  // Text-producing transforms first (they leave obvious markers).
+  if (/%[0-9A-Fa-f]{2}/.test(s)) { const d = encDecodeUrl(s); if (d) return { label: "URL-encoded", decoded: d }; }
+  if (/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos|nbsp);/.test(s)) {
+    const d = decodeHtmlEntities(s); if (d !== s && encReadable(d)) return { label: "HTML entities", decoded: d }; }
+  if (/\\u[0-9a-fA-F]{4}|\\u\{[0-9a-fA-F]+\}|\\x[0-9a-fA-F]{2}/.test(s)) {
+    const d = decodeUnicodeEscapes(s); if (d !== s && encReadable(d)) return { label: "unicode escapes", decoded: d }; }
+  // hex (whole string) — text, or report binary bytes.
+  if (/^[0-9A-Fa-f]+$/.test(s) && s.length % 2 === 0 && s.length >= 16) {
+    const txt = encDecodeHex(s);
+    if (txt) return { label: "hex", decoded: txt };
+    return { label: "hex", decoded: null, binary: s.length / 2 };
+  }
+  // base64, optionally after a short "name=" prefix (s=…, token=…, sig=…), so a
+  // value like `s=nBm4…` decodes the token rather than choking on the prefix.
+  const b64m = s.match(/^(?:[A-Za-z0-9_.~-]{1,16}=)?([A-Za-z0-9+/_-]{12,}={0,2})$/);
+  if (b64m) {
+    const bin = b64ToBin(b64m[1]);
+    if (bin !== null && bin.length >= 3) {
+      const txt = binToUtf8(bin);
+      if (txt && encReadable(txt)) return { label: "base64", decoded: txt };
+      return { label: "base64", decoded: null, binary: bin.length };
+    }
+  }
+  return null;
+}
+// Recursively peel layers (base64-of-urlencoded-of-json, etc.) up to a cap,
+// stopping at a fixed point or a repeat. Returns the chain + final value.
+function analyzeEncoding(s, maxDepth) {
+  const chain = [], seen = new Set();
+  let cur = s;
+  for (let i = 0; i < (maxDepth || 5); i++) {
+    if (seen.has(cur)) break;
+    seen.add(cur);
+    const step = encDecodeLayer(cur);
+    if (!step) break;
+    chain.push(step);
+    if (step.decoded == null) break;         // binary terminal — stop, keep the byte count
+    if (step.decoded === cur) break;
+    cur = step.decoded;
+  }
+  if (!chain.length) return null;
+  const last = chain[chain.length - 1];
+  return { chain: chain, final: cur, binaryTail: last.decoded == null ? (last.binary || 0) : 0 };
+}
+// Worth a tip? Decoded text always is. A binary terminal only when it's a real,
+// substantial token (nested, or ≥24 bytes) — so a short random id stays quiet.
+function encWorthStamping(a) {
+  if (!a) return false;
+  if (a.binaryTail) return a.chain.length >= 2 || a.binaryTail >= 24;
+  return true;
+}
+// Name the structure a decoded value turned out to be — the payoff line of a tip.
+function encFinalKind(s) {
+  const t = (s || "").replace(/^\s+/, "");
+  if (/^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./.test(t)) return "a JWT";
+  if (t[0] === "{" || t[0] === "[") { try { JSON.parse(s); return "JSON"; } catch (e) { return "JSON-like data"; } }
+  if (t[0] === "<") return "XML / HTML";
+  if (/^[\w.+%-]+=[^&]*(?:&[\w.+%-]+=[^&]*)+$/.test(t)) return "a query / form string";
+  if (/^https?:\/\//i.test(t)) return "a URL";
+  return null;
+}
+// Whole-string test (for a JSON/query/cookie value that IS one encoded blob).
+// JWTs are owned by the jwt: path, so they're excluded here.
+function encTipFor(s) {
+  if (!s || s.length < 8) return null;
+  if (/^eyJ[A-Za-z0-9_-]+\.eyJ/.test(s)) return null;
+  return encWorthStamping(analyzeEncoding(s)) ? "enc:" + s : null;
+}
+
+// ── GraphQL ──
+// Decide whether a JSON string value looks like a GraphQL document, and which
+// tip to stamp — introspection is the headline finding, so it wins.
+function gqlStringTip(strWithQuotes) {
+  const s = strWithQuotes;
+  if (/\b__schema\b|\b__type\b/.test(s)) return "introspection";
+  if (/^"\s*(?:#[^\n]*\n\s*)*(?:query|mutation|subscription)\b/.test(s) || /\b__typename\b/.test(s)) return "operation";
+  return null;
+}
+// Highlight a raw GraphQL body (Content-Type: application/graphql), stamping the
+// operation / introspection keywords a tester cares about.
+function hlGraphql(s) {
+  return hlTokens(s, /__typename|__schema|__type|\b(?:query|mutation|subscription|fragment)\b/g, m => {
+    const k = m[0].toLowerCase();
+    if (k === "__schema" || k === "__type") return { cls: "tok-kw", tip: "gql:introspection" };
+    if (k === "__typename") return { cls: "tok-kw", tip: "gql:__typename" };
+    return HTTP_TIPS.gql[k] ? { cls: "tok-method", tip: "gql:" + k } : null;
+  });
+}
+
+// ── URL path + query (request line) ──
+// Split the request-target into path and query, and stamp param tips on the
+// query keys a hunter commonly probes. Every character is preserved so the
+// request overlay stays aligned.
+function hlPath(path) {
+  const qi = path.indexOf("?");
+  const base = qi < 0 ? path : path.slice(0, qi);
+  let out = repSpan("tok-path", base);
+  if (qi < 0) return out;
+  out += repSpan("tok-json-punct", "?");
+  const parts = path.slice(qi + 1).split(/([&;])/);
+  for (const part of parts) {
+    if (part === "&" || part === ";") { out += repSpan("tok-json-punct", part); continue; }
+    const eqi = part.indexOf("=");
+    const key = eqi < 0 ? part : part.slice(0, eqi);
+    const nk = normKey(key);
+    out += (key && HTTP_TIPS.param[nk]) ? repSpanTip("tok-param", key, "param:" + nk)
+                                        : (key ? repSpan("tok-param", key) : "");
+    if (eqi >= 0) {
+      const val = part.slice(eqi + 1);
+      const et = encTipFor(val);
+      out += repSpan("tok-json-punct", "=") +
+        (et ? repSpanTip("tok-sensitive", val, et) : (val ? repSpan("tok-val", val) : ""));
+    }
+  }
+  return out;
+}
+
+// ── Response header values with structured sub-tokens ──
+// Server / X-Powered-By etc.: flag a disclosed product+version (a CVE lookup
+// cue) — never asserting a specific CVE, only that an exact version is exposed.
+function hlServer(value) {
+  return hlTokens(value, /[A-Za-z][A-Za-z0-9.+-]*[\/_]v?\d+(?:\.\d+)+|\bv?\d+(?:\.\d+){2,}\b/g,
+    m => ({ cls: "tok-kw", tip: "verdis:" + m[0] }));
+}
+function hlContentDisposition(value) {
+  return hlTokens(value, /filename\*?|attachment|inline|form-data/gi, m => {
+    const k = m[0].toLowerCase().replace("*", "").replace("-", "");
+    return HTTP_TIPS.cd[k] ? { tip: "cd:" + k } : null;
+  });
+}
+function hlWwwAuth(value) {
+  return hlTokens(value, /[A-Za-z][A-Za-z0-9_-]*/g, m => {
+    const k = m[0].toLowerCase();
+    return HTTP_TIPS.wwwauth[k] ? { tip: "wwwauth:" + k } : null;
+  });
+}
+// Generic word-token value highlighter: stamp <prefix>:<token> for any token
+// that has an entry in the given HTTP_TIPS sub-object. Powers the many header
+// values that are just a set of known keywords (encodings, CORS isolation,
+// fetch-metadata, cache status, …).
+function hlWords(value, obj, prefix) {
+  return hlTokens(value, /[A-Za-z][A-Za-z0-9_-]*/g, m => {
+    const k = m[0].toLowerCase();
+    return obj[k] ? { tip: prefix + ":" + k } : null;
+  });
+}
+// Alt-Svc: protocol-ids (h2 / h3 / draft h3-NN), the `clear` value, and the
+// ma= / persist= params. Draft protocol ids collapse to their base (h3-29→h3).
+function hlAltSvc(value) {
+  return hlTokens(value, /h[0-9]+(?:-[0-9]+)?|clear|ma|persist/gi, m => {
+    let k = m[0].toLowerCase();
+    if (/^h[0-9]/.test(k)) k = k.split("-")[0];     // h3-29 → h3
+    return HTTP_TIPS.altsvc[k] ? { tip: "altsvc:" + k } : null;
+  });
+}
+// Content-Type: the media type (ct:) plus the charset / boundary params.
+function hlContentType(value) {
+  return hlTokens(value, /[a-z0-9.+-]+\/[a-z0-9.+-]+|charset|boundary/gi, m => {
+    const t = m[0].toLowerCase();
+    if (t === "charset") return { tip: "ctparam:charset" };
+    if (t === "boundary") return { tip: "ctparam:boundary" };
+    return HTTP_TIPS.ct[t] ? { tip: "ct:" + t } : null;
+  });
+}
+
 function hlJson(s) {
   const re = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([{}\[\],:])/g;
   let out = "", last = 0, m;
   while ((m = re.exec(s))) {
     out += esc(s.slice(last, m.index));
     if (m[1] !== undefined) {
-      out += (m[2] !== undefined)
-        ? repSpan("tok-json-key", m[1]) + repSpan("tok-json-punct", m[2])
-        : repSpan("tok-json-str", m[1]);
+      if (m[2] !== undefined) {                 // "key":  → a field name (param colour)
+        const nk = normKey(m[1].slice(1, -1));
+        out += (HTTP_TIPS.json[nk] ? repSpanTip("tok-param", m[1], "json:" + nk)
+                                   : repSpan("tok-param", m[1])) + repSpan("tok-json-punct", m[2]);
+      } else {                                  // a string VALUE → modifiable / GraphQL / encoded
+        out += hlJsonStringValue(m[1]);
+      }
     } else if (m[3] !== undefined) { out += repSpan("tok-json-bool", m[3]); }
     else if (m[4] !== undefined) { out += repSpan("tok-json-num", m[4]); }
     else if (m[5] !== undefined) { out += repSpan("tok-json-punct", m[5]); }
     last = re.lastIndex;
   }
   return out + esc(s.slice(last));
+}
+function hlJsonStringValue(strWithQuotes) {
+  const gt = gqlStringTip(strWithQuotes);
+  if (gt) return repSpanTip("tok-kw", strWithQuotes, "gql:" + gt);     // GraphQL = point of interest
+  const et = encTipFor(strWithQuotes.slice(1, -1));
+  if (et) return repSpanTip("tok-sensitive", strWithQuotes, et);       // decodable blob
+  return repSpan("tok-val", strWithQuotes);                            // a modifiable value
 }
 function hlXmlTag(tag) {
   const m = tag.match(/^(<[!?\/]?)([\w:.-]*)([\s\S]*?)([?\/]?>)$/);
@@ -3065,28 +6546,86 @@ function repDetectCT(headLines) {
     const m = l.match(/^content-type\s*:\s*(.+)$/i);
     if (m) {
       const v = m[1].toLowerCase();
+      if (v.includes("graphql")) return "graphql";
       if (v.includes("json")) return "json";
+      if (v.includes("x-www-form-urlencoded")) return "form";
       if (v.includes("xml") || v.includes("html")) return "xml";
       return "";
     }
   }
   return "";
 }
+// Highlight an application/x-www-form-urlencoded body: field names are params,
+// values are modifiable (or decodable). Separators are kept so it stays aligned.
+function hlForm(body) {
+  const parts = String(body).split(/([&\n\r]+)/);
+  let out = "";
+  for (const part of parts) {
+    if (part === "" ) continue;
+    if (/^[&\n\r]+$/.test(part)) { out += repSpan("tok-json-punct", part); continue; }
+    const eq = part.indexOf("=");
+    if (eq < 0) { out += repSpan("tok-param", part); continue; }
+    const key = part.slice(0, eq), val = part.slice(eq + 1);
+    const nk = normKey(key);
+    out += (key && HTTP_TIPS.param[nk]) ? repSpanTip("tok-param", key, "param:" + nk)
+                                        : (key ? repSpan("tok-param", key) : "");
+    out += repSpan("tok-json-punct", "=");
+    const et = encTipFor(val);
+    out += et ? repSpanTip("tok-sensitive", val, et) : (val ? repSpan("tok-val", val) : "");
+  }
+  return out;
+}
 function hlBody(body, ct) {
   let kind = ct;
-  if (!kind) { const t = body.replace(/^\s+/, ""); kind = t[0] === "{" || t[0] === "[" ? "json" : t[0] === "<" ? "xml" : ""; }
+  if (!kind) {
+    const t = body.replace(/^\s+/, "");
+    kind = (t[0] === "{" || t[0] === "[") ? "json" : t[0] === "<" ? "xml"
+         : /^[^=&\s]+=[^&]*&[^=&\s]+=/.test(t) ? "form" : "";   // 2+ k=v pairs ⇒ form
+  }
   if (kind === "json") return hlJson(body);
   if (kind === "xml") return hlXml(body);
+  if (kind === "graphql") return hlGraphql(body);
+  if (kind === "form") return hlForm(body);
   return esc(body);
 }
-function hlHttp(text, kind) {
+// Scan header lines for cross-line conditions no single token reveals on its
+// own — the basis for correlation tips. `reqOrigin` is the Origin the paired
+// request sent, so a response's Allow-Origin can be checked for reflection.
+function msgCtx(headLines, reqOrigin) {
+  const ctx = { cl: false, te: false, acao: null, acac: false, reqOrigin: reqOrigin || "" };
+  for (let i = 1; i < headLines.length; i++) {
+    const m = headLines[i].match(/^([^:\s][^:]*):\s?(.*)$/);
+    if (!m) continue;
+    const n = m[1].trim().toLowerCase(), v = m[2].trim();
+    if (n === "content-length") ctx.cl = true;
+    else if (n === "transfer-encoding") ctx.te = true;
+    else if (n === "access-control-allow-origin") ctx.acao = v;
+    else if (n === "access-control-allow-credentials") ctx.acac = v.toLowerCase() === "true";
+  }
+  ctx.desync = ctx.cl && ctx.te;
+  return ctx;
+}
+// The Origin header carried by a raw request (empty if none) — a CORS response
+// reflecting this value is the tell for an exploitable cross-origin read.
+function reqOriginOf(req) {
+  const norm = String(req || "").replace(/\r\n/g, "\n");
+  const idx = norm.indexOf("\n\n");
+  const lines = (idx === -1 ? norm : norm.slice(0, idx)).split("\n");
+  for (let i = 1; i < lines.length; i++) {
+    const m = lines[i].match(/^origin:\s*(.+)$/i);
+    if (m) return m[1].trim();
+  }
+  return "";
+}
+function hlHttp(text, kind, reqOrigin) {
   const norm = String(text || "").replace(/\r\n/g, "\n");
   const idx = norm.indexOf("\n\n");
   const head = idx === -1 ? norm : norm.slice(0, idx);
   const body = idx === -1 ? "" : norm.slice(idx + 2);
   const headLines = head.split("\n");
+  const ctx = msgCtx(headLines, reqOrigin);
   const html = headLines.map((ln, i) =>
-    i === 0 ? (kind === "response" ? hlStatusLine(ln) : hlReqLine(ln)) : hlHeaderLine(ln)
+    i === 0 ? (kind === "response" ? hlStatusLine(ln) : hlReqLine(ln)) : hlHeaderLine(ln, ctx)
   ).join("\n");
   const bodyHtml = body ? hlBody(body, repDetectCT(headLines)) : "";
   return html + (idx === -1 ? "" : "\n\n") + bodyHtml;
@@ -3120,6 +6659,8 @@ const REP_TOKENS = [
   ["--tok-xml-tag", "XML tag"], ["--tok-xml-attr", "XML attr"],
   ["--tok-xml-str", "XML value"], ["--tok-xml-ent", "XML entity"],
   ["--tok-kw", "Keyword / attribute"],
+  ["--tok-param", "Parameter / field name"], ["--tok-val", "Modifiable value"],
+  ["--tok-sensitive", "Encoded / cookie / token"],
 ];
 const REP_THEMES = {
   "Default (adaptive)": {},
@@ -3152,15 +6693,19 @@ const REP_DISPLAY_DEFAULT = { font: "System Mono", size: 13, line: 1.6,
 let repDisplay = Object.assign({}, REP_DISPLAY_DEFAULT);
 
 function applyRepDisplay() {
-  const pane = $("pane-repeater"); if (!pane) return;
-  pane.style.setProperty("--rep-font", REP_FONTS[repDisplay.font] || REP_FONTS["System Mono"]);
-  pane.style.setProperty("--rep-font-size", repDisplay.size + "px");
-  pane.style.setProperty("--rep-line", String(repDisplay.line));
-  for (const v of REP_TOK_VARS) pane.style.removeProperty(v);    // clear prior overrides
   const theme = REP_THEMES[repDisplay.theme] || {};
-  for (const k in theme) pane.style.setProperty(k, theme[k]);
-  for (const k in repDisplay.colors) if (repDisplay.colors[k]) pane.style.setProperty(k, repDisplay.colors[k]);
+  for (const id of ["pane-repeater", "pane-http"]) {              // one shared font/colors set for Repeater + HTTP
+    const pane = $(id); if (!pane) continue;
+    pane.style.setProperty("--rep-font", REP_FONTS[repDisplay.font] || REP_FONTS["System Mono"]);
+    pane.style.setProperty("--rep-font-size", repDisplay.size + "px");
+    pane.style.setProperty("--rep-line", String(repDisplay.line));
+    for (const v of REP_TOK_VARS) pane.style.removeProperty(v);   // clear prior overrides
+    for (const k in theme) pane.style.setProperty(k, theme[k]);
+    for (const k in repDisplay.colors) if (repDisplay.colors[k]) pane.style.setProperty(k, repDisplay.colors[k]);
+  }
   repHighlightRequest();                                          // resync heights after a size change
+  // The HTTP detail recolors/resizes automatically: the token + font vars are set
+  // on #pane-http above and its read-only <pre>s inherit them (no re-render needed).
 }
 function saveRepDisplay() { try { localStorage.setItem("beatrix.rep.display", JSON.stringify(repDisplay)); } catch (e) {} }
 function loadRepDisplay() {
@@ -3204,21 +6749,29 @@ function initRepSettings() {
   $("rep-reset").onclick = () => { repDisplay = Object.assign({}, REP_DISPLAY_DEFAULT, { colors: {} }); applyRepDisplay(); saveRepDisplay(); syncRepControls(); };
 
   const gear = $("rep-gear"), pop = $("rep-pop");
-  gear.onclick = (e) => { e.stopPropagation(); const open = pop.classList.toggle("open"); if (open) buildRepColorFields(); };
+  document.body.appendChild(pop);                                 // hoist out of #pane-repeater so the HTTP gear can open it too
+  const openPop = (anchor) => { const open = pop.classList.toggle("open"); if (open) { buildRepColorFields(); placeFixedUnder(pop, anchor); } };
+  gear.onclick = (e) => { e.stopPropagation(); openPop(gear); };
+  const hgear = $("http-gear"); if (hgear) hgear.onclick = (e) => { e.stopPropagation(); openPop(hgear); };
   pop.onclick = (e) => e.stopPropagation();
   document.addEventListener("click", () => pop.classList.remove("open"));
 
-  // HTTP Tips toggle — restore the last on/off state.
-  $("rep-tips").onclick = () => setRepTips(!repTipsOn);
-  let tipsSaved = false;
-  try { tipsSaved = localStorage.getItem("beatrix.rep.tips") === "1"; } catch (e) {}
-  setRepTips(tipsSaved);
+  // Tips toggle — register the Repeater's split + button with the global engine
+  // (shared on/off state is restored centrally in setTips's init).
+  registerTipZone(document.querySelector(".rep-split"));
+  registerTipButton($("rep-tips"));
 
   // Beautify toggle — pretty-print the response body; restore the last state.
   $("rep-pretty").onclick = () => setRepPretty(!repPrettyOn);
   let prettySaved = false;
   try { prettySaved = localStorage.getItem("beatrix.rep.pretty") === "1"; } catch (e) {}
   setRepPretty(prettySaved);
+
+  // Decode toggle — auto-list decoded cookies/tokens/encoded values.
+  $("rep-decode").onclick = () => setRepDecode(!repDecodeOn);
+  let decodeSaved = false;
+  try { decodeSaved = localStorage.getItem("beatrix.rep.decode") === "1"; } catch (e) {}
+  setRepDecode(decodeSaved);
 
   applyRepDisplay();
 }
@@ -3446,7 +6999,61 @@ const HTTP_TIPS = {
     "max-forwards": { title: "Max-Forwards", desc: "Limits how many proxies a TRACE/OPTIONS request may traverse." },
     "dnt": { title: "DNT (Do Not Track)", desc: "Legacy 'do not track' preference; largely ignored today.", sec: "Its uniqueness can add to browser fingerprinting." },
     "x-content-security-policy": { title: "X-Content-Security-Policy (legacy)", desc: "Old, non-standard CSP header for legacy browsers.", sec: "If it's the ONLY CSP present, modern browsers ignore it — effectively no protection." },
-    "x-webkit-csp": { title: "X-WebKit-CSP (legacy)", desc: "Old WebKit-prefixed CSP header.", sec: "Superseded by Content-Security-Policy; ignored by modern browsers." }
+    "x-webkit-csp": { title: "X-WebKit-CSP (legacy)", desc: "Old WebKit-prefixed CSP header.", sec: "Superseded by Content-Security-Policy; ignored by modern browsers." },
+    "alt-svc": { title: "Alt-Svc", desc: "Advertises alternative services for this origin — e.g. HTTP/3 (h3) on a port.", sec: "Reveals supported protocols (HTTP/2/3) for fingerprinting; a persisted entry is cached client-side." },
+    "alt-used": { title: "Alt-Used", desc: "Names the alternative service the client actually used.", sec: "Fingerprinting signal; confirms Alt-Svc was honoured." },
+    "content-location": { title: "Content-Location", desc: "The canonical URL of the returned representation.", sec: "Can leak internal paths or an alternate (maybe less-protected) endpoint for the same resource." },
+    "trailer": { title: "Trailer", desc: "Names header fields sent after a chunked body (in the trailer).", sec: "Trailers interact with chunked framing — a factor in request-smuggling/desync; confirm both ends agree." },
+    "refresh": { title: "Refresh", desc: "Non-standard header that reloads/redirects after N seconds (meta-refresh as a header).", sec: "A controllable URL here is an open-redirect vector that bypasses some Location-based filters." },
+    "from": { title: "From", desc: "Email address of the human controlling the requesting agent.", sec: "Rarely sent by browsers; its presence often marks a bot/scanner." },
+    "accept-patch": { title: "Accept-Patch", desc: "Advertises the media types accepted by PATCH.", sec: "Reveals that PATCH is enabled and what it ingests — a mass-assignment surface." },
+    "accept-post": { title: "Accept-Post", desc: "Advertises the media types accepted by POST.", sec: "Enumerates accepted content types — try an unexpected one (XML→XXE, etc.)." },
+    "no-vary-search": { title: "No-Vary-Search", desc: "Declares which URL query params do NOT affect the cached response.", sec: "Mis-set, it can serve a cached response across params that actually matter — a cache-poisoning/deception angle." },
+    "expect-ct": { title: "Expect-CT (deprecated)", desc: "Formerly enforced Certificate Transparency.", sec: "Obsolete and ignored by modern browsers; CT is now always enforced. Its presence hints at an old config." },
+    "origin-agent-cluster": { title: "Origin-Agent-Cluster", desc: "Requests origin-keyed agent clustering (process isolation): `?1`.", sec: "A hardening/isolation hint; affects document.domain and cross-origin memory sharing." },
+    "sec-gpc": { title: "Sec-GPC", desc: "Global Privacy Control — `1` signals the user opts out of sale/sharing of data.", sec: "A legal/privacy signal (CCPA/GDPR); check the server actually honours it." },
+    "sec-purpose": { title: "Sec-Purpose", desc: "Marks a request as a prefetch/prerender (`prefetch`).", sec: "Speculative requests can trigger side effects early — ensure state-changing actions ignore prefetches." },
+    "priority": { title: "Priority", desc: "HTTP stream priority hints (urgency, incremental) — RFC 9218.", sec: "Transport tuning; little direct security impact." },
+    "early-data": { title: "Early-Data", desc: "`1` means the request arrived in TLS 1.3 0-RTT early data.", sec: "0-RTT data is REPLAYABLE — a server must reject non-idempotent actions in early data (425 Too Early) or it's open to replay." },
+    "idempotency-key": { title: "Idempotency-Key", desc: "Client-supplied key so a retried request isn't processed twice.", sec: "Logic/replay surface — test whether reuse or omission lets an action run twice (double-spend)." },
+    "accept-ch": { title: "Accept-CH", desc: "Lists client-hint headers the server wants the browser to send.", sec: "Opts the client into sending more fingerprinting surface (device, UA details)." },
+    "critical-ch": { title: "Critical-CH", desc: "Client hints critical enough to trigger a connection retry.", sec: "Same fingerprinting surface as Accept-CH, enforced harder." },
+    "save-data": { title: "Save-Data", desc: "`on` signals the user wants reduced data usage.", sec: "A fingerprinting bit; servers sometimes serve different (occasionally weaker) content." },
+    "content-digest": { title: "Content-Digest", desc: "A digest of the message body (RFC 9530).", sec: "Integrity check — tamper with the body and see if the digest is validated server-side." },
+    "repr-digest": { title: "Repr-Digest", desc: "A digest of the full representation (RFC 9530).", sec: "As Content-Digest, over the whole representation." },
+    "want-content-digest": { title: "Want-Content-Digest", desc: "Asks the peer to send a Content-Digest.", sec: "Signals digest-based integrity is in use." },
+    "signature": { title: "Signature", desc: "An HTTP Message Signature over selected components (RFC 9421).", sec: "Check which components are covered (Signature-Input) — unsigned headers/params may be tamperable." },
+    "signature-input": { title: "Signature-Input", desc: "Declares which message components a Signature covers.", sec: "The security of the signature is only as good as its coverage — look for unsigned, trusted inputs." },
+    "sec-websocket-key": { title: "Sec-WebSocket-Key", desc: "Client nonce in the WebSocket opening handshake.", sec: "NOT authentication — it only proves a WS handshake; real auth must be separate (cookies/token)." },
+    "sec-websocket-accept": { title: "Sec-WebSocket-Accept", desc: "Server's handshake proof, derived from the client key.", sec: "Confirms a WS upgrade; the WS channel itself may skip CSRF/Origin checks — test that." },
+    "sec-websocket-protocol": { title: "Sec-WebSocket-Protocol", desc: "Negotiated WebSocket subprotocol.", sec: "Sometimes misused to smuggle a bearer token — check if auth rides here." },
+    "sec-websocket-version": { title: "Sec-WebSocket-Version", desc: "WebSocket protocol version (usually 13).", sec: "Informational." },
+    "sec-websocket-extensions": { title: "Sec-WebSocket-Extensions", desc: "Negotiated WS extensions (e.g. permessage-deflate).", sec: "Compression over WS can enable CRIME-style attacks on secrets in frames." },
+    "x-robots-tag": { title: "X-Robots-Tag", desc: "Per-response indexing controls (noindex, nofollow, …).", sec: "Recon — `noindex` often marks sensitive/staging paths the owner wants hidden." },
+    "sourcemap": { title: "SourceMap", desc: "Points to a source map (.map) for minified JS/CSS.", sec: "Source-map disclosure reveals original source, comments, and paths — fetch it and read the real code." },
+    "x-sourcemap": { title: "X-SourceMap (legacy)", desc: "Legacy source-map pointer.", sec: "As SourceMap — grab the .map to recover original source." },
+    "service-worker-allowed": { title: "Service-Worker-Allowed", desc: "Widens the scope a service worker may control.", sec: "An over-broad scope plus any script-upload or XSS can register a persistent, origin-wide SW — near-permanent control." },
+    "x-aspnet-version": { title: "X-AspNet-Version", desc: "Exposes the ASP.NET runtime version.", sec: "Version disclosure — map it to known .NET CVEs; should be suppressed." },
+    "x-aspnetmvc-version": { title: "X-AspNetMvc-Version", desc: "Exposes the ASP.NET MVC version.", sec: "Version disclosure — should be suppressed." },
+    "x-generator": { title: "X-Generator", desc: "Names the CMS/framework that generated the page (e.g. Drupal).", sec: "Fingerprinting — reveals the stack and often its version." },
+    "access-control-allow-private-network": { title: "Access-Control-Allow-Private-Network", desc: "Permits a public page's CORS request to reach a private-network host.", sec: "`true` lets an internet site talk to an internal/loopback service — an SSRF/CSRF-to-internal risk; scope it tightly." },
+    "access-control-request-private-network": { title: "Access-Control-Request-Private-Network", desc: "Preflight asking to reach a private-network resource.", sec: "The request side of Private Network Access — watch what internal hosts a public origin tries to reach." },
+    "permissions-policy-report-only": { title: "Permissions-Policy-Report-Only", desc: "Reports (doesn't enforce) permissions-policy violations.", sec: "Report-only means the policy is NOT enforced yet — features are still permitted." },
+    "cross-origin-embedder-policy-report-only": { title: "Cross-Origin-Embedder-Policy-Report-Only", desc: "Reports (doesn't enforce) COEP violations.", sec: "Not enforced — cross-origin isolation is not actually in effect." },
+    "observe-browsing-topics": { title: "Observe-Browsing-Topics", desc: "Opts a response into the Topics API observation.", sec: "Privacy — participates in interest-based tracking." },
+    "sec-browsing-topics": { title: "Sec-Browsing-Topics", desc: "Sends the user's inferred advertising topics.", sec: "Privacy/fingerprinting — leaks inferred interests to the server." },
+    "attribution-reporting-eligible": { title: "Attribution-Reporting-Eligible", desc: "Marks a request as eligible for ad attribution reporting.", sec: "Ad-tech surface; privacy consideration." },
+    "integrity-policy": { title: "Integrity-Policy", desc: "Requires Subresource Integrity for certain destinations.", sec: "A hardening control — its absence means scripts can load without SRI." },
+    "cf-ray": { title: "CF-RAY", desc: "Cloudflare request id; the suffix is the datacenter (e.g. EWR).", sec: "Confirms Cloudflare fronts the origin; the datacenter code aids geo-fingerprinting and WAF-bypass research." },
+    "x-amz-cf-id": { title: "X-Amz-Cf-Id", desc: "Amazon CloudFront request id.", sec: "Confirms CloudFront/AWS fronting — useful for origin-discovery / WAF-bypass work." },
+    "x-served-by": { title: "X-Served-By", desc: "Varnish/Fastly cache node that served the response.", sec: "Reveals CDN/cache topology and node names." },
+    "x-vercel-id": { title: "X-Vercel-Id", desc: "Vercel edge request id (includes region).", sec: "Confirms Vercel hosting and edge region — fingerprinting." },
+    "warning": { title: "Warning (deprecated)", desc: "Carried cache/transformation warnings.", sec: "Obsolete; its presence hints at an old intermediary." },
+    "tk": { title: "Tk (deprecated)", desc: "Tracking-status response to DNT.", sec: "Part of the defunct Do-Not-Track effort; informational." },
+    "sec-ch-ua-arch": { title: "Sec-CH-UA-Arch", desc: "Client-hint: CPU architecture (x86, arm).", sec: "Fingerprinting surface (sent only if the server requested it via Accept-CH)." },
+    "sec-ch-ua-model": { title: "Sec-CH-UA-Model", desc: "Client-hint: device model.", sec: "High-entropy fingerprinting bit, especially on mobile." },
+    "sec-ch-ua-platform-version": { title: "Sec-CH-UA-Platform-Version", desc: "Client-hint: OS version.", sec: "Fingerprinting; also hints at patch level." },
+    "sec-ch-ua-full-version-list": { title: "Sec-CH-UA-Full-Version-List", desc: "Client-hint: full browser version list.", sec: "Exact browser versions aid targeted exploitation and fingerprinting." }
   },
   tags: {
     "html": { title: "<html>", desc: "The root element of an HTML document." },
@@ -3548,7 +7155,16 @@ const HTTP_TIPS = {
     "kw-wasm-unsafe-eval": { title: "'wasm-unsafe-eval'", desc: "Allows compiling/instantiating WebAssembly without allowing JS eval().", sec: "Narrower than 'unsafe-eval', but still review why Wasm compilation is needed." },
     "kw-unsafe-hashes": { title: "'unsafe-hashes'", desc: "Allows specific inline event handlers/style attributes by hash.", sec: "Loosens script-src-attr — confirm the hashed handlers are truly static." },
     "kw-report-sample": { title: "'report-sample'", desc: "Includes a short sample of the offending code in violation reports." },
-    "kw-inline-speculation-rules": { title: "'inline-speculation-rules'", desc: "Allows inline <script type=speculationrules> for prefetch/prerender hints." }
+    "kw-inline-speculation-rules": { title: "'inline-speculation-rules'", desc: "Allows inline <script type=speculationrules> for prefetch/prerender hints." },
+    "kw-trusted-types-eval": { title: "'trusted-types-eval'", desc: "Allows eval()-family calls only when a Trusted Type is passed.", sec: "Safer than 'unsafe-eval' — permits eval only with enforced Trusted Types." },
+    "nonce": { title: "'nonce-…' (CSP nonce)", desc: "A per-response random token; a <script>/<style> runs only if its nonce attribute matches.", sec: "Must be unpredictable and regenerated every response. A static/reused nonce, or one reflected from input, defeats the CSP — test for both." },
+    "hash": { title: "'sha256/384/512-…' (CSP hash)", desc: "Allows an inline <script>/<style> whose content hashes to this value.", sec: "Pins exact inline code. With 'strict-dynamic', a hashed loader can still pull in more script — trace what it loads." },
+    "fenced-frame-src": { title: "fenced-frame-src", desc: "Restricts which URLs may load in a <fencedframe>.", sec: "Newer directive; absence falls back to frame-src/child-src/default-src." },
+    "http": { title: "http: (scheme source)", desc: "Allows plaintext HTTP origins for this directive.", sec: "Permits mixed/insecure content — nearly as weak as '*' and MITM-able." },
+    "filesystem": { title: "filesystem: (scheme source)", desc: "Allows filesystem: URLs for this directive.", sec: "Rarely needed; an unusual allowance worth questioning." },
+    "mediastream": { title: "mediastream: (scheme source)", desc: "Allows mediastream: URIs for this directive.", sec: "Rarely needed outside media apps." },
+    "ws": { title: "ws: (scheme source)", desc: "Allows plaintext WebSocket origins (connect-src).", sec: "Unencrypted WS is MITM-able; prefer wss:." },
+    "wss": { title: "wss: (scheme source)", desc: "Allows secure WebSocket origins (connect-src).", sec: "A bare wss: trusts every secure WS endpoint." }
   },
   cc: {
     "no-store": { title: "no-store", desc: "Never cache this response anywhere.", sec: "Correct for sensitive pages; its absence can leak data into shared caches." },
@@ -3643,6 +7259,385 @@ const HTTP_TIPS = {
     "download": { title: "download (a)", desc: "Marks the link as a download and suggests a filename.", sec: "A controllable filename can enable reflected-file-download / misleading saves." },
     "allow": { title: "allow (iframe)", desc: "Feature-policy grant list for the framed document (camera, geolocation, ...).", sec: "Over-broad grants let embedded/injected content use powerful browser features." },
     "loading": { title: "loading", desc: "Lazy- or eager-loads an image/iframe ('lazy' / 'eager')." }
+  },
+  // Correlation tips: stamped by the highlighter only when a cross-line
+  // condition holds (see msgCtx), so the key already implies the finding.
+  corr: {
+    "desync": { title: "Content-Length + Transfer-Encoding together",
+      desc: "This message carries BOTH Content-Length and Transfer-Encoding. HTTP/1.1 says Transfer-Encoding wins and Content-Length is ignored, but a front-end proxy and the back-end often disagree on which to honor.",
+      sec: "The classic request-smuggling / desync setup (CL.TE or TE.CL): when two hops frame the body differently, the leftover bytes become a prefix on the next request. Worth probing by obfuscating the Transfer-Encoding header (spacing / casing / duplicates) and comparing how each hop responds." },
+    "cors-star": { title: "Access-Control-Allow-Origin: *",
+      desc: "The response lets any origin read it via CORS.",
+      sec: "Fine for genuinely public data. If this endpoint returns anything user- or session-specific, any website can read it. Browsers ignore '*' for credentialed requests, so check whether credentials are in play." },
+    "cors-star-creds": { title: "Allow-Origin '*' with credentials — contradictory",
+      desc: "Allow-Origin is '*' while Allow-Credentials is true.",
+      sec: "Browsers reject this exact pair, so it usually means a broken config rather than a direct read. But it shows the server relaxes CORS carelessly — send a concrete Origin and see whether it gets echoed back with credentials still allowed." },
+    "cors-null": { title: "Access-Control-Allow-Origin: null",
+      desc: "The response grants CORS access to the 'null' origin.",
+      sec: "'null' is reachable by others — sandboxed iframes, data:/file: documents, and some redirects all send Origin: null. Treat it as attacker-reachable." },
+    "cors-null-creds": { title: "Allow-Origin 'null' with credentials",
+      desc: "Allow-Origin is 'null' AND Allow-Credentials is true.",
+      sec: "A document in a sandboxed iframe sends Origin: null, so another origin can read this credentialed response. Strong CORS finding — a sandboxed-iframe fetch is the usual proof." },
+    "cors-reflect": { title: "Allow-Origin reflects your Origin",
+      desc: "Allow-Origin equals the Origin you sent — the server echoes whatever Origin it receives.",
+      sec: "Reflection means every origin passes the CORS check. Low impact on its own; confirm whether credentials are allowed and whether the data is sensitive." },
+    "cors-reflect-creds": { title: "Allow-Origin reflects your Origin + credentials",
+      desc: "The server echoes your Origin in Allow-Origin AND sets Allow-Credentials: true.",
+      sec: "The textbook exploitable CORS case: any origin is reflected and credentials ride along, so another origin can read this response with the victim's session. A cross-origin fetch with credentials:'include' from an unrelated origin is the proof." },
+    "cors-creds": { title: "Access-Control-Allow-Credentials: true",
+      desc: "Allows cross-origin responses to be read WITH cookies / credentials by the permitted origin(s).",
+      sec: "The risk is the pairing flagged here: 'true' alongside a permissive or reflected Allow-Origin is what makes the response readable with the victim's session." }
+  },
+  // JSON body field names worth a second look. Keys are normalized (lowercase,
+  // no _ or -), so user_id / userId / user-id all resolve here.
+  json: {
+    "id": { title: "id", desc: "A generic object identifier.", sec: "Prime IDOR / BOLA target — swap it for another id (±1, another user's) and see if authorization is enforced server-side." },
+    "userid": { title: "user id", desc: "References a specific user.", sec: "Change it to another user's id to test horizontal access control (IDOR)." },
+    "accountid": { title: "account id", desc: "References an account.", sec: "IDOR — can you read or act on an account that isn't yours?" },
+    "customerid": { title: "customer id", desc: "References a customer record.", sec: "IDOR on customer data — try neighbouring ids." },
+    "orgid": { title: "org id", desc: "References an organization / workspace.", sec: "Cross-tenant IDOR — reaching another org's data is usually high severity." },
+    "tenantid": { title: "tenant id", desc: "Multi-tenant partition key.", sec: "Change it to test tenant isolation — a classic SaaS cross-tenant break." },
+    "groupid": { title: "group id", desc: "References a group / team.", sec: "IDOR — can you view or modify a group you don't belong to?" },
+    "projectid": { title: "project id", desc: "References a project.", sec: "IDOR — try ids outside your projects." },
+    "orderid": { title: "order id", desc: "References an order.", sec: "IDOR — other users' orders expose PII and purchase data." },
+    "invoiceid": { title: "invoice id", desc: "References an invoice.", sec: "IDOR — invoices leak billing details and amounts." },
+    "fileid": { title: "file id", desc: "References a stored file.", sec: "IDOR — can you fetch files you didn't upload?" },
+    "documentid": { title: "document id", desc: "References a document.", sec: "IDOR on documents — often sensitive." },
+    "objectid": { title: "object id", desc: "References a stored object (often MongoDB).", sec: "IDOR; a 24-hex ObjectId also leaks a creation timestamp." },
+    "uuid": { title: "uuid", desc: "A universally-unique identifier.", sec: "Hard to guess, but still test if one is leaked/enumerable, and whether v1 UUIDs leak time/MAC." },
+    "guid": { title: "guid", desc: "Globally-unique identifier (UUID).", sec: "As with uuid — unpredictability is not authorization; test if leaked." },
+    "role": { title: "role", desc: "The principal's role.", sec: "Mass-assignment / privilege escalation — try submitting role=admin where only the server should set it." },
+    "roles": { title: "roles", desc: "List of assigned roles.", sec: "Try adding a privileged role; check if it's trusted on write." },
+    "isadmin": { title: "is_admin", desc: "Admin flag.", sec: "Mass-assignment — setting it true in a request is a textbook privilege-escalation test." },
+    "admin": { title: "admin", desc: "Admin flag / section.", sec: "Try flipping it on where it shouldn't be client-settable." },
+    "isstaff": { title: "is_staff", desc: "Staff/internal flag (Django-style).", sec: "Mass-assignment to gain internal privileges." },
+    "superuser": { title: "superuser", desc: "Full-privilege flag.", sec: "The highest-value mass-assignment target — test writability." },
+    "scope": { title: "scope", desc: "Granted OAuth/permission scope.", sec: "Try widening it (e.g. add admin / write scopes) and see if it's honoured." },
+    "scopes": { title: "scopes", desc: "List of granted scopes.", sec: "Add privileged scopes and check server-side enforcement." },
+    "permissions": { title: "permissions", desc: "Explicit permission set.", sec: "Mass-assignment — can you grant yourself permissions on write?" },
+    "acl": { title: "acl", desc: "Access-control list.", sec: "If client-supplied, try granting yourself access." },
+    "plan": { title: "plan", desc: "Subscription / pricing plan.", sec: "Logic bug — can you set a higher plan without paying?" },
+    "tier": { title: "tier", desc: "Account tier.", sec: "Try upgrading your tier via the request body." },
+    "accesslevel": { title: "access_level", desc: "Numeric/str access level.", sec: "Mass-assignment — raise it and test." },
+    "usertype": { title: "user_type", desc: "Account type / class.", sec: "Switching type (e.g. user→admin) is a privilege-escalation test." },
+    "verified": { title: "verified", desc: "Verification flag.", sec: "Try setting it true to bypass a verification step." },
+    "emailverified": { title: "email_verified", desc: "Email-confirmed flag.", sec: "Flip it true to skip email confirmation (account takeover aid)." },
+    "active": { title: "active", desc: "Enabled/active flag.", sec: "Mass-assignment — reactivating or enabling accounts you shouldn't." },
+    "enabled": { title: "enabled", desc: "Feature/account enabled flag.", sec: "Try enabling gated features via the body." },
+    "status": { title: "status", desc: "State of the object (e.g. pending/approved).", sec: "Logic bug — can you self-approve by setting status directly?" },
+    "password": { title: "password", desc: "A credential.", sec: "Must never appear in a response. On write, check for reset/change flows that skip the current-password check." },
+    "passwd": { title: "passwd", desc: "A credential (unix-style name).", sec: "Should never be returned; see password." },
+    "pwd": { title: "pwd", desc: "A credential (short name).", sec: "Should never be returned; see password." },
+    "newpassword": { title: "new_password", desc: "Replacement credential in a change/reset.", sec: "Test whether it's accepted without the current password or a valid reset token (account takeover)." },
+    "token": { title: "token", desc: "An opaque auth/reset/verification token.", sec: "Check entropy, expiry, and single-use; a leaked or guessable token is often account takeover." },
+    "accesstoken": { title: "access_token", desc: "OAuth/API access token.", sec: "Must not leak to third parties; test scope and expiry. Decodes if it's a JWT." },
+    "refreshtoken": { title: "refresh_token", desc: "Long-lived token that mints access tokens.", sec: "Very high value — if it leaks, sessions can be renewed indefinitely." },
+    "idtoken": { title: "id_token", desc: "OIDC identity token (JWT).", sec: "Inspect claims and signature; see the JWT tip." },
+    "apikey": { title: "api_key", desc: "A static API credential.", sec: "Never expose in responses/URLs; test whether it's over-privileged or reusable." },
+    "secret": { title: "secret", desc: "A secret value.", sec: "Should never be returned to a client — a disclosed secret is a finding on its own." },
+    "clientsecret": { title: "client_secret", desc: "OAuth client secret.", sec: "If exposed to a browser/mobile client it's compromised — enables token theft." },
+    "clientid": { title: "client_id", desc: "OAuth client identifier.", sec: "Public, but pairs with redirect_uri — test open-redirect / client confusion in the OAuth flow." },
+    "privatekey": { title: "private_key", desc: "A private cryptographic key.", sec: "Catastrophic if returned to a client — report immediately." },
+    "session": { title: "session", desc: "Session identifier/blob.", sec: "Check it's unpredictable and rotated on login; a predictable value enables fixation/hijack." },
+    "sessionid": { title: "session_id", desc: "Session identifier.", sec: "See session — test entropy and rotation." },
+    "jwt": { title: "jwt", desc: "A JSON Web Token.", sec: "Decode it (see the JWT tip) — check alg, expiry, and whether privileged claims are trusted." },
+    "otp": { title: "otp", desc: "One-time password / code.", sec: "Test rate-limiting and whether it's ever returned in a response (it shouldn't be)." },
+    "totp": { title: "totp", desc: "Time-based one-time code.", sec: "Check it's not echoed back and that attempts are throttled." },
+    "pin": { title: "pin", desc: "Numeric PIN.", sec: "Low entropy — brute-force / throttling is the test." },
+    "csrftoken": { title: "csrf_token", desc: "Anti-CSRF token.", sec: "Check it's bound to the session and validated; a token that's optional or reflected is a CSRF gap." },
+    "card": { title: "card", desc: "Payment card data.", sec: "PCI-sensitive — must be masked/tokenized, never returned in full." },
+    "cardnumber": { title: "card_number", desc: "A PAN.", sec: "Must never be returned unmasked — a disclosure finding." },
+    "cvv": { title: "cvv", desc: "Card security code.", sec: "Must never be stored or returned — flag if present." },
+    "ssn": { title: "ssn", desc: "Social-security / national id number.", sec: "High-sensitivity PII; must be masked and access-controlled." },
+    "url": { title: "url", desc: "A URL the server may fetch or redirect to.", sec: "SSRF / open-redirect — point it at internal hosts (169.254.169.254, localhost) or an attacker domain." },
+    "uri": { title: "uri", desc: "A URI the server may act on.", sec: "Same as url — test SSRF / redirect." },
+    "redirect": { title: "redirect", desc: "Post-action redirect destination.", sec: "Open-redirect — try an external and a protocol-relative (//evil) value." },
+    "redirecturi": { title: "redirect_uri", desc: "OAuth redirect target.", sec: "A loose match enables token theft via open redirect — test subdomain/path tricks." },
+    "returnurl": { title: "return_url", desc: "Where to return after an action.", sec: "Open-redirect test." },
+    "next": { title: "next", desc: "Next-page/redirect destination.", sec: "Open-redirect — common in login flows." },
+    "callback": { title: "callback", desc: "Callback URL or JSONP function.", sec: "SSRF (URL) or XSS/JSONP leakage (function name) — test both readings." },
+    "webhook": { title: "webhook", desc: "A URL the server will call.", sec: "SSRF by design — aim it at internal services and inspect the result/timing." },
+    "link": { title: "link", desc: "A URL value.", sec: "SSRF / open-redirect depending on how it's used." },
+    "file": { title: "file", desc: "A file name/path the server reads.", sec: "Path traversal / LFI — try ../ sequences and absolute paths." },
+    "filename": { title: "filename", desc: "Name of a file to store/serve.", sec: "Path traversal and unsafe extensions — test ../ and double extensions on upload." },
+    "path": { title: "path", desc: "A filesystem or URL path.", sec: "Traversal (../) and SSRF depending on use." },
+    "template": { title: "template", desc: "A template name or inline template.", sec: "SSTI if rendered, LFI if a path — try engine probes like {{7*7}}." },
+    "include": { title: "include", desc: "A resource to include.", sec: "LFI / RFI — test local paths and remote URLs." },
+    "amount": { title: "amount", desc: "A monetary amount/quantity.", sec: "Business-logic — try negatives, zero, huge values, and extra precision." },
+    "price": { title: "price", desc: "A price value.", sec: "If client-supplied, try lowering it — price tampering." },
+    "total": { title: "total", desc: "An order/cart total.", sec: "Check it's recomputed server-side, not trusted from the client." },
+    "balance": { title: "balance", desc: "An account balance.", sec: "Logic bug — can you set or overdraw it?" },
+    "quantity": { title: "quantity", desc: "An item quantity.", sec: "Try negatives/overflow to invert pricing or stock logic." },
+    "discount": { title: "discount", desc: "A discount value/percent.", sec: "Try stacking or >100% — logic abuse." },
+    "currency": { title: "currency", desc: "A currency code.", sec: "Currency confusion — mismatched codes can undercharge." },
+    "coupon": { title: "coupon", desc: "A promo/coupon code.", sec: "Test reuse, stacking, and enumeration of valid codes." },
+    "query": { title: "query", desc: "A search/query string — or a GraphQL document.", sec: "Injection surface (SQL/NoSQL/search); if it carries GraphQL, check introspection." },
+    "search": { title: "search", desc: "A search term.", sec: "Reflected XSS / injection surface — probe with context-breaking payloads." },
+    "filter": { title: "filter", desc: "A filter expression.", sec: "NoSQL / query injection — try operator objects ($ne, $gt) and boolean logic." },
+    "sort": { title: "sort", desc: "A sort field/direction.", sec: "Sometimes a raw column name — test SQL injection / column disclosure." },
+    "cmd": { title: "cmd", desc: "A command string.", sec: "Command-injection red flag — probe with ;, |, and backticks (authorized targets only)." },
+    "sql": { title: "sql", desc: "A raw SQL fragment.", sec: "If client-influenced, direct SQL injection — treat with care." }
+  },
+  // URL query/path parameter names. Keys normalized like json (lowercase, no _/-).
+  param: {
+    "redirect": { title: "redirect", desc: "Where to send the browser next.", sec: "Open-redirect — try an absolute URL and //evil.example (protocol-relative)." },
+    "redirecturi": { title: "redirect_uri", desc: "OAuth redirect target.", sec: "Loose validation → token theft; test subdomain, path, and @-tricks." },
+    "redirecturl": { title: "redirect_url", desc: "Redirect destination.", sec: "Open-redirect test." },
+    "url": { title: "url", desc: "A URL the server fetches or redirects to.", sec: "SSRF (internal hosts, cloud metadata) and open-redirect." },
+    "uri": { title: "uri", desc: "A URI parameter.", sec: "SSRF / redirect depending on use." },
+    "next": { title: "next", desc: "Next/return destination.", sec: "Open-redirect, especially in login flows." },
+    "return": { title: "return", desc: "Return destination after an action.", sec: "Open-redirect test." },
+    "returnurl": { title: "returnurl", desc: "Return destination.", sec: "Open-redirect test." },
+    "continue": { title: "continue", desc: "Where to continue after auth.", sec: "Open-redirect (Google-style param)." },
+    "dest": { title: "dest", desc: "Destination URL/path.", sec: "Open-redirect / SSRF." },
+    "destination": { title: "destination", desc: "Destination URL/path.", sec: "Open-redirect / SSRF." },
+    "callback": { title: "callback", desc: "Callback URL or JSONP function name.", sec: "SSRF (URL) or JSONP data theft / XSS (function) — test both." },
+    "jsonp": { title: "jsonp", desc: "JSONP callback name.", sec: "Reflected into a script context — XSS and cross-origin data theft." },
+    "imageurl": { title: "image_url", desc: "A remote image URL to fetch.", sec: "SSRF via image fetch / thumbnailing." },
+    "feed": { title: "feed", desc: "A feed URL to fetch.", sec: "SSRF — server-side fetch of attacker URL." },
+    "to": { title: "to", desc: "A destination (URL or recipient).", sec: "Open-redirect if a URL." },
+    "out": { title: "out", desc: "Outbound link target.", sec: "Open-redirect (link-tracking pattern)." },
+    "link": { title: "link", desc: "A URL value.", sec: "Open-redirect / SSRF." },
+    "host": { title: "host", desc: "A hostname parameter.", sec: "SSRF / host-header-style routing abuse." },
+    "domain": { title: "domain", desc: "A domain parameter.", sec: "SSRF / redirect / trust-boundary confusion." },
+    "proxy": { title: "proxy", desc: "A proxy/forward target.", sec: "SSRF by design — test internal reach." },
+    "file": { title: "file", desc: "A file to read/serve.", sec: "Path traversal / LFI — try ../ and absolute paths." },
+    "path": { title: "path", desc: "A path parameter.", sec: "Traversal / LFI, or SSRF if a URL path." },
+    "page": { title: "page", desc: "A page name/number.", sec: "If it names a file/template: LFI or SSTI — test non-numeric values." },
+    "filename": { title: "filename", desc: "A file name.", sec: "Traversal and unsafe extensions." },
+    "template": { title: "template", desc: "A template to render.", sec: "SSTI if rendered ({{7*7}}), LFI if a path." },
+    "include": { title: "include", desc: "A resource to include.", sec: "LFI / RFI." },
+    "dir": { title: "dir", desc: "A directory parameter.", sec: "Path traversal / listing." },
+    "document": { title: "document", desc: "A document to load.", sec: "LFI / IDOR depending on backend." },
+    "folder": { title: "folder", desc: "A folder parameter.", sec: "Path traversal / listing." },
+    "download": { title: "download", desc: "A resource to download.", sec: "Traversal / arbitrary-file-read." },
+    "load": { title: "load", desc: "A resource to load.", sec: "LFI / SSRF depending on use." },
+    "view": { title: "view", desc: "A view/file to render.", sec: "LFI / SSTI." },
+    "cmd": { title: "cmd", desc: "A command parameter.", sec: "Command injection red flag (authorized targets only)." },
+    "exec": { title: "exec", desc: "A command/action to execute.", sec: "Command injection / unsafe dispatch." },
+    "command": { title: "command", desc: "A command parameter.", sec: "Command injection red flag." },
+    "code": { title: "code", desc: "Code, or an OAuth authorization code.", sec: "If OAuth: test single-use/expiry/binding. If evaluated: code injection." },
+    "eval": { title: "eval", desc: "An expression to evaluate.", sec: "Code/expression injection." },
+    "query": { title: "query", desc: "A query string.", sec: "Injection (SQL/NoSQL/search) and reflected XSS." },
+    "q": { title: "q", desc: "A search query (short form).", sec: "Reflected XSS and injection surface." },
+    "search": { title: "search", desc: "A search term.", sec: "Reflected XSS / injection." },
+    "lang": { title: "lang", desc: "A language/locale — sometimes a file path.", sec: "LFI via locale file selection; test ../." },
+    "id": { title: "id", desc: "An object identifier.", sec: "IDOR / BOLA — enumerate and test authorization." },
+    "user": { title: "user", desc: "A user selector.", sec: "IDOR — try other usernames/ids." },
+    "userid": { title: "user_id", desc: "A user id.", sec: "IDOR." },
+    "account": { title: "account", desc: "An account selector.", sec: "IDOR." },
+    "uid": { title: "uid", desc: "A user id (short).", sec: "IDOR." },
+    "order": { title: "order", desc: "An order selector — or a sort direction.", sec: "IDOR (order id) or SQLi (ORDER BY) depending on use." },
+    "token": { title: "token", desc: "A token in the URL.", sec: "Tokens in URLs leak via logs/Referer — test entropy and expiry." },
+    "key": { title: "key", desc: "An API key or object key.", sec: "Keys in URLs leak; test over-privilege." },
+    "apikey": { title: "api_key", desc: "An API key in the URL.", sec: "Leaks via logs/Referer — should be a header instead." },
+    "admin": { title: "admin", desc: "An admin toggle/section.", sec: "Try admin=1/true for forced-browsing privilege bumps." },
+    "debug": { title: "debug", desc: "A debug toggle.", sec: "Try debug=1/true — can expose stack traces, config, or verbose errors." },
+    "test": { title: "test", desc: "A test toggle.", sec: "May unlock non-prod behaviour or bypass checks." },
+    "impersonate": { title: "impersonate", desc: "Act-as-another-user selector.", sec: "If reachable without strong authz, direct account takeover." },
+    "format": { title: "format", desc: "Response format selector.", sec: "Switching format can expose debug/XML (XXE) or bypass filters." }
+  },
+  // GraphQL tokens (only the keys the highlighter actually stamps are listed).
+  gql: {
+    "query": { title: "query (GraphQL)", desc: "A read operation.", sec: "Still enforce authz per-field; check for sensitive fields reachable unauthenticated." },
+    "mutation": { title: "mutation (GraphQL)", desc: "A state-changing operation.", sec: "Test authorization and CSRF — mutations are the write surface." },
+    "subscription": { title: "subscription (GraphQL)", desc: "A real-time (usually WebSocket) operation.", sec: "Check auth on the socket handshake and per-event authorization." },
+    "fragment": { title: "fragment (GraphQL)", desc: "A reusable selection set.", sec: "Can be abused for deeply-nested/cyclic queries → DoS; check depth limits." },
+    "operation": { title: "GraphQL operation", desc: "This value is a GraphQL document.", sec: "Watch for aliasing/batching (rate-limit & brute-force bypass) and deep nesting (DoS); confirm per-field authorization." },
+    "introspection": { title: "GraphQL introspection", desc: "__schema / __type query the API's own schema.", sec: "Introspection in production leaks the entire API surface — try {__schema{types{name}}}. Even if disabled, 'did you mean' field suggestions can leak it." },
+    "__typename": { title: "__typename", desc: "Meta-field returning an object's type name.", sec: "Harmless alone, but a reliable tell that an endpoint is GraphQL — then probe introspection and nested queries." }
+  },
+  // Vary tokens — each names part of the cache key.
+  vary: {
+    "origin": { title: "Vary: Origin", desc: "Responses are cached per request Origin.", sec: "Correct for CORS; its ABSENCE when ACAO is dynamic is a cache-poisoning risk." },
+    "cookie": { title: "Vary: Cookie", desc: "Cached per Cookie header.", sec: "Prevents serving one user's authenticated response to another — its absence on personalized pages is dangerous." },
+    "accept-encoding": { title: "Vary: Accept-Encoding", desc: "Cached per compression.", sec: "Routine; mainly a correctness/BREACH-era consideration." },
+    "user-agent": { title: "Vary: User-Agent", desc: "Cached per UA string.", sec: "Explodes the cache key (UAs are near-unique) — often a sign of UA-based logic worth poking." },
+    "accept": { title: "Vary: Accept", desc: "Cached per Accept header.", sec: "Content negotiation — try Accept: application/xml etc. to reach alternate (maybe weaker) handlers." }
+  },
+  // Content-Disposition params (keys normalized: filename* → filename, form-data → formdata).
+  cd: {
+    "filename": { title: "filename", desc: "Suggested name for a downloaded/uploaded file.", sec: "On download: reflected-file-download and header-injection if attacker-influenced. On upload: path traversal / unsafe extension." },
+    "attachment": { title: "attachment", desc: "Forces a download rather than inline render.", sec: "A safety control — its absence on user content enables inline HTML/SVG XSS." },
+    "inline": { title: "inline", desc: "Renders the content in the browser.", sec: "Risky for user-uploaded HTML/SVG/PDF — can execute script in your origin." },
+    "formdata": { title: "form-data", desc: "A multipart form field part.", sec: "Note the field 'name' and any 'filename' — upload bypasses often live in these." }
+  },
+  // WWW-Authenticate scheme + params.
+  wwwauth: {
+    "basic": { title: "Basic (challenge)", desc: "Server asks for Basic credentials.", sec: "Base64, not encryption — only acceptable over TLS." },
+    "bearer": { title: "Bearer (challenge)", desc: "Server asks for a bearer token.", sec: "Inspect the 'error'/'error_description' params — they often reveal why auth failed (expired/invalid scope)." },
+    "digest": { title: "Digest (challenge)", desc: "Challenge-response auth with a nonce.", sec: "Note realm/nonce/qop; weak algorithms (MD5) and nonce reuse are the angles." },
+    "negotiate": { title: "Negotiate (challenge)", desc: "SPNEGO / Kerberos-NTLM.", sec: "Enterprise SSO — indicates Windows integrated auth." },
+    "ntlm": { title: "NTLM (challenge)", desc: "NTLM authentication.", sec: "Legacy; relay and brute-force considerations on internal tests." },
+    "realm": { title: "realm", desc: "Names the protection space.", sec: "Reveals app/area naming and sometimes internal structure." },
+    "charset": { title: "charset", desc: "Expected credential charset (UTF-8).", sec: "Informational." },
+    "error": { title: "error", desc: "Machine-readable auth error (Bearer).", sec: "invalid_token vs insufficient_scope tells you whether the token or its scope failed — guides the next probe." },
+    "nonce": { title: "nonce", desc: "Server one-time value (Digest).", sec: "Check for reuse / predictability." },
+    "qop": { title: "qop", desc: "Quality of protection (Digest).", sec: "auth vs auth-int; absence weakens the scheme." },
+    "stale": { title: "stale", desc: "Nonce-expired hint (Digest).", sec: "stale=true means retry with a fresh nonce, not a wrong password." },
+    "algorithm": { title: "algorithm", desc: "Digest hash algorithm.", sec: "MD5 is weak — prefer SHA-256 variants." }
+  },
+  // Referrer-Policy values (keys keep their hyphens).
+  refpol: {
+    "no-referrer": { title: "no-referrer", desc: "Never send the Referer header.", sec: "Safest — no URL leakage." },
+    "no-referrer-when-downgrade": { title: "no-referrer-when-downgrade", desc: "Send Referer except HTTPS→HTTP.", sec: "The old default; full URL still goes to any https site — leaks path/query cross-site." },
+    "origin": { title: "origin", desc: "Send only the origin, never the path.", sec: "Good — strips tokens embedded in the path/query." },
+    "origin-when-cross-origin": { title: "origin-when-cross-origin", desc: "Full URL same-origin, origin-only cross-origin.", sec: "Cross-site leakage is limited to the origin — reasonable." },
+    "same-origin": { title: "same-origin", desc: "Referer only for same-origin requests.", sec: "Good — no cross-site leakage." },
+    "strict-origin": { title: "strict-origin", desc: "Origin only, and nothing on HTTPS→HTTP.", sec: "Good." },
+    "strict-origin-when-cross-origin": { title: "strict-origin-when-cross-origin", desc: "Modern default: full URL same-origin, origin cross-origin, none on downgrade.", sec: "Sensible default." },
+    "unsafe-url": { title: "unsafe-url", desc: "Always send the full URL.", sec: "Dangerous — leaks full path/query (tokens, ids) to every cross-site destination." }
+  },
+  // Content-Encoding / Accept-Encoding tokens (ce:).
+  ce: {
+    "gzip": { title: "gzip", desc: "LZ77 + CRC32 compression (the UNIX gzip format).", sec: "Decompression can be a DoS vector (zip-bomb) if unbounded; with reflected secrets, historically BREACH." },
+    "br": { title: "br (Brotli)", desc: "Brotli compression (RFC 7932), common over HTTPS.", sec: "Modern browsers only — its use hints at a current server/CDN." },
+    "zstd": { title: "zstd (Zstandard)", desc: "Zstandard compression (RFC 8878).", sec: "Newer than br; some tools/proxies can't decode it, which can mask response content during testing." },
+    "deflate": { title: "deflate", desc: "zlib/deflate compression (RFC 1950/1951).", sec: "Ambiguous raw-vs-zlib framing occasionally trips decoders." },
+    "compress": { title: "compress", desc: "Legacy LZW (UNIX compress) — effectively unused today.", sec: "Its presence is unusual and worth a second look." },
+    "identity": { title: "identity", desc: "No transformation — the body is sent as-is.", sec: "Explicitly requesting identity can bypass compression-based defenses." },
+    "dcb": { title: "dcb", desc: "Dictionary-Compressed Brotli (Compression Dictionary Transport).", sec: "Dictionary transport is new; shared dictionaries have their own privacy/poisoning considerations." },
+    "dcz": { title: "dcz", desc: "Dictionary-Compressed Zstandard.", sec: "As dcb, Zstandard variant." }
+  },
+  // Transfer-Encoding tokens (tenc:) — framing, not payload encoding.
+  tenc: {
+    "chunked": { title: "chunked", desc: "Body sent as size-prefixed chunks; length is implicit.", sec: "The heart of request-smuggling/desync — if a front proxy and back-end disagree on chunked parsing (esp. alongside Content-Length), you can smuggle a request. Probe obfuscated/duplicate TE." },
+    "gzip": { title: "gzip (transfer coding)", desc: "Per-hop gzip of the transfer, distinct from Content-Encoding.", sec: "Rare as a transfer coding; unusual framing can confuse intermediaries." },
+    "deflate": { title: "deflate (transfer coding)", desc: "Per-hop deflate transfer coding.", sec: "Rare; note it for desync testing." },
+    "compress": { title: "compress (transfer coding)", desc: "Per-hop LZW transfer coding.", sec: "Legacy/rare." },
+    "identity": { title: "identity (transfer coding)", desc: "No transfer coding applied.", sec: "Informational." }
+  },
+  // Connection tokens (conn:).
+  conn: {
+    "keep-alive": { title: "keep-alive", desc: "Reuse the TCP connection for further requests.", sec: "Connection reuse is what makes request-smuggling impactful — a smuggled prefix poisons the next request on the socket." },
+    "close": { title: "close", desc: "Close the connection after this message.", sec: "Prevents keep-alive reuse; a server forcing close can thwart some smuggling." },
+    "upgrade": { title: "upgrade", desc: "Switch protocols (e.g. to WebSocket/h2c).", sec: "h2c-upgrade smuggling and WebSocket hijack both start here — check Origin/auth on the upgrade." }
+  },
+  // Permissions-Policy feature tokens (pp:). Allowlist semantics: () disables,
+  // self = same-origin only, * = every origin (risky for sensitive features).
+  pp: {
+    "camera": { title: "camera", desc: "Access to video input.", sec: "Should be () or self — * grants every embedded origin the webcam." },
+    "microphone": { title: "microphone", desc: "Access to audio input.", sec: "Should be () or self; * is a privacy risk." },
+    "geolocation": { title: "geolocation", desc: "Access to physical location.", sec: "Should be tightly scoped; * leaks location to any iframe." },
+    "payment": { title: "payment", desc: "Payment Request API.", sec: "Granting it to third-party frames enables payment-UI abuse." },
+    "usb": { title: "usb", desc: "WebUSB device access.", sec: "Direct hardware access — should almost always be ()." },
+    "serial": { title: "serial", desc: "Web Serial device access.", sec: "Hardware access — default to ()." },
+    "hid": { title: "hid", desc: "WebHID device access.", sec: "Hardware access — default to ()." },
+    "bluetooth": { title: "bluetooth", desc: "Web Bluetooth access.", sec: "Hardware access — default to ()." },
+    "midi": { title: "midi", desc: "Web MIDI access.", sec: "Device access — default to ()." },
+    "display-capture": { title: "display-capture", desc: "Screen capture via getDisplayMedia().", sec: "Screen-sharing — a third-party frame with this is dangerous." },
+    "fullscreen": { title: "fullscreen", desc: "Fullscreen API.", sec: "Fullscreen can aid UI-spoofing/clickjacking if granted broadly." },
+    "autoplay": { title: "autoplay", desc: "Autoplay of media.", sec: "Low risk; mostly UX." },
+    "accelerometer": { title: "accelerometer", desc: "Motion sensor access.", sec: "Sensor data aids fingerprinting/keystroke inference." },
+    "gyroscope": { title: "gyroscope", desc: "Orientation sensor access.", sec: "Fingerprinting/inference risk." },
+    "magnetometer": { title: "magnetometer", desc: "Magnetometer access.", sec: "Fingerprinting risk." },
+    "encrypted-media": { title: "encrypted-media", desc: "EME/DRM access.", sec: "Mostly media; fingerprinting via key systems." },
+    "picture-in-picture": { title: "picture-in-picture", desc: "PiP video.", sec: "Low risk." },
+    "screen-wake-lock": { title: "screen-wake-lock", desc: "Keep the screen awake.", sec: "Low risk." },
+    "web-share": { title: "web-share", desc: "Web Share API.", sec: "Can be used to exfiltrate via the share sheet in some flows." },
+    "clipboard-read": { title: "clipboard-read", desc: "Read the system clipboard.", sec: "Clipboard theft — should be tightly scoped." },
+    "clipboard-write": { title: "clipboard-write", desc: "Write the system clipboard.", sec: "Clipboard hijack/paste attacks if abused." },
+    "publickey-credentials-get": { title: "publickey-credentials-get", desc: "WebAuthn assertion (get credential).", sec: "Granting to third-party frames can undermine phishing-resistant auth." },
+    "publickey-credentials-create": { title: "publickey-credentials-create", desc: "WebAuthn registration.", sec: "Scope tightly — passkey registration is sensitive." },
+    "identity-credentials-get": { title: "identity-credentials-get", desc: "FedCM credential access.", sec: "Federated-login surface; scope to trusted origins." },
+    "storage-access": { title: "storage-access", desc: "Request unpartitioned (third-party) cookie access.", sec: "Broad grants weaken cookie partitioning / privacy." },
+    "browsing-topics": { title: "browsing-topics", desc: "Topics API access.", sec: "Interest-based tracking — a privacy consideration." },
+    "attribution-reporting": { title: "attribution-reporting", desc: "Attribution Reporting API.", sec: "Ad measurement; privacy consideration." },
+    "idle-detection": { title: "idle-detection", desc: "Detect when the user is idle.", sec: "Behavioural inference; scope tightly." },
+    "local-fonts": { title: "local-fonts", desc: "Enumerate installed fonts.", sec: "High-entropy fingerprinting — default to ()." },
+    "local-network-access": { title: "local-network-access", desc: "Requests to the local/private network.", sec: "Directly relevant to SSRF-from-browser / internal-network attacks — should be ()." },
+    "xr-spatial-tracking": { title: "xr-spatial-tracking", desc: "WebXR spatial tracking.", sec: "Sensor/environment data; fingerprinting." },
+    "window-management": { title: "window-management", desc: "Multi-screen window placement.", sec: "Reveals screen layout; minor fingerprinting." }
+  },
+  // Alt-Svc tokens (altsvc:).
+  altsvc: {
+    "h2": { title: "h2 (HTTP/2)", desc: "Advertises HTTP/2 over TLS at the alternative authority.", sec: "Protocol fingerprinting; also enables h2-specific desync testing." },
+    "h3": { title: "h3 (HTTP/3)", desc: "Advertises HTTP/3 (QUIC) — draft ids (h3-29) collapse here.", sec: "Signals a QUIC endpoint; HTTP/3 has its own smuggling/parser surface worth probing." },
+    "clear": { title: "clear", desc: "Invalidates all cached alternative services for the origin.", sec: "Resets client-side Alt-Svc cache." },
+    "ma": { title: "ma= (max-age)", desc: "Seconds the alternative service stays fresh (default 24h).", sec: "A very long ma with persist is a client-side cache worth noting." },
+    "persist": { title: "persist=1", desc: "Keep the entry across network changes.", sec: "A persistent, user-specific Alt-Svc entry has been raised as a supercookie/tracking vector." }
+  },
+  // Clear-Site-Data directives (csd:). Values are quoted in the header.
+  csd: {
+    "cache": { title: "\"cache\"", desc: "Clears the browser cache for the origin.", sec: "Used on logout/incident response; its presence hints at a security-sensitive transition." },
+    "cookies": { title: "\"cookies\"", desc: "Clears cookies AND HTTP auth creds for the registrable domain (incl. subdomains).", sec: "The strong logout primitive — verify it actually fires on logout." },
+    "storage": { title: "\"storage\"", desc: "Clears localStorage, sessionStorage, IndexedDB, and service-worker registrations.", sec: "Clearing SW registrations here is the clean way to evict a hijacked worker." },
+    "executioncontexts": { title: "\"executionContexts\"", desc: "Reloads all browsing contexts for the origin.", sec: "Forces a reload so cleared state takes effect immediately." },
+    "clienthints": { title: "\"clientHints\"", desc: "Clears stored client hints for the origin.", sec: "Resets the client-hint fingerprinting surface." },
+    "prefetchcache": { title: "\"prefetchCache\"", desc: "Clears Speculation-Rules prefetches.", sec: "Evicts speculatively-fetched content." },
+    "prerendercache": { title: "\"prerenderCache\"", desc: "Clears Speculation-Rules prerenders.", sec: "Evicts speculatively-rendered pages." }
+  },
+  // X-Frame-Options values (xfo:).
+  xfo: {
+    "deny": { title: "DENY", desc: "The page may never be framed.", sec: "Strongest clickjacking protection. Note XFO is legacy — CSP frame-ancestors supersedes it." },
+    "sameorigin": { title: "SAMEORIGIN", desc: "Only same-origin pages may frame this.", sec: "Reasonable, but doesn't allow an allowlist — frame-ancestors is more precise." },
+    "allow-from": { title: "ALLOW-FROM (obsolete)", desc: "Formerly allowed a single framing origin.", sec: "Ignored by modern browsers → effectively NO protection. Use CSP frame-ancestors instead." }
+  },
+  // X-Content-Type-Options (xcto:).
+  xcto: {
+    "nosniff": { title: "nosniff", desc: "Disables MIME sniffing; the declared Content-Type is trusted.", sec: "Its ABSENCE lets browsers sniff types — a vector for turning an upload/endpoint into executable HTML/JS (XSS)." }
+  },
+  // Cross-Origin-Opener-Policy (coop:).
+  coop: {
+    "unsafe-none": { title: "unsafe-none", desc: "No isolation — the default; the document shares its browsing-context group.", sec: "Leaves window references (opener) reachable cross-origin — XS-Leaks / tabnabbing surface." },
+    "same-origin": { title: "same-origin", desc: "Isolates the document into a same-origin browsing-context group.", sec: "Needed (with COEP) for cross-origin isolation; mitigates several XS-Leaks." },
+    "same-origin-allow-popups": { title: "same-origin-allow-popups", desc: "Like same-origin but keeps references to popups it opens.", sec: "A middle ground; popups it opens remain reachable." },
+    "noopener-allow-popups": { title: "noopener-allow-popups", desc: "Severs opener for openees but allows opening popups.", sec: "Newer value; check browser support." }
+  },
+  // Cross-Origin-Embedder-Policy (coep:).
+  coep: {
+    "unsafe-none": { title: "unsafe-none", desc: "Default — no embedding restriction.", sec: "Cross-origin isolation is NOT active; SharedArrayBuffer/precise timers stay disabled." },
+    "require-corp": { title: "require-corp", desc: "Cross-origin subresources must opt in via CORP/CORS.", sec: "Enables cross-origin isolation (with COOP) — unlocks powerful APIs, so verify the isolation is intended." },
+    "credentialless": { title: "credentialless", desc: "Loads cross-origin subresources without credentials instead of requiring CORP.", sec: "Easier isolation; no cookies are sent to those subresources." }
+  },
+  // Cross-Origin-Resource-Policy (corp:).
+  corp: {
+    "same-origin": { title: "same-origin", desc: "Only same-origin pages may embed this resource.", sec: "Blocks cross-origin reads — a defense against Spectre-style leaks and hotlinking." },
+    "same-site": { title: "same-site", desc: "Only same-site pages may embed this resource.", sec: "Broader than same-origin; subdomains count as same-site." },
+    "cross-origin": { title: "cross-origin", desc: "Any origin may embed this resource.", sec: "Explicitly public — fine for CDN assets, risky for anything user-specific." }
+  },
+  // Sec-Fetch-Site (sfs:) — request metadata the server can use for defense.
+  sfs: {
+    "same-origin": { title: "same-origin", desc: "Request originated from the same origin.", sec: "Servers can use this to reject cross-site state changes — a strong CSRF defense." },
+    "same-site": { title: "same-site", desc: "Same site, different origin (e.g. subdomain).", sec: "Looser than same-origin; a compromised subdomain still reads as same-site." },
+    "cross-site": { title: "cross-site", desc: "Request came from a different site.", sec: "Sensitive endpoints should scrutinize or reject cross-site requests." },
+    "none": { title: "none", desc: "User-initiated (typed URL, bookmark) — no origin.", sec: "Distinguishes direct navigation from site-driven requests." }
+  },
+  // Sec-Fetch-Mode (sfm:).
+  sfm: {
+    "navigate": { title: "navigate", desc: "A top-level navigation.", sec: "Helps separate page loads from subresource/API calls in defenses." },
+    "cors": { title: "cors", desc: "A CORS fetch.", sec: "Subject to CORS; cross-origin reads need ACAO." },
+    "no-cors": { title: "no-cors", desc: "An opaque cross-origin fetch (no response read).", sec: "Can still trigger side effects — CSRF-like writes are possible without reading the response." },
+    "same-origin": { title: "same-origin", desc: "A same-origin fetch.", sec: "No CORS involved." },
+    "websocket": { title: "websocket", desc: "A WebSocket handshake.", sec: "WS often skips CORS — check Origin validation on the handshake." }
+  },
+  // Sec-Fetch-Dest (sfd:) — the request's destination.
+  sfd: {
+    "document": { title: "document", desc: "A top-level document load.", sec: "Framing/navigation context." },
+    "iframe": { title: "iframe", desc: "A nested frame load.", sec: "Pair with frame-ancestors/XFO to reason about clickjacking." },
+    "empty": { title: "empty", desc: "fetch()/XHR with no special destination.", sec: "The usual API-call destination." },
+    "script": { title: "script", desc: "A <script> load.", sec: "The destination to guard with script-src." },
+    "style": { title: "style", desc: "A stylesheet load.", sec: "CSS can exfiltrate via selectors; guard with style-src." },
+    "image": { title: "image", desc: "An image load.", sec: "Images are a common blind-SSRF/exfil channel." },
+    "font": { title: "font", desc: "A font load.", sec: "Guard with font-src." },
+    "object": { title: "object", desc: "A plugin/object load.", sec: "object-src 'none' is recommended — legacy plugin surface." },
+    "worker": { title: "worker", desc: "A Worker script load.", sec: "Workers run script — guard with worker-src/script-src." }
+  },
+  // cf-cache-status / x-cache values (cachestatus:).
+  cachestatus: {
+    "hit": { title: "HIT", desc: "Served from the edge cache.", sec: "If an authenticated/personalized response is a HIT, suspect a cache-poisoning or cache-deception bug." },
+    "miss": { title: "MISS", desc: "Not in cache; fetched from origin.", sec: "Baseline for comparing cache behaviour across requests." },
+    "dynamic": { title: "DYNAMIC", desc: "Treated as uncacheable; always from origin.", sec: "Good for sensitive endpoints — confirms they aren't edge-cached." },
+    "expired": { title: "EXPIRED", desc: "Was cached but stale; revalidated.", sec: "Observe revalidation behaviour." },
+    "bypass": { title: "BYPASS", desc: "Cache intentionally skipped.", sec: "Check what triggers bypass — a controllable bypass can defeat caching defenses." },
+    "revalidated": { title: "REVALIDATED", desc: "Stale entry confirmed still fresh with origin.", sec: "Normal conditional-request behaviour." },
+    "stale": { title: "STALE", desc: "A stale cached response was served.", sec: "Stale-while-revalidate / error serving — note timing." },
+    "updating": { title: "UPDATING", desc: "Serving stale while the cache updates.", sec: "Edge-case timing window." }
+  },
+  // Content-Type params (ctparam:).
+  ctparam: {
+    "charset": { title: "charset", desc: "The character encoding of the body.", sec: "Charset confusion (e.g. missing charset, or UTF-7 in old browsers) has enabled XSS filter bypasses." },
+    "boundary": { title: "boundary", desc: "The delimiter between multipart parts.", sec: "Parser differentials on the boundary can bypass upload/WAF checks — try unusual but legal boundaries." }
   }
 };
 // Decode a base64url segment to a string (best-effort).
@@ -3674,6 +7669,208 @@ function decodeJwtTip(token) {
   sec += "Check exp/nbf and whether privileged claims (role/admin/scope) are trusted server-side.";
   return { title: "JWT — JSON Web Token", desc: desc, sec: sec };
 }
+// Build a live tip for an HTTP Basic credential: base64-decode to user:pass.
+function decodeBasicTip(token) {
+  let decoded = "";
+  try { decoded = b64urlToStr(token); } catch (e) {}
+  const i = decoded.indexOf(":");
+  const user = i >= 0 ? decoded.slice(0, i) : decoded;
+  const pass = i >= 0 ? decoded.slice(i + 1) : "";
+  const desc = decoded
+    ? "Decodes to  user = " + (user || "(empty)") + "  ·  pass = " + (pass || "(empty)")
+    : "Could not base64-decode this credential.";
+  return { title: "HTTP Basic credentials", desc: desc,
+    sec: "Basic auth is base64, not encryption — whoever sees the request sees the password. Confirm it only ever travels over TLS, and try the decoded credentials against other endpoints (reuse)." };
+}
+// Live tip for an encoded blob: re-decode by the type baked into the key and
+// show a truncated preview of what it hides.
+// Live tip for an encoded blob: peel every layer and show the chain + result.
+function decodeEncTip(blob) {
+  const a = analyzeEncoding(blob);
+  if (!a) {
+    return { title: "Encoded value", desc: "This looked encoded but did not decode to readable data.",
+      sec: "If it's binary (a hash, raw key, or random id) it may not be meant to decode." };
+  }
+  const steps = a.chain.map(c => c.decoded == null ? c.label + " (binary)" : c.label).join("  →  ");
+  const n = a.chain.length, layers = n + (n > 1 ? " layers" : " layer");
+  if (a.binaryTail) {
+    return { title: "Encoded value — " + layers,
+      desc: steps + "\nEnds in " + a.binaryTail + " bytes of BINARY data (not text) — likely a signature, MAC, hash, or encrypted / compressed token.",
+      sec: "Opaque binary is usually a signed or encrypted token; editing it by hand just invalidates the signature rather than changing a value. Worth identifying (what produced it, how long), not tampering." };
+  }
+  const kind = encFinalKind(a.final);
+  const preview = a.final.length > 220 ? a.final.slice(0, 220) + "…" : a.final;
+  const desc = steps + (kind ? "   ⟶   " + kind : "") + "\nDecodes to:  " + preview;
+  return { title: "Encoded value — " + layers,
+    desc: desc,
+    sec: "Encoding is not protection. A decodable blob in a parameter, cookie, or header often hides an id, filter, path, or flag you can tamper with — decode it, change it, re-encode, and resend. Watch for ids (IDOR), file paths (LFI), and URLs (SSRF / open redirect)." };
+}
+// Live tip for a disclosed product/version. Deliberately NO baked-in CVE list —
+// it points the tester at a CVE source rather than asserting a vuln.
+function decodeVerdisTip(token) {
+  return { title: "Version disclosure", desc: "Advertises an exact build:  " + token,
+    sec: "Exposing the precise version lets an attacker fingerprint the stack and look up matching exploits. Check this version against a CVE source (NVD / vendor advisories); old or end-of-life builds frequently carry public CVEs. Consider whether this header should be suppressed." };
+}
+// ── Network knowledge base (nmap / IANA / NSE), same shape as HTTP_TIPS ──────
+// Keyed by the data-tip prefixes the Network renderers stamp: port:<n>,
+// state:<s>, proto:<p>, svc:<name>, nse:<id>, cpe:x, osc:accuracy. Content
+// cross-referenced from the nmap book (port states, -sV, OS detection, NSE),
+// the IANA service-name/port registry, and the NSE script DB.
+const NET_TIPS = {
+  states: {
+    "open": { title: "open", desc: "An application is actively accepting connections (TCP) or responding (UDP) on this port.", sec: "Open ports are the primary attack surface — identify the service and exact version, then check it against known CVEs and default/weak credentials." },
+    "closed": { title: "closed", desc: "The port is reachable and replied, but no application is listening on it.", sec: "Confirms the host is up and not filtering this port; a service could appear here later, so note it for re-scans." },
+    "filtered": { title: "filtered", desc: "nmap cannot determine whether the port is open — a firewall or packet filter is dropping the probes, so no reply comes back.", sec: "Filtering hides services. Try a different scan type/timing, a trusted source port (e.g. 53/443), fragmentation, or a different vantage point." },
+    "unfiltered": { title: "unfiltered", desc: "The port is reachable but nmap cannot tell open from closed — seen mainly with an ACK scan used to map firewall rules.", sec: "Resolve the real state with a SYN or version scan." },
+    "open|filtered": { title: "open|filtered", desc: "nmap cannot tell open from filtered — common in UDP and FIN/NULL/Xmas scans where open ports simply stay silent.", sec: "Do not dismiss these: DNS/SNMP/TFTP/IKE often sit on silent UDP ports. Confirm with an application-layer probe." },
+    "closed|filtered": { title: "closed|filtered", desc: "nmap cannot tell closed from filtered — produced by the IP ID idle scan.", sec: "Ambiguous; re-test with another technique." },
+    "up": { title: "host up", desc: "The host answered a discovery probe (ICMP / ARP / TCP / UDP), so nmap scanned it.", sec: "'Up' only means reachable from your vantage point — a filtered host can still look down from elsewhere." },
+    "down": { title: "host down", desc: "No reply to discovery probes — nmap treated the host as offline and skipped the port scan.", sec: "May be truly offline or just blocking probes; re-run with -Pn to skip host discovery and scan anyway." }
+  },
+  protos: {
+    "tcp": { title: "TCP", desc: "Connection-oriented transport with a 3-way handshake; nmap reads port state reliably from the TCP flags in replies (SYN-ACK = open, RST = closed)." },
+    "udp": { title: "UDP", desc: "Connectionless transport. Scans are slow and ambiguous: closed ports answer with (rate-limited) ICMP port-unreachable, open ports often send nothing.", sec: "UDP is routinely under-scanned — DNS, SNMP, TFTP, NTP, IKE and SIP live here and are high-value." },
+    "sctp": { title: "SCTP", desc: "Stream Control Transmission Protocol — multi-stream transport used in telecom signalling (SIGTRAN, Diameter) and some clustering." }
+  },
+  osc: { accuracy: { title: "OS-match accuracy", desc: "nmap's confidence in this OS fingerprint, as a percent. Guesses are ranked; under 100% means the TCP/IP fingerprint only partially matched nmap's database.", sec: "Low accuracy or several near-ties means the OS guess is unreliable — corroborate with service banners (SSH version, HTTP Server header, SMB OS discovery)." } },
+  cpe: { x: { title: "CPE", desc: "Common Platform Enumeration — a standardized identifier (cpe:/a:vendor:product:version for apps, cpe:/o:... for OSes) nmap assigns to what it detected.", sec: "Paste the CPE into the NVD CVE search to pull known vulnerabilities for that exact product and version." } },
+  ports: {
+    "20": { title: "20 · FTP-data", desc: "The active-mode FTP data channel." },
+    "21": { title: "21 · FTP", desc: "File Transfer Protocol control channel. Cleartext.", sec: "Test anonymous login (ftp-anon) and sniffable credentials; pair with a version check for vsftpd/ProFTPD CVEs." },
+    "22": { title: "22 · SSH", desc: "Secure Shell — remote login and file transfer.", sec: "Enumerate auth methods and host keys; check for weak/default creds, exposed keys, and outdated OpenSSH versions." },
+    "23": { title: "23 · Telnet", desc: "Legacy remote login — fully cleartext.", sec: "Credentials and sessions are sniffable; its mere presence is a finding. Check for default creds on appliances/IoT." },
+    "25": { title: "25 · SMTP", desc: "Mail submission/transfer between servers.", sec: "Test for open relay, user enumeration (VRFY/EXPN/RCPT), and STARTTLS support; banner reveals the MTA." },
+    "53": { title: "53 · DNS", desc: "Domain Name System (TCP used for zone transfers and large responses).", sec: "Attempt a zone transfer (AXFR) and check for open recursion (DNS amplification abuse)." },
+    "67": { title: "67 · DHCP (server)", desc: "DHCP server port (UDP)." },
+    "69": { title: "69 · TFTP", desc: "Trivial FTP (UDP) — no authentication.", sec: "Often holds router/VoIP configs and firmware; try to grab config files by known names." },
+    "80": { title: "80 · HTTP", desc: "Web server (cleartext).", sec: "Primary web attack surface — enumerate paths, methods, and the server/app stack; everything the Repeater is for." },
+    "88": { title: "88 · Kerberos", desc: "Kerberos authentication — a strong signal of a Windows Active Directory domain controller.", sec: "Target for AS-REP roasting and Kerberoasting; combine with LDAP/SMB findings." },
+    "110": { title: "110 · POP3", desc: "Mail retrieval (cleartext unless POP3S).", sec: "Check for cleartext creds and STARTTLS." },
+    "111": { title: "111 · rpcbind/portmapper", desc: "Maps RPC program numbers to ports (often fronts NFS).", sec: "rpcinfo enumerates RPC services; frequently exposes NFS shares (port 2049)." },
+    "123": { title: "123 · NTP", desc: "Network Time Protocol (UDP).", sec: "Check for the monlist command (ntp-monlist) — a classic DDoS amplification vector and info leak." },
+    "135": { title: "135 · MSRPC", desc: "Microsoft RPC endpoint mapper.", sec: "Enumerate RPC endpoints; historically a remote-exploit surface on Windows." },
+    "137": { title: "137 · NetBIOS-NS", desc: "NetBIOS name service (UDP).", sec: "nbstat reveals hostnames, domain, and MAC — useful for Windows recon." },
+    "139": { title: "139 · NetBIOS-SSN", desc: "SMB over NetBIOS (legacy Windows file sharing).", sec: "Enumerate shares/sessions; pair with 445 for SMB attacks." },
+    "143": { title: "143 · IMAP", desc: "Mail access (cleartext unless IMAPS).", sec: "Check STARTTLS and cleartext creds." },
+    "161": { title: "161 · SNMP", desc: "Simple Network Management Protocol (UDP).", sec: "Try default community strings (public/private); SNMP leaks interfaces, routes, ARP, processes and sometimes credentials." },
+    "179": { title: "179 · BGP", desc: "Border Gateway Protocol — core internet routing." },
+    "389": { title: "389 · LDAP", desc: "Directory service (cleartext) — usually Active Directory or OpenLDAP.", sec: "Query the RootDSE and test anonymous binds; a rich source of users, groups and policy." },
+    "443": { title: "443 · HTTPS", desc: "Web server over TLS.", sec: "Inspect the cert (SANs reveal other hostnames/origins) and cipher suites; then treat like HTTP." },
+    "445": { title: "445 · SMB (microsoft-ds)", desc: "Modern Windows/Samba file sharing (direct over TCP).", sec: "Enumerate shares and the SMB dialect/signing; test for null sessions and MS17-010 (EternalBlue)." },
+    "465": { title: "465 · SMTPS", desc: "SMTP over implicit TLS." },
+    "500": { title: "500 · IKE/IPsec", desc: "IPsec key exchange (UDP) — a VPN endpoint.", sec: "Fingerprint the VPN (ike-scan); aggressive mode can leak a crackable PSK hash." },
+    "515": { title: "515 · LPD", desc: "Line Printer Daemon — network printing." },
+    "587": { title: "587 · SMTP submission", desc: "Authenticated mail submission (STARTTLS)." },
+    "623": { title: "623 · IPMI/BMC", desc: "Baseboard management (UDP) — out-of-band server control (iDRAC/iLO).", sec: "IPMI 2.0 has a protocol-level password-hash leak; default creds are rampant. Full-server compromise if owned." },
+    "636": { title: "636 · LDAPS", desc: "LDAP over TLS." },
+    "873": { title: "873 · rsync", desc: "File sync daemon.", sec: "List modules anonymously — often exposes backups or a whole filesystem read/write." },
+    "993": { title: "993 · IMAPS", desc: "IMAP over implicit TLS." },
+    "995": { title: "995 · POP3S", desc: "POP3 over implicit TLS." },
+    "1080": { title: "1080 · SOCKS", desc: "SOCKS proxy.", sec: "An open proxy can pivot into internal networks." },
+    "1099": { title: "1099 · Java RMI", desc: "Java RMI registry.", sec: "Often deserialization-exploitable for RCE (e.g. via ysoserial gadgets)." },
+    "1433": { title: "1433 · MSSQL", desc: "Microsoft SQL Server.", sec: "Test default/weak sa creds; if you get in, xp_cmdshell can run OS commands." },
+    "1521": { title: "1521 · Oracle TNS", desc: "Oracle database listener.", sec: "Enumerate the SID, then test default accounts; TNS poisoning on old versions." },
+    "1723": { title: "1723 · PPTP", desc: "Legacy VPN.", sec: "MS-CHAPv2 is broken — captured handshakes are crackable. Its presence is a weakness." },
+    "1883": { title: "1883 · MQTT", desc: "IoT publish/subscribe messaging (cleartext).", sec: "Often unauthenticated — subscribe to # to read all topics, including sensitive telemetry/commands." },
+    "2049": { title: "2049 · NFS", desc: "Network File System.", sec: "List exports (showmount); world-readable/writable exports and no_root_squash are classic footholds." },
+    "2375": { title: "2375 · Docker API", desc: "Unencrypted Docker Engine API.", sec: "Exposed and unauthenticated = trivial host takeover (run a privileged container mounting /)." },
+    "2376": { title: "2376 · Docker API (TLS)", desc: "Docker Engine API over TLS.", sec: "Still full control if client-cert auth is misconfigured." },
+    "2181": { title: "2181 · ZooKeeper", desc: "Distributed coordination service.", sec: "Often unauthenticated; the four-letter commands leak config and can disrupt clusters." },
+    "3128": { title: "3128 · Squid proxy", desc: "HTTP proxy/cache.", sec: "Test for open-proxy relaying and access to internal resources." },
+    "3306": { title: "3306 · MySQL/MariaDB", desc: "Relational database.", sec: "Test default/weak creds and whether it is bound to the world; version maps to known CVEs." },
+    "3389": { title: "3389 · RDP", desc: "Windows Remote Desktop.", sec: "Grab NTLM/host info (rdp-ntlm-info); test for weak creds and NLA; historically BlueKeep (CVE-2019-0708)." },
+    "4444": { title: "4444 · (common C2/backdoor)", desc: "Default listener for Metasploit/Meterpreter and many backdoors.", sec: "An open 4444 on a target is highly suspicious — investigate for an existing compromise." },
+    "4786": { title: "4786 · Cisco Smart Install", desc: "Cisco IOS config/deployment service.", sec: "Smart Install Exploitation Tool can dump or overwrite device configs unauthenticated." },
+    "5060": { title: "5060 · SIP", desc: "VoIP signalling (UDP/TCP).", sec: "Enumerate extensions and test for default creds / toll fraud." },
+    "5432": { title: "5432 · PostgreSQL", desc: "Relational database.", sec: "Test default/weak creds; superuser access can lead to command execution (COPY ... PROGRAM)." },
+    "5555": { title: "5555 · Android ADB", desc: "Android Debug Bridge over TCP.", sec: "Usually unauthenticated — full shell on the device; worm-abused for cryptominers." },
+    "5601": { title: "5601 · Kibana", desc: "Elasticsearch dashboard UI.", sec: "Often unauthenticated and paired with an open Elasticsearch; past RCE CVEs." },
+    "5672": { title: "5672 · AMQP", desc: "Message broker (RabbitMQ).", sec: "Test guest/guest; the management plugin (15672) may be exposed too." },
+    "5900": { title: "5900 · VNC", desc: "Remote desktop/framebuffer.", sec: "Frequently has no or a weak password — instant GUI access. Check vnc-info." },
+    "5985": { title: "5985 · WinRM (HTTP)", desc: "Windows Remote Management / PowerShell remoting.", sec: "With valid creds this is a reliable remote-shell path (evil-winrm)." },
+    "5986": { title: "5986 · WinRM (HTTPS)", desc: "WinRM over TLS." },
+    "6379": { title: "6379 · Redis", desc: "In-memory data store.", sec: "Classically unauthenticated — can be abused to write SSH keys/cron/webshells for RCE." },
+    "6443": { title: "6443 · Kubernetes API", desc: "Kubernetes control-plane API server.", sec: "Test for anonymous/misconfigured RBAC — cluster-admin access means owning every workload." },
+    "7001": { title: "7001 · WebLogic", desc: "Oracle WebLogic admin/app port.", sec: "A long history of unauthenticated deserialization RCE CVEs — version-check carefully." },
+    "8000": { title: "8000 · HTTP-alt", desc: "Common alternate/dev HTTP port.", sec: "Often a dev server, admin UI, or API with weaker auth than production." },
+    "8080": { title: "8080 · HTTP-alt / proxy", desc: "Very common alternate HTTP (Tomcat, proxies, app servers).", sec: "Check for Tomcat manager, exposed admin panels, and proxy relaying." },
+    "8443": { title: "8443 · HTTPS-alt", desc: "Common alternate HTTPS (admin consoles, appliances).", sec: "Frequently fronts management interfaces — inspect cert and look for default creds." },
+    "8086": { title: "8086 · InfluxDB", desc: "Time-series database HTTP API.", sec: "Often unauthenticated — reads/writes metrics and can leak infrastructure detail." },
+    "8089": { title: "8089 · Splunk", desc: "Splunk management/REST port.", sec: "Test default creds; authenticated Splunk can run scripts for RCE." },
+    "9000": { title: "9000 · dev/app (SonarQube, PHP-FPM, Portainer)", desc: "Busy alternate port — SonarQube, PHP-FPM (FastCGI), Portainer and more.", sec: "Identify which: exposed PHP-FPM enables RCE; default SonarQube/Portainer creds are common." },
+    "9200": { title: "9200 · Elasticsearch", desc: "Search/analytics datastore HTTP API.", sec: "Historically unauthenticated — _search/_cat dump all indices; old versions have RCE." },
+    "9418": { title: "9418 · Git", desc: "Native git:// protocol.", sec: "Anonymous clone of repositories — source and secrets leakage." },
+    "10000": { title: "10000 · Webmin", desc: "Server admin web UI.", sec: "Test default creds; several unauthenticated RCE CVEs historically." },
+    "11211": { title: "11211 · Memcached", desc: "In-memory cache.", sec: "Unauthenticated data read/write and a massive UDP amplification vector — should never face the internet." },
+    "27017": { title: "27017 · MongoDB", desc: "Document database.", sec: "Classic no-auth exposure — dump every database. Check mongodb-info." },
+    "50000": { title: "50000 · SAP / DB2", desc: "SAP dispatcher or IBM DB2.", sec: "Enterprise crown jewels — enumerate carefully; many version-specific exploits." }
+  },
+  svcs: {
+    "http": { title: "service: http", desc: "A web server speaking cleartext HTTP (regardless of port).", sec: "Enumerate with the Repeater/Ghost; identify the server and framework for targeted attacks." },
+    "ssl/http": { title: "service: ssl/http", desc: "HTTP wrapped in TLS (HTTPS) on this port.", sec: "Inspect the certificate's SANs for extra hostnames/origins, then test as HTTP." },
+    "https": { title: "service: https", desc: "HTTP over TLS.", sec: "Check cert and cipher suites, then treat like HTTP." },
+    "ssl": { title: "ssl / tls tunnel", desc: "nmap detected a TLS/SSL tunnel in front of another service. It reports the INNER protocol as the service name (e.g. http) and marks the encryption separately as tunnel=ssl — so 'ssl/http' is nmap's way of saying HTTPS.", sec: "Inspect the certificate (ssl-cert — SANs can reveal other hostnames/origins) and the cipher suites (ssl-enum-ciphers), then test the inner service as you would unencrypted." },
+    "ssh": { title: "service: ssh", desc: "Secure Shell on this port (may be nonstandard).", sec: "Version-check OpenSSH/Dropbear; enumerate auth methods and host keys." },
+    "microsoft-ds": { title: "service: microsoft-ds", desc: "SMB file sharing (Windows/Samba).", sec: "Enumerate shares and signing; test null sessions and MS17-010." },
+    "netbios-ssn": { title: "service: netbios-ssn", desc: "SMB over legacy NetBIOS.", sec: "Pair with microsoft-ds for SMB enumeration." },
+    "ms-wbt-server": { title: "service: ms-wbt-server", desc: "Microsoft RDP.", sec: "Grab NTLM/host info; test NLA and weak creds." },
+    "ms-sql-s": { title: "service: ms-sql-s", desc: "Microsoft SQL Server.", sec: "Test sa creds; xp_cmdshell → OS commands." },
+    "mysql": { title: "service: mysql", desc: "MySQL/MariaDB database.", sec: "Weak/default creds and world-binding; version → CVEs." },
+    "postgresql": { title: "service: postgresql", desc: "PostgreSQL database.", sec: "Superuser can reach command execution (COPY ... PROGRAM)." },
+    "oracle-tns": { title: "service: oracle-tns", desc: "Oracle DB listener.", sec: "Enumerate SID; default accounts." },
+    "mongodb": { title: "service: mongodb", desc: "MongoDB document store.", sec: "Check for no-auth exposure." },
+    "redis": { title: "service: redis", desc: "Redis key-value store.", sec: "No-auth Redis → key-write RCE tricks." },
+    "domain": { title: "service: domain", desc: "DNS server.", sec: "Attempt AXFR and check open recursion." },
+    "snmp": { title: "service: snmp", desc: "SNMP agent.", sec: "Brute default community strings; rich info leak." },
+    "ldap": { title: "service: ldap", desc: "Directory service (often Active Directory).", sec: "Query RootDSE; test anonymous bind." },
+    "rpcbind": { title: "service: rpcbind", desc: "RPC portmapper.", sec: "rpcinfo enumerates RPC/NFS services." },
+    "vnc": { title: "service: vnc", desc: "VNC remote desktop.", sec: "Often weak/no password — direct GUI access." },
+    "upnp": { title: "service: upnp", desc: "Universal Plug and Play.", sec: "Can expose internal device control and port-mapping abuse." },
+    "ipp": { title: "service: ipp", desc: "Internet Printing Protocol (CUPS).", sec: "Past unauthenticated RCE via CUPS; enumerate printers/queues." }
+  },
+  nse: {
+    "http-title": { title: "NSE http-title", desc: "Fetches the HTML <title> of a web service.", sec: "A fast way to spot admin panels, default pages, and what app is running." },
+    "http-headers": { title: "NSE http-headers", desc: "Dumps the server's response headers.", sec: "Reveals server/framework, security headers (or their absence), and cookies." },
+    "http-server-header": { title: "NSE http-server-header", desc: "Extracts the Server response header.", sec: "Version banner → targeted CVE lookup." },
+    "http-methods": { title: "NSE http-methods", desc: "Lists HTTP methods the server allows (OPTIONS).", sec: "PUT/DELETE/WebDAV methods can mean upload or overwrite." },
+    "http-enum": { title: "NSE http-enum", desc: "Probes for common files/dirs and app fingerprints.", sec: "Surfaces admin interfaces, backups, and known app paths quickly." },
+    "http-robots.txt": { title: "NSE http-robots.txt", desc: "Reads robots.txt disallow entries.", sec: "Disallowed paths often point straight at sensitive areas." },
+    "http-git": { title: "NSE http-git", desc: "Detects an exposed .git directory.", sec: "An exposed .git lets you reconstruct source and secrets." },
+    "http-shellshock": { title: "NSE http-shellshock", desc: "Tests CGI endpoints for the Shellshock bash flaw.", sec: "CVE-2014-6271 — unauthenticated RCE where vulnerable." },
+    "http-cookie-flags": { title: "NSE http-cookie-flags", desc: "Checks cookies for Secure/HttpOnly/SameSite.", sec: "Missing flags enable theft/CSRF — confirm in the Repeater." },
+    "ssl-cert": { title: "NSE ssl-cert", desc: "Dumps the X.509 certificate (subject, SANs, issuer, validity).", sec: "SANs leak other hostnames/origins; expired or self-signed is a finding." },
+    "ssl-enum-ciphers": { title: "NSE ssl-enum-ciphers", desc: "Enumerates supported TLS versions and cipher suites with a grade.", sec: "Flags SSLv3/TLS1.0, weak ciphers, and known downgrade issues." },
+    "ssl-heartbleed": { title: "NSE ssl-heartbleed", desc: "Tests for the OpenSSL Heartbleed memory-disclosure flaw.", sec: "CVE-2014-0160 — leaks memory (keys, sessions) if vulnerable." },
+    "ssl-date": { title: "NSE ssl-date", desc: "Reads the server clock from the TLS handshake.", sec: "Clock skew can hint at the host's timezone/patch level." },
+    "ssh-hostkey": { title: "NSE ssh-hostkey", desc: "Retrieves the SSH host public keys/fingerprints.", sec: "Duplicate host keys across hosts indicate cloned images / weak key generation." },
+    "ssh-auth-methods": { title: "NSE ssh-auth-methods", desc: "Lists accepted SSH authentication methods for a user.", sec: "Password auth enabled invites brute-force; keyboard-interactive quirks matter." },
+    "ssh2-enum-algos": { title: "NSE ssh2-enum-algos", desc: "Enumerates SSH key-exchange/cipher/MAC algorithms.", sec: "Weak/legacy algorithms are a hardening finding." },
+    "ftp-anon": { title: "NSE ftp-anon", desc: "Checks whether anonymous FTP login is allowed and lists files.", sec: "Anonymous FTP often exposes sensitive files or an upload foothold." },
+    "smb-os-discovery": { title: "NSE smb-os-discovery", desc: "Pulls OS, computer name, domain and build over SMB.", sec: "Core Windows recon — ties hosts to a domain and reveals patch level." },
+    "smb-security-mode": { title: "NSE smb-security-mode", desc: "Reports SMB signing/security settings.", sec: "Signing not required enables SMB relay attacks (ntlmrelayx)." },
+    "smb2-security-mode": { title: "NSE smb2-security-mode", desc: "SMB2/3 signing requirement.", sec: "Same relay concern as SMBv1 signing." },
+    "smb-enum-shares": { title: "NSE smb-enum-shares", desc: "Lists SMB shares and permissions.", sec: "World-readable/writable shares are quick wins." },
+    "smb-vuln-ms17-010": { title: "NSE smb-vuln-ms17-010", desc: "Tests for the EternalBlue SMBv1 flaw.", sec: "CVE-2017-0144 — wormable unauthenticated RCE (WannaCry/NotPetya)." },
+    "rdp-ntlm-info": { title: "NSE rdp-ntlm-info", desc: "Extracts NTLM/host info from the RDP handshake.", sec: "Leaks hostname, domain, and OS build without auth." },
+    "vnc-info": { title: "NSE vnc-info", desc: "Reports the VNC protocol version and security types.", sec: "'None' security type = passwordless GUI access." },
+    "mysql-info": { title: "NSE mysql-info", desc: "Reads MySQL handshake info (version, capabilities, salt).", sec: "Version → CVEs; exposure confirms a reachable DB." },
+    "ms-sql-info": { title: "NSE ms-sql-info", desc: "MSSQL instance/version details.", sec: "Maps to CVEs; precursor to credential testing." },
+    "mongodb-info": { title: "NSE mongodb-info", desc: "MongoDB build info and, if open, databases.", sec: "Confirms no-auth exposure and dumps DB names." },
+    "redis-info": { title: "NSE redis-info", desc: "Redis server info / whether auth is required.", sec: "No-auth Redis is directly exploitable." },
+    "dns-zone-transfer": { title: "NSE dns-zone-transfer", desc: "Attempts an AXFR zone transfer.", sec: "A successful transfer dumps every DNS record — a full internal map." },
+    "dns-recursion": { title: "NSE dns-recursion", desc: "Checks whether the resolver answers recursive queries for you.", sec: "Open recursion = DNS amplification abuse and cache-poisoning risk." },
+    "snmp-info": { title: "NSE snmp-info", desc: "Pulls system info via SNMP (with a community string).", sec: "With 'public' this leaks interfaces, software and sometimes creds." },
+    "nbstat": { title: "NSE nbstat", desc: "NetBIOS name/MAC/user over UDP 137.", sec: "Fast Windows hostname/domain/MAC recon." },
+    "smtp-commands": { title: "NSE smtp-commands", desc: "Lists SMTP EHLO capabilities.", sec: "Shows VRFY/EXPN (user enum) and relay-relevant features." },
+    "smtp-open-relay": { title: "NSE smtp-open-relay", desc: "Tests whether the server relays third-party mail.", sec: "An open relay enables spam/phishing from your target's name." },
+    "ntp-monlist": { title: "NSE ntp-monlist", desc: "Requests the NTP monlist of recent clients.", sec: "Big info leak and a potent DDoS amplification vector." },
+    "ldap-rootdse": { title: "NSE ldap-rootdse", desc: "Reads the LDAP RootDSE (naming contexts, functional level).", sec: "Confirms AD and seeds further directory enumeration." },
+    "rpcinfo": { title: "NSE rpcinfo", desc: "Enumerates RPC programs via the portmapper.", sec: "Exposes NFS and other RPC services and their ports." },
+    "banner": { title: "NSE banner", desc: "Grabs whatever text banner a service prints on connect.", sec: "Often the fastest version/product fingerprint." },
+    "vulners": { title: "NSE vulners", desc: "Maps detected service versions (CPEs) to known CVEs via the Vulners DB.", sec: "Gives a ready CVE shortlist per service — verify each against the actual version." }
+  }
+};
+
 function lookupTip(raw) {
   if (!raw) return null;
   const i = raw.indexOf(":"); if (i < 0) return null;
@@ -3689,22 +7886,69 @@ function lookupTip(raw) {
   if (p === "ct") return HTTP_TIPS.ct[k] || null;
   if (p === "auth") return HTTP_TIPS.auth[k] || null;
   if (p === "attr") return HTTP_TIPS.attr[k] || null;
+  if (p === "corr") return HTTP_TIPS.corr[k] || null;
+  if (p === "json") return HTTP_TIPS.json[k] || null;
+  if (p === "param") return HTTP_TIPS.param[k] || null;
+  if (p === "gql") return HTTP_TIPS.gql[k] || null;
+  if (p === "vary") return HTTP_TIPS.vary[k] || null;
+  if (p === "cd") return HTTP_TIPS.cd[k] || null;
+  if (p === "wwwauth") return HTTP_TIPS.wwwauth[k] || null;
+  if (p === "refpol") return HTTP_TIPS.refpol[k] || null;
+  if (p === "ce") return HTTP_TIPS.ce[k] || null;
+  if (p === "tenc") return HTTP_TIPS.tenc[k] || null;
+  if (p === "conn") return HTTP_TIPS.conn[k] || null;
+  if (p === "pp") return HTTP_TIPS.pp[k] || null;
+  if (p === "altsvc") return HTTP_TIPS.altsvc[k] || null;
+  if (p === "csd") return HTTP_TIPS.csd[k] || null;
+  if (p === "xfo") return HTTP_TIPS.xfo[k] || null;
+  if (p === "xcto") return HTTP_TIPS.xcto[k] || null;
+  if (p === "coop") return HTTP_TIPS.coop[k] || null;
+  if (p === "coep") return HTTP_TIPS.coep[k] || null;
+  if (p === "corp") return HTTP_TIPS.corp[k] || null;
+  if (p === "sfs") return HTTP_TIPS.sfs[k] || null;
+  if (p === "sfm") return HTTP_TIPS.sfm[k] || null;
+  if (p === "sfd") return HTTP_TIPS.sfd[k] || null;
+  if (p === "cachestatus") return HTTP_TIPS.cachestatus[k] || null;
+  if (p === "ctparam") return HTTP_TIPS.ctparam[k] || null;
+  if (p === "basic") return decodeBasicTip(k);
+  if (p === "enc") return decodeEncTip(k);
+  if (p === "verdis") return decodeVerdisTip(k);
   if (p === "jwt") return decodeJwtTip(k);
+  // Network tips
+  if (p === "port") return NET_TIPS.ports[k] || { title: "Port " + k, desc: "No specific note for this port. Identify the service with a version scan (-sV), then research the product/version.", sec: "Any open port is attack surface — enumerate the service and check it for default creds and known CVEs." };
+  if (p === "state") return NET_TIPS.states[k] || null;
+  if (p === "proto") return NET_TIPS.protos[k] || null;
+  if (p === "svc") return NET_TIPS.svcs[k] || { title: "service: " + k, desc: "nmap's best guess at the service running here (from -sV / the port map).", sec: "Confirm the exact product and version, then look it up for default creds and CVEs." };
+  if (p === "nse") return NET_TIPS.nse[k] || { title: "NSE " + k, desc: "An nmap Scripting Engine script; its output is shown with the host/port.", sec: "Look this script up in the NSE documentation for exactly what it checks." };
+  if (p === "cpe") return NET_TIPS.cpe.x;
+  if (p === "osc") return NET_TIPS.osc.accuracy;
+  if (p === "ver") return { title: "Service version", desc: "The exact product and build nmap fingerprinted with -sV.", sec: "Pin this against a CVE source (NVD / vendor advisories) — old or end-of-life builds frequently carry public exploits." };
   return null;
 }
-let repTipsOn = false, repTipRAF = 0, repPrettyOn = false;
+let tipsOn = false, repTipRAF = 0, repPrettyOn = false, repDecodeOn = false;
+// Place a cursor-following tooltip at the BOTTOM-RIGHT of the cursor, clear of the
+// pointer (so it never covers the text), flipping left/above near the screen edges.
+// Cursor coords are divided by uiZoom() to map the pointer's visual position into the
+// zoomed layout space — same convention as smShowHint / placeFixedUnder. `el` must
+// already be visible (display:block) so offsetWidth/Height measure correctly.
+function placeCursorTip(el, cx, cy) {
+  const OFFX = 18, OFFY = 26;                      // clears a standard arrow cursor's body
+  const z = uiZoom(), bw = el.offsetWidth, bh = el.offsetHeight;
+  const vw = window.innerWidth / z, vh = window.innerHeight / z;
+  const x = cx / z, y = cy / z;
+  let left = x + OFFX, top = y + OFFY;
+  if (left + bw > vw - 8) left = x - bw - OFFX;   // flip to the left near the right edge
+  if (top + bh > vh - 8) top = y - bh - OFFY;     // flip above near the bottom edge
+  el.style.left = Math.max(8, left) + "px";
+  el.style.top = Math.max(8, top) + "px";
+}
 function repShowTip(tip, x, y) {
   const b = $("rep-tip");
   b.innerHTML = '<div class="tip-title">' + esc(tip.title) + '</div>' +
     '<div class="tip-desc">' + esc(tip.desc) + '</div>' +
     (tip.sec ? '<div class="tip-sec">&#9656; ' + esc(tip.sec) + '</div>' : '');
   b.style.display = "block";
-  const pad = 16, bw = b.offsetWidth, bh = b.offsetHeight;
-  let left = x + pad, top = y + pad;
-  if (left + bw > innerWidth - 8) left = x - bw - pad;
-  if (top + bh > innerHeight - 8) top = y - bh - pad;
-  b.style.left = Math.max(8, left) + "px";
-  b.style.top = Math.max(8, top) + "px";
+  placeCursorTip(b, x, y);
 }
 function repHideTip() { $("rep-tip").style.display = "none"; }
 function repTipMove(e) {
@@ -3722,16 +7966,40 @@ function repTipMove(e) {
     if (tip) repShowTip(tip, x, y); else repHideTip();
   });
 }
-function setRepTips(on) {
-  repTipsOn = on;
-  const split = document.querySelector(".rep-split"), btn = $("rep-tips");
-  btn.classList.toggle("on", on);
-  btn.textContent = on ? "Tips: on" : "Tips: off";
-  split.classList.toggle("tips-on", on);
-  if (on) { split.addEventListener("mousemove", repTipMove); split.addEventListener("mouseleave", repHideTip); }
-  else { split.removeEventListener("mousemove", repTipMove); split.removeEventListener("mouseleave", repHideTip); repHideTip(); }
-  try { localStorage.setItem("beatrix.rep.tips", on ? "1" : "0"); } catch (e) {}
+// ── Global Tips: one on/off shared by every module ──────────────────────────
+// Each "tip zone" (an element whose [data-tip] tokens become hoverable) and
+// each toggle button registers once; setTips drives them all so the Repeater
+// and Network (and any future module) stay in lockstep. repTipMove/repHideTip/
+// #rep-tip are the shared engine (elementsFromPoint → lookupTip → floating box).
+const tipZones = [], tipButtons = [];
+function syncTipButton(btn) { btn.classList.toggle("on", tipsOn); btn.textContent = tipsOn ? "Tips: on" : "Tips: off"; }
+function registerTipZone(el) {
+  if (!el || tipZones.indexOf(el) >= 0) return;
+  tipZones.push(el);
+  el.classList.toggle("tips-on", tipsOn);
+  if (tipsOn) { el.addEventListener("mousemove", repTipMove); el.addEventListener("mouseleave", repHideTip); }
 }
+function registerTipButton(btn) {
+  if (!btn || tipButtons.indexOf(btn) >= 0) return;
+  tipButtons.push(btn); btn.onclick = () => setTips(!tipsOn); syncTipButton(btn);
+}
+function setTips(on) {
+  tipsOn = on;
+  for (const el of tipZones) {
+    el.classList.toggle("tips-on", on);
+    if (on) { el.addEventListener("mousemove", repTipMove); el.addEventListener("mouseleave", repHideTip); }
+    else { el.removeEventListener("mousemove", repTipMove); el.removeEventListener("mouseleave", repHideTip); }
+  }
+  if (!on) repHideTip();
+  for (const b of tipButtons) syncTipButton(b);
+  try { localStorage.setItem("beatrix.tips", on ? "1" : "0"); } catch (e) {}
+}
+// Restore the shared preference once at load (migrating the Repeater's old key),
+// before any zone/button registers so they pick up the current state.
+try {
+  const v = localStorage.getItem("beatrix.tips");
+  tipsOn = v !== null ? v === "1" : (localStorage.getItem("beatrix.rep.tips") === "1");
+} catch (e) {}
 
 async function loadRepeaterFor(pid) {
   if (pid === null) return;
@@ -3822,7 +8090,7 @@ function scheduleRepSave() {
       project: activeProject, id, request: t.request, target: t.target }) });
   }, 500);
 }
-$("rep-request").addEventListener("input", () => { repView = { live: true, idx: 0 }; repHighlightRequest(); scheduleRepSave(); updateRepHistUI(); });
+$("rep-request").addEventListener("input", () => { repView = { live: true, idx: 0 }; repHighlightRequest(); scheduleRepSave(); updateRepHistUI(); if (repDecodeOn) renderDecodePanel(); });
 $("rep-request").addEventListener("scroll", () => {
   const hl = $("rep-request-hl");
   hl.scrollTop = $("rep-request").scrollTop; hl.scrollLeft = $("rep-request").scrollLeft;
@@ -3840,6 +8108,14 @@ function sendToAutoRepeater(request, target) {
   arRenderPayloadBoxes();                            // recompute § positions for the new template
 }
 $("rep-toar").onclick = () => sendToAutoRepeater($("rep-request").value, $("rep-target").value);
+// Right-click the (read-only) response pane for the shared Send-to / Copy / Scope routing.
+// The request textarea is left alone so native copy/paste/undo keep working.
+$("rep-response").oncontextmenu = (e) => {
+  e.preventDefault();
+  const resp = currentRepResponse();
+  showCtxMenu(e.clientX, e.clientY, routeReqMenu({
+    raw: $("rep-request").value, url: $("rep-target").value, response: (resp && resp.raw) || "" }));
+};
 initRepSettings();
 
 async function sendRep() {
@@ -3944,22 +8220,158 @@ function setRepPretty(on) {
   renderRepResponse(currentRepResponse());          // re-render whatever's shown
 }
 
+// ── Auto-decode panel ──
+// Framework fingerprints for session cookies: name → which stack it belongs to,
+// whether it's encrypted (undecodable without the server key), and a note. This
+// is the "decode cookies & tokens" knowledge base — it decodes what's decodable
+// and, just as importantly, says plainly when a value is encrypted/opaque.
+// (repDecodeOn is declared up top with the other toggle flags so that
+// renderRepResponse can call renderDecodePanel safely during page init.)
+const COOKIE_FRAMEWORKS = [
+  { re: /^JSESSIONID$/i, fw: "Java / Servlet", enc: false, note: "Opaque server-side session id — a lookup key, nothing encoded inside it." },
+  { re: /^PHPSESSID$/i, fw: "PHP", enc: false, note: "Opaque server-side session id." },
+  { re: /^ASP\.NET_SessionId$/i, fw: "ASP.NET (classic)", enc: false, note: "Opaque server-side session id." },
+  { re: /^\.AspNetCore\.|^\.AspNet\.ApplicationCookie$/i, fw: "ASP.NET Core", enc: true, note: "Encrypted via Data Protection — undecodable without the app's keyring." },
+  { re: /^session$/i, fw: "Flask", enc: false, note: "Signed, not encrypted: base64url JSON payload + HMAC. The payload decodes; forging it needs SECRET_KEY. A leading '.' means the payload is zlib-compressed." },
+  { re: /^laravel_session$|^XSRF-TOKEN$/i, fw: "Laravel", enc: true, note: "AES-encrypted with APP_KEY — undecodable without it." },
+  { re: /^sessionid$/i, fw: "Django", enc: false, note: "Opaque server-side session id (unless the signed_cookies backend is in use)." },
+  { re: /^csrftoken$/i, fw: "Django", enc: false, note: "A masked random CSRF token, not an encoding." },
+  { re: /_session$/i, fw: "Rails", enc: false, note: "Cookie session: base64 JSON + HMAC (older) or AES-encrypted (5.1+ default). Encrypted ones need secret_key_base." },
+  { re: /^connect\.sid$/i, fw: "Express / connect", enc: false, note: "Signed: 's:' + id + '.' + HMAC. The id is readable; the signature needs the session secret." },
+  { re: /next-auth\.session-token$/i, fw: "NextAuth.js", enc: true, note: "Usually a JWE (encrypted JWT) — undecodable without NEXTAUTH_SECRET." },
+  { re: /^(SSESS|SESS)[0-9a-f]+$/i, fw: "Drupal", enc: false, note: "Opaque server-side session id." },
+  { re: /^wordpress_(logged_in|sec)_/i, fw: "WordPress", enc: false, note: "Signed auth cookie (user|expiry|token|HMAC) — the fields are readable; the HMAC needs the keys." },
+  { re: /^AWSALB(CORS)?$/i, fw: "AWS ALB", enc: true, note: "Load-balancer stickiness cookie — encrypted by AWS, opaque to you." },
+  { re: /^(__cf_bm|cf_clearance)$/i, fw: "Cloudflare", enc: true, note: "Bot-management / challenge cookie — signed by Cloudflare, opaque to you." },
+  { re: /^_ga$|^_gid$|^_gat/i, fw: "Google Analytics", enc: false, note: "Client-side analytics id (not a session) — e.g. GA1.2.<client>.<timestamp>." },
+];
+function cookieFramework(name) {
+  for (const f of COOKIE_FRAMEWORKS) if (f.re.test(name)) return f;
+  return null;
+}
+// Decode one value → { kind: "jwt"|"text"|"binary"|"opaque", summary } or null.
+function repDecodeValue(v) {
+  if (!v) return null;
+  if (/^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./.test(v)) return { kind: "jwt", summary: "JWT — " + decodeJwtTip(v).desc.replace(/\n/g, "  ") };
+  // A dot-segmented signed token (Flask session, signed cookie): the first
+  // segment is the base64url payload; the rest is a timestamp + HMAC signature.
+  const dotm = v.match(/^\.?([A-Za-z0-9_-]{8,})(?:\.[A-Za-z0-9_-]{3,}){1,2}$/);
+  if (dotm) {
+    const payload = encDecodeB64(dotm[1]);
+    if (payload) {
+      const pk = encFinalKind(payload);
+      const p = payload.length > 280 ? payload.slice(0, 280) + "…" : payload;
+      return { kind: "text", summary: "signed token — base64url payload" + (pk ? " ⟶ " + pk : "") + ":  " + p + "   (+ timestamp & HMAC; forging needs the key)" };
+    }
+  }
+  const a = analyzeEncoding(v);
+  if (!a) return null;
+  const steps = a.chain.map(c => c.decoded == null ? c.label + " (binary)" : c.label).join(" → ");
+  if (a.binaryTail) return { kind: "binary", summary: steps + " — " + a.binaryTail + " bytes of binary (needs the server key to decrypt)" };
+  const k = encFinalKind(a.final);
+  const final = a.final.length > 300 ? a.final.slice(0, 300) + "…" : a.final;
+  return { kind: "text", summary: steps + (k ? " ⟶ " + k : "") + ":  " + final };
+}
+// Pull every cookie, auth credential, encoded param, and JWT out of one message.
+function extractDecodables(text, src) {
+  const items = [], seen = new Set();
+  const push = (label, raw, dec, fw) => {
+    const key = label + "|" + raw; if (seen.has(key)) return; seen.add(key);
+    items.push({ src: src, label: label, raw: raw, dec: dec, fw: fw });
+  };
+  const norm = String(text || "").replace(/\r\n/g, "\n");
+  const idx = norm.indexOf("\n\n");
+  const lines = (idx < 0 ? norm : norm.slice(0, idx)).split("\n");
+  if (src === "REQ" && lines[0]) {
+    const m = lines[0].match(/^\S+\s+(\S+)/);
+    const qi = m ? m[1].indexOf("?") : -1;
+    if (qi >= 0) for (const pair of m[1].slice(qi + 1).split(/[&;]/)) {
+      const e = pair.indexOf("="); if (e < 0) continue;
+      const dec = repDecodeValue(pair.slice(e + 1));
+      if (dec) push("param " + pair.slice(0, e), pair.slice(e + 1), dec, null);
+    }
+  }
+  for (let i = 1; i < lines.length; i++) {
+    const hm = lines[i].match(/^([^:\s][^:]*):\s?(.*)$/); if (!hm) continue;
+    const n = hm[1].trim().toLowerCase(), val = hm[2];
+    if (n === "cookie" || n === "set-cookie") {
+      const segs = val.split(";"), pairs = n === "cookie" ? segs : [segs[0]];
+      for (const seg of pairs) {
+        const e = seg.indexOf("="); if (e < 0) continue;
+        const cn = seg.slice(0, e).trim(), cv = seg.slice(e + 1).trim();
+        if (!cn) continue;
+        const fw = cookieFramework(cn), dec = repDecodeValue(cv);
+        if (dec || fw || cv.length >= 16) push("cookie " + cn, cv, dec, fw);  // skip trivial cookies (theme=dark)
+      }
+    } else if (n === "authorization") {
+      const am = val.match(/^(\s*)(\S+)\s+([\s\S]*)$/);
+      if (am) {
+        const scheme = am[2].toLowerCase(), cred = am[3].trim();
+        if (scheme === "basic") push("Authorization Basic", cred, { kind: "text", summary: decodeBasicTip(cred).desc }, null);
+        else if (scheme === "bearer") push("Authorization Bearer", cred, repDecodeValue(cred) || { kind: "opaque", summary: "opaque bearer token" }, null);
+      }
+    }
+  }
+  const re = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
+  let jm;
+  while ((jm = re.exec(text))) {
+    const tok = jm[0];
+    if (!items.some(it => it.raw === tok)) push("JWT", tok, { kind: "jwt", summary: "JWT — " + decodeJwtTip(tok).desc.replace(/\n/g, "  ") }, null);
+  }
+  return items;
+}
+function renderDecodePanel() {
+  const panel = $("rep-decoded"); if (!panel || !repDecodeOn) return;
+  const req = ($("rep-request") || {}).value || "";
+  const resp = currentRepResponse();
+  const respRaw = (resp && !resp.error) ? (resp.raw || "") : "";
+  const items = extractDecodables(req, "REQ").concat(extractDecodables(respRaw, "RESP"));
+  if (!items.length) {
+    panel.innerHTML = '<div class="dec-empty">No cookies, tokens, or encoded values found in this request or response.</div>';
+    return;
+  }
+  const rows = items.map(it => {
+    const fw = it.fw ? '<span class="dec-fw' + (it.fw.enc ? ' enc' : '') + '">' + esc(it.fw.fw) + (it.fw.enc ? ' · encrypted' : '') + '</span>' : '';
+    let val;
+    if (it.dec && it.dec.kind !== "binary" && it.dec.kind !== "opaque") val = esc(it.dec.summary);
+    else if (it.fw && it.fw.note) val = esc(it.fw.note);
+    else if (it.dec) val = esc(it.dec.summary);
+    else val = "opaque — nothing to decode without the server key.";
+    return '<div class="dec-row"><span class="dec-src dec-' + it.src.toLowerCase() + '">' + it.src + '</span>' +
+      '<span class="dec-label">' + esc(it.label) + '</span>' + fw +
+      '<div class="dec-val">' + val + '</div></div>';
+  }).join("");
+  panel.innerHTML = '<div class="dec-hdr">Decoded — ' + items.length + ' value' + (items.length > 1 ? 's' : '') + '</div>' + rows;
+}
+function setRepDecode(on) {
+  repDecodeOn = on;
+  const btn = $("rep-decode");
+  if (btn) { btn.classList.toggle("on", on); btn.textContent = on ? "Decode: on" : "Decode: off"; }
+  const panel = $("rep-decoded"); if (panel) panel.hidden = !on;
+  try { localStorage.setItem("beatrix.rep.decode", on ? "1" : "0"); } catch (e) {}
+  if (on) renderDecodePanel();
+}
+
 function renderRepResponse(resp) {
   const pre = $("rep-response");
-  if (!resp) { pre.textContent = ""; pre.classList.remove("err"); $("rep-status").textContent = ""; return; }
+  if (!resp) { pre.textContent = ""; pre.classList.remove("err"); $("rep-status").textContent = ""; renderDecodePanel(); return; }
   if (resp.error) {
     pre.classList.add("err"); pre.textContent = resp.error;
     $("rep-status").innerHTML = '<span class="bad">✕ ' + esc(resp.error) + '</span>';
-    return;
+    renderDecodePanel(); return;
   }
   pre.classList.remove("err");
-  pre.innerHTML = hlHttp(repPrettyOn ? beautifyHttp(resp.raw || "") : (resp.raw || ""), "response");
+  // The request shown in the editor is the one that produced this response, so
+  // its Origin is what a reflected Allow-Origin would echo.
+  const reqOrigin = reqOriginOf(($("rep-request") || {}).value || "");
+  pre.innerHTML = hlHttp(repPrettyOn ? beautifyHttp(resp.raw || "") : (resp.raw || ""), "response", reqOrigin);
   const cls = resp.status >= 200 && resp.status < 300 ? "ok"
             : resp.status >= 400 ? "bad" : "dim";
   const bits = ['<span class="' + cls + '">' + resp.status + " " + esc(resp.reason || "") + "</span>",
     repBytes(resp.size || 0), (resp.time_ms || 0) + " ms"];
   if (resp.truncated) bits.push('<span class="dim">(body truncated)</span>');
   $("rep-status").innerHTML = bits.join(" · ");
+  renderDecodePanel();
 }
 
 // History scrub: ‹ › walk the tab's past sends; the newest step forward returns
@@ -4156,14 +8568,24 @@ function arRenderTable() {
   let cols = AR_COLS.slice();
   if (hasGrep) cols = cols.concat([{ key: "grep", label: "Grep" }]);
   if (hasExtract) cols = cols.concat([{ key: "extract", label: "Extract" }]);
-  const thead = $("ar-thead"); thead.innerHTML = "";
-  for (const c of cols) {
-    const th = document.createElement("th");
-    th.textContent = c.label;
-    if (arSort.key === c.key) th.className = "sorted" + (arSort.dir > 0 ? " asc" : "");
-    th.onclick = () => { if (arSort.key === c.key) arSort.dir *= -1; else arSort = { key: c.key, dir: 1 }; arRenderTable(); };
-    thead.appendChild(th);
+  // Only rebuild the header when the column SET actually changes — otherwise reuse the existing
+  // <th> nodes so their resize grips (and any in-progress drag) survive the live poll.
+  const thead = $("ar-thead");
+  const sig = cols.map(c => c.label).join("\u0001");
+  if (thead.getAttribute("data-cols") !== sig) {
+    thead.innerHTML = "";
+    for (const c of cols) {
+      const th = document.createElement("th");
+      th.textContent = c.label;
+      th.onclick = () => { if (arSort.key === c.key) arSort.dir *= -1; else arSort = { key: c.key, dir: 1 }; arRenderTable(); };
+      thead.appendChild(th);
+    }
+    thead.setAttribute("data-cols", sig);
   }
+  Array.prototype.forEach.call(thead.children, (th, idx) => {      // refresh the sort indicator on the (reused) headers
+    const c = cols[idx]; if (!c) return;
+    th.className = (arSort.key === c.key) ? "sorted" + (arSort.dir > 0 ? " asc" : "") : "";
+  });
   const rows = arResults.slice().sort((a, b) => {
     if (arSort.key === "payloads")
       return arSort.dir * String((a.payloads || []).join(" ")).localeCompare(String((b.payloads || []).join(" ")));
@@ -4182,9 +8604,18 @@ function arRenderTable() {
     if (hasExtract) cells.push(r.extract == null ? "—" : esc(r.extract));
     tr.innerHTML = cells.map(c => "<td>" + c + "</td>").join("");
     tr.onclick = () => arSelectRow(r.index);
+    tr.oncontextmenu = (e) => { e.preventDefault(); const x = e.clientX, y = e.clientY;
+      arSelectRow(r.index).then(() => arRouteMenu(x, y)); };   // shared Send-to / Copy / Scope routing
     tb.appendChild(tr);
   }
   $("ar-empty").style.display = arResults.length ? "none" : "block";
+}
+// Right-click an AutoRepeater attempt (row or detail) → the shared request-routing menu,
+// built from that attempt's own request/response against the module's target origin.
+function arRouteMenu(x, y) {
+  if (!arDetailRow) return;
+  const url = (($("ar-target") || {}).value) || "";
+  showCtxMenu(x, y, routeReqMenu({ raw: arDetailRow.request || "", url: url, response: arDetailRow.response || "" }));
 }
 async function arSelectRow(index) {
   arSelected = index; arRenderTable();
@@ -4196,7 +8627,7 @@ function arRenderDetail() {
   const pre = $("ar-detail");
   if (!arDetailRow) { pre.textContent = ""; return; }
   if (arDetailTab === "request") pre.innerHTML = hlHttp(arDetailRow.request || "", "request");
-  else pre.innerHTML = arDetailRow.response ? hlHttp(arDetailRow.response, "response") : (arDetailRow.error ? esc(arDetailRow.error) : "");
+  else pre.innerHTML = arDetailRow.response ? hlHttp(arDetailRow.response, "response", reqOriginOf(arDetailRow.request)) : (arDetailRow.error ? esc(arDetailRow.error) : "");
 }
 document.querySelectorAll("#pane-autorepeater .ar-dtabs button").forEach(b => {
   b.onclick = () => {
@@ -4204,6 +8635,7 @@ document.querySelectorAll("#pane-autorepeater .ar-dtabs button").forEach(b => {
     arDetailTab = b.dataset.ard; arRenderDetail();
   };
 });
+$("ar-detail").oncontextmenu = (e) => { e.preventDefault(); arRouteMenu(e.clientX, e.clientY); };
 async function loadAutoRepeaterFor(pid) {
   if (pid === null) return;
   let d; try { d = await (await fetch("/autorepeater/state?project=" + pid)).json(); } catch (e) { return; }
@@ -4221,9 +8653,4096 @@ arRenderPayloadBoxes();
 arRenderRules();
 
 // ── Sessions: choose the workspace (session > projects) before the dashboard ──
+// ── Network pane (Zenmap-style nmap) ──
+const NET_PROFILE_GROUPS = [
+  { label: "Zenmap classic", items: {
+    "Intense scan": "-T4 -A -v",
+    "Intense scan plus UDP": "-sS -sU -T4 -A -v",
+    "Intense scan, all TCP ports": "-p 1-65535 -T4 -A -v",
+    "Intense scan, no ping": "-T4 -A -v -Pn",
+    "Ping scan": "-sn",
+    "Quick scan": "-T4 -F",
+    "Quick scan plus": "-sV -T4 -O -F --version-light",
+    "Quick traceroute": "-sn --traceroute",
+    "Regular scan": "",
+    "Slow comprehensive scan": "-sS -sU -T4 -A -v -PE -PP -PS80,443 -PA3389 -PU40125 -PY -g 53 --script \"default or (discovery and safe)\"",
+  } },
+  { label: "Host discovery", items: {
+    "List scan (no probes)": "-sL",
+    "Ping sweep (no port scan)": "-sn",
+    "ARP ping sweep (LAN)": "-sn -PR",
+    "ICMP echo ping": "-sn -PE",
+    "ICMP timestamp + netmask ping": "-sn -PP -PM",
+    "TCP SYN ping (common ports)": "-sn -PS21,22,23,25,53,80,110,135,139,143,443,445,993,995,3306,3389,5900,8080",
+    "TCP ACK ping": "-sn -PA80,443,3389",
+    "UDP ping": "-sn -PU53,123,137,161",
+    "SCTP INIT ping": "-sn -PY",
+    "IP protocol ping": "-sn -PO",
+    "No-ping (assume host up)": "-Pn -T4 -F",
+    "Traceroute": "-sn --traceroute",
+  } },
+  { label: "TCP scans", items: {
+    "Quick scan (top 100)": "-T4 -F",
+    "Top 1000 ports (SYN)": "-sS -T4 --open",
+    "All TCP ports (SYN)": "-sS -p- -T4 --open",
+    "TCP connect (unprivileged)": "-sT -T4",
+    "TCP NULL scan": "-sN",
+    "TCP FIN scan": "-sF",
+    "TCP Xmas scan": "-sX",
+    "TCP ACK scan (firewall map)": "-sA",
+    "TCP Window scan": "-sW",
+    "TCP Maimon scan": "-sM",
+    "Idle / zombie scan": "-sI ZOMBIE_HOST:PORT",
+    "Custom TCP flags": "--scanflags SYNACK",
+  } },
+  { label: "UDP / other protocols", items: {
+    "UDP top 200 ports": "-sU --top-ports 200 -T4 --open",
+    "UDP all ports (slow)": "-sU -p- -T4",
+    "SCTP INIT scan": "-sY -T4",
+    "SCTP COOKIE-ECHO scan": "-sZ",
+    "IP protocol scan": "-sO",
+    "FTP bounce scan": "-b FTP_RELAY_HOST",
+  } },
+  { label: "Service / OS", items: {
+    "Service / version detection": "-sV -T4",
+    "Version (light / fast)": "-sV --version-light -T4",
+    "Version (intensive)": "-sV --version-all -T4",
+    "OS detection": "-O --osscan-guess",
+    "OS + version fingerprint": "-sS -sV -O -T4",
+    "Aggressive (OS+ver+scripts+trace)": "-A -T4",
+  } },
+  { label: "NSE script categories", items: {
+    "Default scripts (-sC)": "-sC",
+    "Discovery scripts": "--script discovery",
+    "Safe scripts": "--script safe",
+    "Auth scripts": "-sV --script auth",
+    "Vulnerability detection (vuln)": "-sV --script vuln",
+    "Vulners / CVE lookup": "-sV --script vulners",
+    "Exploit scripts": "-sV --script exploit",
+    "Malware / backdoor check": "--script malware",
+    "Broadcast discovery (LAN)": "--script broadcast",
+    "Brute force (slow)": "-sV --script brute",
+    "Denial-of-service (dangerous)": "--script dos",
+    "Intrusive scripts": "-sV --script intrusive",
+    "External (3rd-party data)": "--script external",
+    "Fuzzer (slow)": "--script fuzzer",
+  } },
+  { label: "Targeted service enumeration", items: {
+    "HTTP enumeration": "-sV --script \"http-enum,http-headers,http-methods,http-title,http-robots.txt\"",
+    "SMB enumeration": "--script \"smb-os-discovery,smb-enum-shares,smb-enum-users,smb-protocols,smb-security-mode\"",
+    "SMB vulnerabilities": "--script \"smb-vuln*\"",
+    "SSL / TLS (cert, ciphers, vulns)": "--script \"ssl-cert,ssl-enum-ciphers,ssl-dh-params,ssl-heartbleed,sslv2\"",
+    "SSH enumeration": "--script \"ssh-hostkey,ssh-auth-methods,ssh2-enum-algos\"",
+    "FTP enumeration": "--script \"ftp-anon,ftp-syst\"",
+    "DNS enumeration": "--script \"dns-nsid,dns-recursion,dns-zone-transfer\"",
+    "SNMP enumeration": "-sU --script \"snmp-info,snmp-sysdescr,snmp-interfaces\"",
+    "Databases (SQL/Mongo)": "--script \"ms-sql-info,mysql-info,oracle-tns-version,pgsql-brute,mongodb-info\"",
+    "RDP enumeration": "--script \"rdp-ntlm-info,rdp-enum-encryption\"",
+    "SMTP enumeration": "--script \"smtp-commands,smtp-open-relay,smtp-enum-users\"",
+    "VNC enumeration": "--script \"vnc-info,vnc-title\"",
+    "NFS enumeration": "--script \"nfs-showmount,nfs-ls,nfs-statfs\"",
+  } },
+  { label: "Firewall / IDS evasion", items: {
+    "Fragment packets": "-f -sS",
+    "Fragment (custom MTU)": "--mtu 16 -sS",
+    "Decoy scan": "-sS -D RND:10",
+    "Source port 53": "-sS -g 53",
+    "Slow stealth (-T1)": "-sS -T1 -f",
+    "Spoof MAC (random)": "-sS --spoof-mac 0",
+    "Bad-checksum probe": "--badsum",
+  } },
+  { label: "IPv6", items: {
+    "IPv6 SYN scan": "-6 -sS -T4",
+    "IPv6 aggressive": "-6 -A -T4",
+  } },
+];
+// Flat name→args for lookups; mirrors beatrix.core.nmap_runner.NMAP_PROFILES (keep in sync).
+const NET_PROFILES = Object.assign({}, ...NET_PROFILE_GROUPS.map(g => g.items));
+let netSince = 0, netPollTimer = null, netActiveScanId = null, netResult = { hosts: [] },
+    netSelHost = null, netScanning = false, netInited = false, netOutput = "", netLinkedCap = null,
+    netShownScanId = null, netCustomProfiles = {};
+
+function initNetwork() {
+  if (netInited) return; netInited = true;
+  fillNetProfiles("Quick scan");
+  $("net-args").value = netProfileArgs("Quick scan");
+  $("net-profile").onchange = onNetProfileChange;
+  $("net-profile-save").onclick = saveNetProfile;
+  $("net-profile-del").onclick = deleteNetProfile;
+  $("net-export").onclick = netExport;
+  $("net-target").addEventListener("input", syncNetPreview);
+  $("net-scan").onclick = runNmap;
+  $("net-stop").onclick = stopNmap;
+  $("net-sweep-go").onclick = netSweepGo;
+  $("net-target").addEventListener("keydown", e => { if (e.key === "Enter") runNmap(); });
+  $("net-hostsearch").addEventListener("input", () => renderNetHosts(netResult.hosts || []));
+  document.querySelectorAll("#pane-network .net-rtabs button").forEach(b => {
+    b.onclick = () => {
+      document.querySelectorAll("#pane-network .net-rtabs button").forEach(x => x.classList.toggle("active", x === b));
+      const id = b.getAttribute("data-nt");
+      document.querySelectorAll("#pane-network .nt-pane").forEach(p => p.classList.toggle("active", p.id === "nt-" + id));
+    };
+  });
+  // Global Tips — the whole Network results pane is a tip zone.
+  registerTipZone(document.querySelector("#pane-network .net-rbody"));
+  registerTipButton($("net-tips"));
+  syncNetPreview();
+}
+function syncNetPreview() {
+  const t = $("net-target").value.trim();
+  $("net-tpreview").textContent = t || "<target>";
+}
+function netProfileArgs(name) {
+  return (name in netCustomProfiles) ? netCustomProfiles[name] : (NET_PROFILES[name] || "");
+}
+function fillNetProfiles(selected) {
+  const sel = $("net-profile");
+  const cur = selected || sel.value || "Quick scan";
+  sel.innerHTML = "";
+  for (const grp of NET_PROFILE_GROUPS) {               // one <optgroup> per nmap capability
+    const og = document.createElement("optgroup"); og.label = grp.label;
+    for (const name of Object.keys(grp.items)) {
+      const o = document.createElement("option"); o.value = name; o.textContent = name; og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  const custom = Object.keys(netCustomProfiles);
+  if (custom.length) {
+    const g2 = document.createElement("optgroup"); g2.label = "Saved";
+    for (const name of custom) {
+      const o = document.createElement("option"); o.value = name; o.textContent = name; g2.appendChild(o);
+    }
+    sel.appendChild(g2);
+  }
+  sel.value = (cur in netCustomProfiles || cur in NET_PROFILES) ? cur : "Quick scan";
+  $("net-profile-del").hidden = !(sel.value in netCustomProfiles);
+}
+function onNetProfileChange() {
+  const name = $("net-profile").value;
+  $("net-args").value = netProfileArgs(name);
+  $("net-profile-del").hidden = !(name in netCustomProfiles);
+}
+async function loadNetProfiles() {
+  try {
+    const d = await (await fetch("/nmap/profiles?project=" + activeProject)).json();
+    netCustomProfiles = d.profiles || {};
+  } catch (e) { netCustomProfiles = {}; }
+  fillNetProfiles($("net-profile").value);
+}
+async function saveNetProfile() {
+  const name = (prompt("Save the current nmap options as a profile named:") || "").trim();
+  if (!name) return;
+  const d = await (await fetch("/nmap/profiles/save", { method: "POST", body: JSON.stringify({
+    project: activeProject, name: name, args: $("net-args").value }) })).json();
+  if (!d.ok) { $("net-status").innerHTML = '<span class="bad">' + esc(d.error || "save failed") + '</span>'; return; }
+  netCustomProfiles = d.profiles || {};
+  fillNetProfiles(name); onNetProfileChange();
+  $("net-status").innerHTML = '<span class="dim">saved profile “' + esc(name) + '”</span>';
+}
+async function deleteNetProfile() {
+  const name = $("net-profile").value;
+  if (!(name in netCustomProfiles)) return;
+  if (!confirm("Delete saved profile “" + name + "”?")) return;
+  const d = await (await fetch("/nmap/profiles/delete", { method: "POST", body: JSON.stringify({
+    project: activeProject, name: name }) })).json();
+  if (!d.ok) return;
+  netCustomProfiles = d.profiles || {};
+  fillNetProfiles("Quick scan"); onNetProfileChange();
+}
+async function netExport() {
+  let id = netShownScanId;
+  if (id == null) {
+    const first = document.querySelector("#net-history .net-histrow");
+    if (first) id = first.getAttribute("data-id");
+  }
+  if (id == null) { $("net-status").innerHTML = '<span class="dim">no scan to export — run one first</span>'; return; }
+  const fmt = $("net-export-fmt").value;
+  let d;
+  try { d = await (await fetch("/nmap/export?id=" + id + "&fmt=" + fmt + "&project=" + activeProject)).json(); }
+  catch (e) { $("net-status").innerHTML = '<span class="bad">export failed</span>'; return; }
+  if (!d.ok) { $("net-status").innerHTML = '<span class="bad">' + esc(d.error || "export failed") + '</span>'; return; }
+  const url = URL.createObjectURL(new Blob([d.text || ""], { type: "text/plain" }));
+  const a = document.createElement("a"); a.href = url; a.download = d.filename; a.click();
+  URL.revokeObjectURL(url);
+  $("net-status").innerHTML = '<span class="dim">exported ' + esc(d.filename) + '</span>';
+}
+async function loadNetworkFor(pid) {
+  if (pid === null) return;
+  initNetwork();
+  try {
+    const st = await (await fetch("/nmap/state?project=" + pid)).json();
+    if (pid !== activeProject) return;
+    await loadNetProfiles();
+    renderNetHistory(st.scans || []);
+    await loadNetHosts();
+    const running = (st.scans || []).find(s => s.status === "running");
+    if (running && !netScanning) { netActiveScanId = running.id; startNetPolling(); }
+    try {
+      const sw = await (await fetch("/nmap/sweep/state?project=" + pid)).json();
+      if (pid !== activeProject) return;
+      renderNetSweep(sw);                 // re-attach to a live sweep, or offer Resume
+    } catch (e) {}
+  } catch (e) {}
+}
+// ── Full-sweep (resumable, one-button maximum-coverage recon) ──
+async function netSweepGo() {
+  const target = $("net-target").value.trim();
+  if (!target) { $("net-status").innerHTML = '<span class="bad">enter a target</span>'; return; }
+  const mode = $("net-sweep-mode").value;
+  if (mode === "active" && !confirm(
+      "Active sweep runs INTRUSIVE nmap scripts (brute-force, exploit, DoS) that can lock accounts, " +
+      "crash services, or trip intrusion detection. Only run it against systems you are authorized to " +
+      "test.\n\nContinue?")) return;
+  netOutput = ""; $("nt-output").textContent = ""; netSince = 0;
+  const d = await (await fetch("/nmap/sweep/start", { method: "POST", body: JSON.stringify({
+    project: activeProject, target, mode }) })).json();
+  if (!d.ok) { $("net-status").innerHTML = '<span class="bad">' + esc(d.error || "sweep failed to start") + '</span>'; return; }
+  $("net-resume").style.display = "none";
+  appendNetOutput("$ Full " + d.mode + " sweep — " + target + " · " + d.total + " steps\n");
+  startNetPolling();
+}
+async function resumeNetSweep() {
+  $("net-resume").style.display = "none"; netSince = 0;
+  const d = await (await fetch("/nmap/sweep/resume", { method: "POST", body: JSON.stringify({
+    project: activeProject }) })).json();
+  if (!d.ok) { $("net-status").innerHTML = '<span class="bad">' + esc(d.error || "resume failed") + '</span>'; return; }
+  appendNetOutput("$ Resuming " + d.mode + " sweep — " + d.remaining + " step(s) left\n");
+  startNetPolling();
+}
+async function netSweepFresh() {
+  await fetch("/nmap/sweep/clear", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+  $("net-resume").style.display = "none";
+}
+function renderNetSweep(sw) {
+  const box = $("net-resume"); if (!box) return;
+  if (!sw || !sw.exists) { box.style.display = "none"; return; }
+  if (sw.running) {                       // a sweep is live → re-attach polling, show progress
+    box.style.display = "none";
+    if (!netScanning) startNetPolling();
+    $("net-status").innerHTML = '<span class="dim">Sweep · step ' + sw.step + '/' + sw.total +
+      (sw.step_label ? ' · ' + esc(sw.step_label) : '') + '</span>';
+    return;
+  }
+  if (sw.resumable) {
+    box.style.display = "";
+    box.innerHTML = '<b>Comprehensive sweep interrupted</b> — ' + sw.completed + ' of ' + sw.total +
+      ' step(s) done (' + esc(sw.mode || '') + (sw.target ? ' · ' + esc(sw.target) : '') + '). ' +
+      'Resume continues from the next step (and mid-step where nmap can). ' +
+      '<button class="primary" id="net-resume-go">Resume</button> ' +
+      '<button id="net-resume-fresh">Start fresh</button>';
+    $("net-resume-go").onclick = resumeNetSweep;
+    $("net-resume-fresh").onclick = netSweepFresh;
+  } else {
+    box.style.display = "none";
+  }
+}
+// The Hosts column is the project's merged, deduped-by-IP inventory — one row
+// per host, accumulated across every scan — not a single scan's result.
+async function loadNetHosts() {
+  try {
+    const d = await (await fetch("/nmap/hosts?project=" + activeProject)).json();
+    netResult = { hosts: d.hosts || [] };
+    renderNetHosts(netResult.hosts);
+  } catch (e) {}
+}
+function setNetScanning(on) {
+  netScanning = on;
+  $("net-scan").disabled = on; $("net-stop").disabled = !on;
+  $("net-status").innerHTML = on ? '<span class="dim">scanning…</span>' : '';
+}
+async function runNmap() {
+  const target = $("net-target").value.trim();
+  if (!target) { $("net-status").innerHTML = '<span class="bad">enter a target</span>'; return; }
+  const args = $("net-args").value, profile = $("net-profile").value;
+  // Template presets carry an ALL-CAPS placeholder (e.g. ZOMBIE_HOST) the operator must fill.
+  const ph = args.match(/\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/);
+  if (ph) { $("net-status").innerHTML = '<span class="bad">fill in the ' + esc(ph[0]) + ' placeholder in the options first</span>'; return; }
+  netOutput = ""; $("nt-output").textContent = ""; netSince = 0;
+  // Keep the merged inventory + selection on screen; this scan's hosts merge in
+  // live and the final result is reloaded from the inventory when it finishes.
+  const d = await (await fetch("/nmap/run", { method: "POST", body: JSON.stringify({
+    project: activeProject, target, args, profile }) })).json();
+  if (!d.ok) { $("net-status").innerHTML = '<span class="bad">' + esc(d.error || "scan failed") + '</span>'; return; }
+  netActiveScanId = d.scan_id;
+  appendNetOutput("$ " + d.command + (d.privileged ? "   (root via sudo)" : "") + "\n");
+  // Optional linked capture: sniff this scan's traffic to a pcap.
+  netLinkedCap = null;
+  if ($("net-capture").checked) {
+    const localhost = /^(127\.|localhost|::1)/.test(target);
+    const iface = localhost ? "lo" : "";
+    const flt = /[\/\s]/.test(target) ? "" : ("host " + target);
+    try {
+      const cd = await (await fetch("/packets/capture/start", { method: "POST", body: JSON.stringify({
+        project: activeProject, iface, filter: flt, source: "scan", scan_id: d.scan_id,
+        name: "scan " + d.scan_id + " (" + target + ")" }) })).json();
+      if (cd.ok) { netLinkedCap = cd.capture_id; appendNetOutput("[capturing traffic → Packets tab]\n"); }
+      else appendNetOutput("[capture not started: " + (cd.error || "") + "]\n");
+    } catch (e) {}
+  }
+  startNetPolling();
+}
+async function stopNmap() {
+  await fetch("/nmap/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+}
+function startNetPolling() {
+  setNetScanning(true);
+  clearInterval(netPollTimer);
+  netPollTimer = setInterval(pollNmap, 700);
+  pollNmap();
+}
+async function pollNmap() {
+  let d;
+  try { d = await (await fetch("/nmap/events?since=" + netSince + "&project=" + activeProject)).json(); }
+  catch (e) { return; }
+  for (const ev of (d.events || [])) {
+    netSince = Math.max(netSince, ev.seq);
+    if (ev.type === "hosts") {           // live: hosts nmap has finished so far
+      if (ev.detail && ev.detail.length) { mergeNetHosts(ev.detail); renderNetHosts(netResult.hosts); }
+    } else if (ev.type !== "done") {
+      appendNetOutput(ev.text + "\n");
+      const m = /Step (\d+)\/(\d+): (.+?) \u2500\u2500/.exec(ev.text || "");   // sweep progress chip
+      if (m) $("net-status").innerHTML = '<span class="dim">Sweep · step ' + m[1] + '/' + m[2] + ' · ' + esc(m[3]) + '</span>';
+    }
+  }
+  if (d.done) {
+    clearInterval(netPollTimer); netPollTimer = null;
+    setNetScanning(false);
+    if (netLinkedCap != null) {   // close the scan's linked capture
+      fetch("/packets/capture/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+      appendNetOutput("[linked capture #" + netLinkedCap + " saved — open it in the Packets tab]\n");
+      netLinkedCap = null;
+    }
+    try {
+      const st = await (await fetch("/nmap/state?project=" + activeProject)).json();
+      renderNetHistory(st.scans || []);
+    } catch (e) {}
+    try {
+      const sw = await (await fetch("/nmap/sweep/state?project=" + activeProject)).json();
+      renderNetSweep(sw);   // sweep finished → clear chip, or interrupted → offer Resume
+    } catch (e) {}
+    loadNetHosts();   // reload the authoritative merged inventory (this scan folded in)
+  }
+}
+function appendNetOutput(t) {
+  netOutput += t;
+  const pre = $("nt-output"); pre.textContent = netOutput; pre.scrollTop = pre.scrollHeight;
+}
+// Clicking a history entry shows THAT scan's raw output in the Nmap Output tab.
+// It never rewrites the Hosts column — hosts stay the merged project inventory.
+async function showScanOutput(id) {
+  const d = await (await fetch("/nmap/result?id=" + id + "&project=" + activeProject)).json();
+  const scan = d.scan; if (!scan) return;
+  netShownScanId = scan.id;        // the scan the Export button acts on
+  document.querySelectorAll("#net-history .net-histrow").forEach(r =>
+    r.classList.toggle("active", r.getAttribute("data-id") === String(scan.id)));
+  const res = scan.result || {};
+  let out = "$ " + (scan.command || "") + "\n\n" + (res.summary || scan.error || "") + "\n";
+  for (const h of (res.hosts || [])) {
+    const open = (h.ports || []).filter(p => p.state === "open")
+      .map(p => p.port + "/" + p.protocol + (p.service ? " " + p.service : "")).join(", ");
+    out += "\n" + h.ip + (h.hostname ? " (" + h.hostname + ")" : "") + " — " + (h.state || "") +
+           (open ? "\n  open: " + open : "");
+  }
+  netOutput = out; $("nt-output").textContent = out;
+  document.querySelectorAll("#pane-network .net-rtabs button").forEach(b =>
+    b.classList.toggle("active", b.getAttribute("data-nt") === "output"));
+  document.querySelectorAll("#pane-network .nt-pane").forEach(p =>
+    p.classList.toggle("active", p.id === "nt-output"));
+}
+// Upsert a batch of streamed hosts into netResult by ip (preserving order), so
+// the live view and the final whole-scan result converge to the same thing.
+function mergeNetHosts(batch) {
+  if (!netResult || !netResult.hosts) netResult = { hosts: [] };
+  const idx = {};
+  netResult.hosts.forEach((h, i) => { idx[h.ip] = i; });
+  for (const nh of batch) {
+    const at = idx[nh.ip];
+    if (at === undefined) { idx[nh.ip] = netResult.hosts.length; netResult.hosts.push(nh); }
+    else netResult.hosts[at] = netMergeHost(netResult.hosts[at], nh);   // refine, never wipe
+  }
+}
+// Fold a freshly-observed host into the known one — mirrors the server's _merge_host so the
+// live view matches the authoritative inventory: ports union by (proto,port) with a re-scan
+// winning, OS union (best accuracy kept), scripts merged, hostname/trace/up filled in. A sweep
+// step that returns fewer fields (the no-port -sn discovery or --traceroute step) can only ADD,
+// never erase ports already collected — which was wiping the Ports/Hosts tab mid-sweep.
+function netMergeHost(cur, nh) {
+  if (!cur) return nh;
+  const out = Object.assign({}, cur);
+  if (nh.hostname && !out.hostname) out.hostname = nh.hostname;
+  if (nh.state === "up" || !out.state) out.state = nh.state || out.state;   // known-up stays up
+  const pmap = {};
+  for (const p of (out.ports || [])) pmap[(p.protocol || "tcp") + "/" + p.port] = p;
+  for (const p of (nh.ports || [])) pmap[(p.protocol || "tcp") + "/" + p.port] = p;  // re-observed wins
+  out.ports = Object.keys(pmap).sort((a, b) => {
+    const pa = pmap[a], pb = pmap[b];
+    return (pa.protocol || "").localeCompare(pb.protocol || "") || ((pa.port || 0) - (pb.port || 0));
+  }).map(k => pmap[k]);
+  const osmap = {};
+  for (const o of (out.os || [])) osmap[o.name] = o;
+  for (const o of (nh.os || [])) if (!osmap[o.name] || (o.accuracy || 0) > (osmap[o.name].accuracy || 0)) osmap[o.name] = o;
+  out.os = Object.values(osmap).sort((a, b) => (b.accuracy || 0) - (a.accuracy || 0));
+  out.scripts = Object.assign({}, out.scripts || {}, nh.scripts || {});
+  if (nh.trace && nh.trace.length) out.trace = nh.trace;                    // a fresh traceroute replaces the old
+  return out;
+}
+function netHostMatch(h, q) {
+  if (!q) return true;
+  if ((h.ip || "").toLowerCase().includes(q)) return true;
+  if ((h.hostname || "").toLowerCase().includes(q)) return true;
+  return (h.ports || []).some(p =>
+    String(p.port).includes(q) ||
+    (p.service || "").toLowerCase().includes(q) ||
+    (p.product || "").toLowerCase().includes(q));
+}
+function renderNetHosts(hosts) {
+  const box = $("net-hostlist");
+  // Services + Topology always reflect the full inventory (not the host filter).
+  renderNetServices(hosts); renderNetTopology(hosts);
+  if (!(hosts || []).length) {
+    box.innerHTML = '<div class="net-empty">No hosts up yet…</div>';
+    renderNetPorts(null); renderNetDetails(null); return;
+  }
+  const q = ($("net-hostsearch").value || "").trim().toLowerCase();
+  const shown = hosts.filter(h => netHostMatch(h, q));
+  if (!shown.length) { box.innerHTML = '<div class="net-empty">No hosts match the filter.</div>'; return; }
+  box.innerHTML = shown.map(h =>
+    '<div class="net-hostrow" data-ip="' + esc(h.ip) + '"><span class="st-' +
+    (h.state === "up" ? "up" : "down") + '">●</span> ' + esc(h.ip) +
+    (h.hostname ? ' <span class="meta">(' + esc(h.hostname) + ')</span>' : '') + '</div>').join("");
+  box.querySelectorAll(".net-hostrow").forEach(r => {
+    r.onclick = () => selectNetHost(r.getAttribute("data-ip"));
+    r.oncontextmenu = (e) => { e.preventDefault(); const ip = r.getAttribute("data-ip"); selectNetHost(ip); showCtxMenu(e.clientX, e.clientY, routeHostMenu({ host: ip, ip: ip })); };
+  });
+  // Keep the operator's selection across live re-renders; otherwise show the first visible host.
+  if (netSelHost && shown.some(h => h.ip === netSelHost)) selectNetHost(netSelHost);
+  else selectNetHost(shown[0].ip);
+}
+function renderNetServices(hosts) {
+  const box = $("nt-services");
+  const map = {};
+  for (const h of hosts || []) for (const p of h.ports || []) {
+    if ((p.state || "") !== "open") continue;     // Services = open ports only
+    const svc = p.service || "unknown";
+    (map[svc] = map[svc] || { svc: svc, ports: new Set(), hosts: new Set() });
+    map[svc].ports.add((p.protocol || "tcp") + "/" + p.port);
+    map[svc].hosts.add(h.ip);
+  }
+  const rows = Object.values(map).sort((a, b) => b.hosts.size - a.hosts.size || a.svc.localeCompare(b.svc));
+  if (!rows.length) { box.innerHTML = '<div class="net-empty">No open services yet. Run a service scan (e.g. -sV).</div>'; return; }
+  box.innerHTML = '<table class="net-ports rep-code"><thead><tr><th>Service</th><th>Ports</th><th>Hosts</th></tr></thead><tbody>' +
+    rows.map(r => '<tr><td>' + repSpanTip("tok-hname", r.svc, "svc:" + r.svc.toLowerCase()) + '</td><td>' +
+      esc([...r.ports].sort().join(", ")) + '</td><td>' + esc([...r.hosts].join(", ")) +
+      ' <span class="meta">(' + r.hosts.size + ')</span></td></tr>').join("") + '</tbody></table>';
+}
+function selectNetHost(ip) {
+  netSelHost = ip;
+  document.querySelectorAll("#net-hostlist .net-hostrow").forEach(r =>
+    r.classList.toggle("active", r.getAttribute("data-ip") === ip));
+  const h = (netResult.hosts || []).find(x => x.ip === ip);
+  renderNetPorts(h); renderNetDetails(h);
+}
+function renderNetPorts(h) {
+  const box = $("nt-ports");
+  if (!h) { box.innerHTML = '<div class="net-empty">Run a scan to see ports.</div>'; return; }
+  const ports = h.ports || [];
+  if (!ports.length) { box.innerHTML = '<div class="net-empty">No ports reported for ' + esc(h.ip) + '.</div>'; return; }
+  const rows = ports.map(p => {
+    const proto = p.protocol || "tcp";
+    const portCell = repSpanTip("tok-param", String(p.port), "port:" + p.port) +
+      repSpan("tok-hsep", "/") + repSpanTip("tok-reason", proto, "proto:" + proto);
+    const stateCell = repSpanTip("net-pstate-" + p.state, p.state || "", "state:" + (p.state || ""));
+    // nmap reports HTTPS as service "http" + tunnel "ssl"; show it as nmap does
+    // ("ssl/http"), with the tunnel token explaining the TLS layer.
+    const svc = p.service || "";
+    let svcCell = svc ? repSpanTip("tok-hname", svc, "svc:" + svc.toLowerCase()) : "";
+    if (p.tunnel) {
+      const tun = repSpanTip("tok-hname", p.tunnel, "svc:" + p.tunnel.toLowerCase());
+      svcCell = svc ? (tun + repSpan("tok-hsep", "/") + svcCell) : tun;
+    }
+    const ver = [p.product, p.version, p.extrainfo].filter(Boolean).join(" ");
+    const verCell = ver ? repSpanTip("tok-version", ver, p.cpe ? "cpe:x" : "ver:x") : "";
+    return "<tr><td>" + portCell + "</td><td>" + stateCell + "</td><td>" + svcCell + "</td><td>" + verCell + "</td></tr>";
+  }).join("");
+  box.innerHTML = '<table class="net-ports rep-code"><thead><tr><th>Port</th><th>State</th>' +
+    '<th>Service</th><th>Version</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+function renderNetDetails(h) {
+  const box = $("nt-details");
+  if (!h) { box.innerHTML = '<div class="net-empty">Run a scan to see host details.</div>'; return; }
+  const sec = (title, bodyHtml) => '<div class="net-dsec"><h4>' + esc(title) +
+    '</h4><pre class="rep-code">' + bodyHtml + '</pre></div>';
+  let html = "";
+  // Host — IP, hostname, and up/down state.
+  const stateCls = (h.state === "up") ? "tok-status-2xx" : "tok-status-err";
+  let hl = repSpan("tok-param", h.ip || "");
+  if (h.hostname) hl += " " + repSpan("tok-val", "(" + h.hostname + ")");
+  hl += "  " + repSpanTip(stateCls, h.state || "unknown", "state:" + (h.state || ""));
+  html += sec("Host", hl);
+  // OS matches — name + accuracy (hover the % for how to read it).
+  if ((h.os || []).length) html += sec("OS matches", h.os.map(o =>
+    repSpan("tok-hvalue", o.name || "") + "  " +
+    repSpanTip("tok-version", "(" + (o.accuracy != null ? o.accuracy : "?") + "%)", "osc:accuracy")
+  ).join("\n"));
+  // Host scripts — script id (hover for what it checks) + its output.
+  const hs = Object.entries(h.scripts || {});
+  if (hs.length) html += sec("Host scripts", hs.map(([k, v]) =>
+    repSpanTip("tok-hname", k, "nse:" + k) + repSpan("tok-hsep", ":") + "\n" +
+    repSpan("tok-comment", v || "")).join("\n\n"));
+  // Port scripts — grouped under each port.
+  const ps = (h.ports || []).filter(p => Object.keys(p.scripts || {}).length);
+  if (ps.length) html += sec("Port scripts", ps.map(p => {
+    const proto = p.protocol || "tcp";
+    const head = repSpanTip("tok-param", String(p.port), "port:" + p.port) +
+      repSpan("tok-hsep", "/") + repSpanTip("tok-reason", proto, "proto:" + proto);
+    const body = Object.entries(p.scripts).map(([k, v]) =>
+      "  " + repSpanTip("tok-hname", k, "nse:" + k) + repSpan("tok-hsep", ": ") +
+      repSpan("tok-comment", v || "")).join("\n");
+    return head + "\n" + body;
+  }).join("\n\n"));
+  box.innerHTML = html || '<div class="net-empty">No extra details for this host.</div>';
+}
+function renderNetTopology(hosts) {
+  const box = $("nt-topology");
+  const withTrace = (hosts || []).filter(h => (h.trace || []).length);
+  if (!withTrace.length) {
+    box.innerHTML = '<div class="net-empty">No traceroute data. Use a profile with --traceroute ' +
+      '(Quick traceroute, or any Intense scan).</div>';
+    return;
+  }
+  // Merge every host's hop list into one tree rooted at "you"; shared prefixes
+  // collapse, so the branches show where paths diverge (Zenmap's topology view).
+  const root = { ip: "you", children: {} };
+  for (const h of withTrace) {
+    let cur = root, sig = "root";
+    const hops = (h.trace || []).slice().sort((a, b) => (a.ttl || 0) - (b.ttl || 0));
+    for (const hop of hops) {
+      const ipv = hop.ip || ("* (ttl " + hop.ttl + ")");
+      sig += ">" + ipv;
+      if (!cur.children[sig]) cur.children[sig] = { ip: ipv, host: hop.host || "", rtt: hop.rtt || "", children: {} };
+      cur = cur.children[sig];
+    }
+    cur.isTarget = true; if (!cur.host) cur.host = h.hostname || "";
+  }
+  const nodes = [], edges = []; let leaf = 0, maxDepth = 0;
+  (function layout(node, depth, parent) {
+    const id = nodes.length;
+    nodes.push({ ip: node.ip, host: node.host || "", rtt: node.rtt || "",
+                 isTarget: !!node.isTarget, isRoot: depth === 0, depth: depth, y: 0 });
+    if (parent != null) edges.push([parent, id]);
+    if (depth > maxDepth) maxDepth = depth;
+    const kids = Object.values(node.children);
+    if (!kids.length) { nodes[id].y = leaf++; return nodes[id].y; }
+    let sum = 0; for (const k of kids) sum += layout(k, depth + 1, id);
+    nodes[id].y = sum / kids.length; return nodes[id].y;
+  })(root, 0, null);
+  const COLW = 150, ROWH = 34, PADX = 20, PADY = 18, R = 5;
+  const W = PADX * 2 + maxDepth * COLW + 130, H = PADY * 2 + Math.max(1, leaf) * ROWH;
+  const X = d => PADX + d * COLW, Y = y => PADY + y * ROWH + 6;
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
+  for (const [p, c] of edges) {
+    const x1 = X(nodes[p].depth), y1 = Y(nodes[p].y), x2 = X(nodes[c].depth), y2 = Y(nodes[c].y), mx = (x1 + x2) / 2;
+    svg += '<path class="edge" d="M' + x1 + ' ' + y1 + ' C' + mx + ' ' + y1 + ' ' + mx + ' ' + y2 + ' ' + x2 + ' ' + y2 + '"/>';
+  }
+  for (const n of nodes) {
+    const x = X(n.depth), y = Y(n.y);
+    const cls = n.isRoot ? "node root" : (n.isTarget ? "node target" : "node");
+    svg += '<circle class="' + cls + '" cx="' + x + '" cy="' + y + '" r="' + (n.isTarget ? R + 1 : R) + '">' +
+      '<title>' + esc(n.rtt ? (n.ip + " · " + n.rtt + " ms") : n.ip) + '</title></circle>';
+    svg += '<text x="' + (x + 9) + '" y="' + (y + 4) + '">' + (n.isRoot ? "you" : esc(n.ip)) + '</text>';
+    if (n.host) svg += '<text class="meta" x="' + (x + 9) + '" y="' + (y + 15) + '">' + esc(n.host) + '</text>';
+  }
+  svg += '</svg>';
+  box.innerHTML = '<div class="net-topo">' + svg + '</div>';
+  bxMapPan(box);                                 // left-drag to pan the topology, with flick momentum
+}
+function renderNetHistory(scans) {
+  const box = $("net-history");
+  if (!scans.length) { box.innerHTML = '<div class="net-empty">No scans yet.</div>'; return; }
+  box.innerHTML = scans.map(s =>
+    '<div class="net-histrow" data-id="' + s.id + '">' + esc(s.target || "?") +
+    ' <span class="meta">' + esc(s.profile || "") + '</span>' +
+    '<div class="meta">' + esc(s.status === "running" ? "running…" : (s.summary || "").slice(0, 48)) +
+    '</div></div>').join("");
+  box.querySelectorAll(".net-histrow").forEach(r => r.onclick = () => showScanOutput(r.getAttribute("data-id")));
+}
+
+// ── HTTP module (native capture browser → history + site map) ──
+// The browser is a real Chromium (Playwright); we read its traffic in-process via
+// CDP, so there is no proxy on the wire. Captured transactions stream in over the
+// broker, land in the history table + site map, and hand off to Repeater.
+let httpInited = false, httpSince = 0, httpTimer = null, httpRows = [],
+    httpSelId = null, httpSiteFilter = null, httpHeld = [];
+function initHttp() {
+  if (httpInited) return; httpInited = true;
+  httpLoadF();
+  // scope-only checkbox is a shortcut for the Scope filter (matches the Site map).
+  $("http-scope-only").onchange = () => { httpF.scopeOut = !$("http-scope-only").checked; httpF.scopeIn = true; if ($("http-filters").classList.contains("open")) httpBuildPanel(); httpSaveF(); renderHttpList(); };
+  $("http-search").addEventListener("input", httpOnSearchInput);
+  $("http-bodysearch").addEventListener("change", httpOnSearchInput);
+  $("http-clear").onclick = httpClear;
+
+  // ── Detail: Repeater-grade read-only req/resp ──
+  // Tips share the one global engine; the read-only <pre>s expose their data-tip
+  // spans directly (no textarea overlay), so registering the zone is all it takes.
+  registerTipZone($("pane-http").querySelector(".http-reqresp"));
+  ["http-req", "http-resp"].forEach(pid => { const el = $(pid); if (el) el.oncontextmenu = (e) => {
+    if (!httpDetail) return; e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, routeReqMenu({ raw: httpRawRequest(httpDetail), url: httpDetail.url, response: httpRawResponse(httpDetail) }));
+  }; });
+  document.addEventListener("keydown", (e) => {   // Ctrl/Cmd+F finds inside the HTTP viewer
+    const onHttp = document.querySelector('nav button[data-tab="http"]');
+    if (!onHttp || !onHttp.classList.contains("active")) return;
+    if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) { e.preventDefault(); httpFindOpen(); }
+  });
+  $("http-find").addEventListener("input", () => httpFindRun($("http-find").value));
+  $("http-find").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); httpFindStep(e.shiftKey ? -1 : 1); }
+    else if (e.key === "Escape") { e.preventDefault(); httpFindCloseBar(); }
+  });
+  $("http-find-next").onclick = () => httpFindStep(1);
+  $("http-find-prev").onclick = () => httpFindStep(-1);
+  $("http-find-close").onclick = httpFindCloseBar;
+  registerTipButton($("http-tips"));
+  $("http-pretty").onclick = () => setHttpPretty(!httpPrettyOn);
+  $("http-decode").onclick = () => setHttpDecode(!httpDecodeOn);
+  let ps = false, dc = false;
+  try { ps = localStorage.getItem("beatrix.http.pretty") === "1"; } catch (e) {}
+  try { dc = localStorage.getItem("beatrix.http.decode") === "1"; } catch (e) {}
+  setHttpPretty(ps); setHttpDecode(dc);
+  // The Aa gear shares the Repeater's hoisted #rep-pop (wired in initRepSettings).
+
+  // ── Filters / sort / group popover (same lifecycle as the Site map's) ──
+  const btn = $("http-filt-btn"), pop = $("http-filters");
+  btn.onclick = e => { e.stopPropagation(); const open = pop.classList.toggle("open"); if (open) { httpBuildPanel(); placeFixedUnder(pop, btn); } };
+  pop.onclick = e => e.stopPropagation();
+  document.addEventListener("click", () => pop.classList.remove("open"));
+  document.addEventListener("keydown", e => { if (e.key === "Escape") { pop.classList.remove("open"); smHideHint(); } });
+  // Arrow keys browse the list (only on the HTTP tab; never when typing in a field or
+  // working inside the filters popover).
+  document.addEventListener("keydown", e => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const tabBtn = document.querySelector('nav button[data-tab="http"]');
+    if (!tabBtn || !tabBtn.classList.contains("active")) return;
+    const t = e.target;
+    if (t && (t.closest("input, textarea, select, [contenteditable=true]") || t.closest("#http-filters"))) return;
+    e.preventDefault();
+    httpMoveSelection(e.key === "ArrowDown" ? 1 : -1);
+  });
+  pop.addEventListener("click", e => {
+    const chip = e.target.closest(".sm-fchip"), all = e.target.closest("[data-all]"), seg = e.target.closest(".sm-seg-b"), rst = e.target.closest("#http-pan-reset");
+    if (rst) return httpResetF();
+    if (chip) {
+      if (chip.dataset.scope) { if (chip.dataset.scope === "in") httpF.scopeIn = !httpF.scopeIn; else httpF.scopeOut = !httpF.scopeOut; chip.classList.toggle("on"); httpSyncScopeChk(); }
+      else { const off = { status: httpF.statusOff, method: httpF.methodsOff, type: httpF.typesOff }[chip.dataset.fac]; const v = chip.dataset.val; if (off.has(v)) off.delete(v); else off.add(v); chip.classList.toggle("on"); }
+      httpSaveF(); renderHttpList(); return;
+    }
+    if (all) { const fac = all.dataset.all, on = all.dataset.v === "1"; const off = { status: httpF.statusOff, method: httpF.methodsOff, type: httpF.typesOff }[fac]; const vals = fac === "status" ? SM_STATUS : fac === "type" ? SM_KINDS : httpAllMethods(); off.clear(); if (!on) vals.forEach(v => off.add(v)); httpBuildPanel(); httpSaveF(); renderHttpList(); return; }
+    if (seg) { if (seg.dataset.sort) httpF.sort = seg.dataset.sort; else if (seg.dataset.dir) httpF.dir = seg.dataset.dir; else if (seg.dataset.group) httpF.group = seg.dataset.group; pop.querySelectorAll(".sm-seg-b").forEach(x => { if ((seg.dataset.sort && x.dataset.sort) || (seg.dataset.dir && x.dataset.dir) || (seg.dataset.group && x.dataset.group)) x.classList.toggle("on", x === seg); }); httpSaveF(); renderHttpList(); return; }
+  });
+  pop.addEventListener("input", e => {
+    const inp = e.target.closest(".sm-fin");
+    if (inp) { httpF[inp.dataset.txt] = inp.value.trim(); httpSaveF(); renderHttpList(); return; }
+    const chk = e.target.closest("input[data-attr]");
+    if (chk) { httpF[chk.dataset.attr] = chk.checked; httpSaveF(); renderHttpList(); }
+  });
+  const hintFrom = e => { const el = e.target.closest("[data-hint]"); if (el) smShowHint(el); else smHideHint(); };
+  pop.addEventListener("mouseover", hintFrom);
+  pop.addEventListener("focusin", hintFrom);
+  pop.addEventListener("mouseout", e => { if (!e.relatedTarget || !pop.contains(e.relatedTarget)) smHideHint(); });
+  pop.addEventListener("focusout", smHideHint);
+  httpSyncScopeChk();
+}
+function ensureEventPoll() { if (!httpTimer) httpTimer = setInterval(httpPoll, 800); }
+async function loadHttpFor(pid) {
+  httpAnnotLoad();
+  if (pid === null) return; initHttp();
+  try {
+    const d = await (await fetch("/http/history?project=" + pid)).json();
+    if (pid !== activeProject) return;
+    httpRows = d.rows || [];
+    renderHttpList(); ensureEventPoll();
+  } catch (e) {}
+}
+
+// ── Browser module (the embedded capture browser: live screencast + input) ──
+// Chromium runs headless and streams JPEG frames over CDP into the <img> below;
+// clicks/keys are forwarded back. No display is needed on the host.
+let brInited = false, brRunning = false, brWS = null, brTransport = null,
+    brFbTimer = null, brGotFrame = false, brVP = { width: 1280, height: 800 };
+function initBrowser() {
+  if (brInited) return; brInited = true;
+  $("br-launch").onclick = brLaunch;
+  $("br-stop").onclick = brStop;
+  $("br-go").onclick = brNavigate;
+  $("br-url").addEventListener("keydown", e => { if (e.key === "Enter") brNavigate(); });
+  $("br-back").onclick = () => brNavAction("back");
+  $("br-fwd").onclick = () => brNavAction("forward");
+  $("br-reload").onclick = () => brNavAction("reload");
+  $("br-intercept").onchange = () => brSetIntercept($("br-intercept").checked);
+  $("br-full").onclick = brFullscreen;
+  $("br-pop").onclick = brPopout;
+  $("br-held-fwd").onclick = () => brResolveHeld("forward");
+  $("br-held-drop").onclick = () => brResolveHeld("drop");
+  $("br-held-edit").onclick = brEditHeld;
+  brWireScreenInput();
+}
+async function loadBrowserFor(pid) {
+  if (pid === null) return; initBrowser();
+  try {
+    const st = await (await fetch("/browser/state?project=" + pid)).json();
+    if (pid !== activeProject) return;
+    brApplyState(st); ensureEventPoll();
+  } catch (e) {}
+}
+// The view is a native MJPEG stream — the server pushes each JPEG frame over one
+// long-lived <img> connection (no base64, no polling), which is both far faster
+// and what makes the pop-out window trivial.
+function onBrowserTab() {
+  const b = document.querySelector('nav button[data-tab="browser"]');
+  return b && b.classList.contains("active");
+}
+function brStopStream() {
+  if (brWS) { try { brWS.onclose = null; brWS.close(); } catch (e) {} brWS = null; }
+  if (brFbTimer) { clearTimeout(brFbTimer); brFbTimer = null; }
+  const img = $("br-screen-img");
+  if (img) { img.onerror = null; img.onload = null; img.removeAttribute("src"); }
+}
+function brSetStream(on) {
+  const hint = $("br-screen-hint");
+  brStopStream();
+  if (!on) { if (hint) hint.style.display = ""; return; }
+  brGotFrame = false; brTransport = "ws";
+  $("br-screen").hidden = false; $("br-screen-img").hidden = true;
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  let ws;
+  try { ws = new WebSocket(scheme + "//" + location.host + "/browser/ws?project=" + encodeURIComponent(activeProject)); }
+  catch (e) { brUseMjpeg(); return; }
+  ws.binaryType = "arraybuffer";
+  brWS = ws;
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string" || brTransport !== "ws") return;
+    brGotFrame = true;
+    if (brFbTimer) { clearTimeout(brFbTimer); brFbTimer = null; }
+    brRenderFrame(e.data);
+    if (hint) hint.style.display = "none";
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  ws.onclose = () => {
+    if (brWS === ws) brWS = null;
+    if (brTransport !== "ws") return;
+    if (!brGotFrame) { brUseMjpeg(); return; }                 // WS blocked here → MJPEG
+    if (brRunning && onBrowserTab()) setTimeout(() => { if (brRunning && !brWS && brTransport === "ws") brSetStream(true); }, 600);
+  };
+  // If no WS frame arrives quickly (a proxy that drops WebSockets, e.g. Codespaces
+  // port-forwarding), fall back to the MJPEG <img>, which rides any HTTP proxy.
+  brFbTimer = setTimeout(() => { if (!brGotFrame) brUseMjpeg(); }, 2500);
+}
+function brUseMjpeg() {
+  brTransport = "mjpeg";
+  if (brWS) { try { brWS.onclose = null; brWS.close(); } catch (e) {} brWS = null; }
+  if (brFbTimer) { clearTimeout(brFbTimer); brFbTimer = null; }
+  const hint = $("br-screen-hint"), img = $("br-screen-img");
+  $("br-screen").hidden = true; img.hidden = false;
+  img.onload = () => { if (hint) hint.style.display = "none"; };
+  img.onerror = () => {
+    if (brRunning && onBrowserTab() && brTransport === "mjpeg")
+      setTimeout(() => { if (brRunning && brTransport === "mjpeg") img.src = "/browser/stream?project=" + encodeURIComponent(activeProject) + "&t=" + Date.now(); }, 800);
+  };
+  img.src = "/browser/stream?project=" + encodeURIComponent(activeProject) + "&t=" + Date.now();
+}
+function brRenderFrame(buf) {
+  const c = $("br-screen");
+  createImageBitmap(new Blob([buf], { type: "image/jpeg" })).then(bmp => {
+    if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; }
+    c.getContext("2d").drawImage(bmp, 0, 0);
+    if (bmp.close) bmp.close();
+  }).catch(() => {});
+}
+function brApplyState(st) {
+  brRunning = !!st.running;
+  $("br-launch").disabled = brRunning; $("br-stop").disabled = !brRunning;
+  $("br-intercept").checked = !!st.intercept;
+  if (st.viewport) brVP = st.viewport;
+  if (!st.available) $("br-status").innerHTML = '<span class="bad">Playwright not installed — pip install playwright && playwright install chromium</span>';
+  else $("br-status").innerHTML = brRunning ? '<span class="dim">running</span>' : '<span class="dim">not running — click Launch</span>';
+  brSetStream(brRunning);
+}
+async function brLaunch() {
+  $("br-status").innerHTML = '<span class="dim">launching…</span>';
+  const d = await (await fetch("/browser/launch", { method: "POST", body: JSON.stringify({ project: activeProject }) })).json();
+  if (!d.ok) { $("br-status").innerHTML = '<span class="bad">' + esc(d.error || "launch failed") + '</span>'; return; }
+  brRunning = true; $("br-launch").disabled = true; $("br-stop").disabled = false;
+  $("br-status").innerHTML = '<span class="dim">running</span>';
+  ensureEventPoll(); brSetStream(true);
+  if ($("br-url").value.trim()) brNavigate();
+}
+async function brStop() {
+  await fetch("/browser/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+  brRunning = false; $("br-launch").disabled = false; $("br-stop").disabled = true;
+  $("br-status").innerHTML = '<span class="dim">stopped</span>';
+  brSetStream(false);
+}
+async function brNavigate() {
+  const url = $("br-url").value.trim(); if (!url) return;
+  if (!brRunning) { await brLaunch(); if (!brRunning) return; }
+  try { await fetch("/browser/navigate", { method: "POST", body: JSON.stringify({ project: activeProject, url }) }); } catch (e) {}
+}
+async function brNavAction(a) {
+  try { await fetch("/browser/nav", { method: "POST", body: JSON.stringify({ project: activeProject, action: a }) }); } catch (e) {}
+}
+async function brSetIntercept(on) {
+  try { await fetch("/browser/intercept/set", { method: "POST", body: JSON.stringify({ project: activeProject, on }) }); } catch (e) {}
+}
+function brFullscreen() {
+  const el = $("br-screen-wrap");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (el.requestFullscreen) el.requestFullscreen();
+}
+function brPopout() {
+  window.open("/browser/popout?project=" + encodeURIComponent(activeProject),
+    "beatrix-browser-" + activeProject, "width=1320,height=900");
+}
+function brScreenCoords(e) {
+  const el = e.currentTarget, r = el.getBoundingClientRect();   // the visible canvas or img
+  return { x: Math.max(0, (e.clientX - r.left) * (brVP.width / (r.width || 1))),
+           y: Math.max(0, (e.clientY - r.top) * (brVP.height / (r.height || 1))) };
+}
+function brSendInput(ev) {
+  // Input rides the WebSocket when it's the live transport; otherwise POST.
+  if (brTransport === "ws" && brWS && brWS.readyState === 1) { try { brWS.send(JSON.stringify(ev)); return; } catch (e) {} }
+  fetch("/browser/input", { method: "POST", body: JSON.stringify({ project: activeProject, ev: ev }) }).catch(() => {});
+}
+function brWireScreenInput() {
+  const wrap = $("br-screen-wrap");
+  let lastMove = 0;
+  [$("br-screen"), $("br-screen-img")].forEach(el => {   // wire both the WS canvas and the MJPEG img
+    el.addEventListener("mousemove", e => { const now = Date.now(); if (now - lastMove < 60) return; lastMove = now; const c = brScreenCoords(e); brSendInput({ t: "move", x: c.x, y: c.y }); });
+    el.addEventListener("mousedown", e => { e.preventDefault(); wrap.focus(); const c = brScreenCoords(e); brSendInput({ t: "down", x: c.x, y: c.y, button: e.button === 2 ? "right" : "left" }); });
+    el.addEventListener("mouseup", e => { e.preventDefault(); const c = brScreenCoords(e); brSendInput({ t: "up", x: c.x, y: c.y, button: e.button === 2 ? "right" : "left" }); });
+    el.addEventListener("contextmenu", e => e.preventDefault());
+    el.addEventListener("wheel", e => { e.preventDefault(); const c = brScreenCoords(e); brSendInput({ t: "wheel", x: c.x, y: c.y, dx: e.deltaX, dy: e.deltaY }); }, { passive: false });
+  });
+  wrap.setAttribute("tabindex", "0");
+  wrap.addEventListener("keydown", e => {
+    const special = { Enter: 1, Backspace: 1, Tab: 1, Delete: 1, ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, Escape: 1, Home: 1, End: 1, PageUp: 1, PageDown: 1 };
+    if (special[e.key]) { e.preventDefault(); brSendInput({ t: "press", key: e.key }); }
+    else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { e.preventDefault(); brSendInput({ t: "type", text: e.key }); }
+  });
+}
+async function brRefreshHeld() {
+  try { const d = await (await fetch("/browser/intercept/list?project=" + activeProject)).json(); httpHeld = d.held || []; }
+  catch (e) { httpHeld = []; }
+  const bar = $("br-intercept-bar"); if (!bar) return;
+  if (!httpHeld.length) { bar.hidden = true; return; }
+  const h = httpHeld[0];
+  $("br-held-label").textContent = "HELD  " + h.method + " " + h.url;
+  bar.hidden = false;
+}
+async function brResolveHeld(action) {
+  if (!httpHeld.length) return;
+  const id = httpHeld[0].id;
+  const ep = action === "drop" ? "/browser/intercept/drop" : "/browser/intercept/forward";
+  await fetch(ep, { method: "POST", body: JSON.stringify({ project: activeProject, id }) });
+  httpHeld.shift(); brRefreshHeld();
+}
+function brEditHeld() {
+  if (!httpHeld.length) return;
+  const h = httpHeld[0];
+  const cur = [(h.method || "GET") + " " + h.url + " HTTP/1.1"]
+    .concat(Object.keys(h.headers || {}).filter(k => !k.startsWith(":")).map(k => k + ": " + h.headers[k]))
+    .join("\r\n") + "\r\n\r\n" + (h.post_data || "");
+  const edited = prompt("Edit the held request (headers + body are applied):", cur);
+  if (edited === null) return;
+  fetch("/browser/intercept/forward", { method: "POST", body: JSON.stringify({ project: activeProject, id: h.id, overrides: brParseEdit(edited) }) });
+  httpHeld.shift(); brRefreshHeld();
+}
+function brParseEdit(raw) {
+  const [head, ...rest] = raw.split("\r\n\r\n");
+  const body = rest.join("\r\n\r\n");
+  const hl = head.split("\r\n"); const first = (hl.shift() || "").split(" "); const headers = {};
+  for (const line of hl) { const i = line.indexOf(":"); if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim(); }
+  const ov = { headers }; if (first[0]) ov.method = first[0]; if (body) ov.post_data = body; return ov;
+}
+async function httpClear() {
+  if (!httpRows.length) { toast("Nothing to clear."); return; }
+  const shownN = httpVisible().length, total = httpRows.length;
+  const extra = '<div class="bx-clear-scope">' +
+    '<label><input type="radio" name="bxhs" value="all" checked> Everything \u2014 ' + total + ' request' + (total === 1 ? "" : "s") + '</label>' +
+    '<label><input type="radio" name="bxhs" value="filtered"> Only what the filter shows \u2014 ' + shownN + '</label>' +
+    '<label>Time range&nbsp; <select id="bx-hrange"><option value="all">All time</option><option value="3600">Last hour</option><option value="86400">Last 24 hours</option></select></label>' +
+    '</div>';
+  const res = await confirmDialog({ title: "Clear HTTP history", bodyHtml: "Choose what to remove \u2014 you can undo right after.", extraHtml: extra, danger: true, confirmLabel: "Clear",
+    collect: root => ({ scope: (root.querySelector('input[name=bxhs]:checked') || {}).value || "all", range: (root.querySelector('#bx-hrange') || {}).value || "all" }) });
+  if (!res) return;
+  if (res.scope === "all" && res.range === "all") {
+    try { await (await fetch("/data/clear", { method: "POST", body: JSON.stringify({ store: "http", project: activeProject }) })).json(); }
+    catch (e) { toast("Couldn't clear."); return; }
+    httpSelected.clear(); await loadHttpFor(activeProject);
+    toast("Cleared " + total + " request" + (total === 1 ? "" : "s") + ".", { label: "Undo", ms: 9000, fn: httpUndo });
+    return;
+  }
+  const cutoff = res.range === "all" ? 0 : (Date.now() - (+res.range) * 1000);
+  const pool = res.scope === "filtered" ? httpVisible() : httpRows;
+  const ids = pool.filter(r => res.range === "all" ? true : (r.ts || 0) >= cutoff).map(r => r.id);
+  if (!ids.length) { toast("Nothing matches that selection."); return; }
+  await httpDeleteIds(ids);
+}
+async function httpPoll() {
+  if (activeProject === null) return;
+  let d;
+  try { d = await (await fetch("/browser/events?since=" + httpSince + "&project=" + activeProject)).json(); }
+  catch (e) { return; }
+  let added = false, heldChanged = false;
+  for (const ev of (d.events || [])) {
+    httpSince = Math.max(httpSince, ev.seq);
+    if (ev.type === "transaction" && ev.detail) { httpRows.push(ev.detail); added = true; }
+    else if (ev.type === "held") heldChanged = true;
+  }
+  const onHttp = document.querySelector('nav button[data-tab="http"]').classList.contains("active");
+  if (added && onHttp) renderHttpList();
+  if (heldChanged || httpHeld.length) brRefreshHeld();
+}
+// ── HTTP filter / sort / group engine (Site-map parity, over the flat history) ──
+// Reuses the Site map's predicate helpers (smTextPred / smCodePred / smStatusClass /
+// smExtSet) and panel styling/markup helpers (smChip / smSeg / smH / smShowHint).
+const HTTP_COLS = [
+  { k: "id", label: "#" }, { k: "method", label: "Method" }, { k: "host", label: "Host" },
+  { k: "path", label: "Path" }, { k: "status", label: "Status" }, { k: "type", label: "Type" },
+  { k: "length", label: "Len" }, { k: "ts", label: "Time" }];
+// Bucket a row into one coarse resource kind — mirrors the server's _kind_of so the
+// Type column/filter match the Site map exactly.
+function httpKind(r) {
+  const rt = (r.resource_type || "").toLowerCase(), mime = (r.mime || "").toLowerCase();
+  if (["document", "iframe", "main_frame", "sub_frame"].indexOf(rt) >= 0 || mime.indexOf("html") >= 0) return "doc";
+  if (["xhr", "fetch"].indexOf(rt) >= 0 || mime.indexOf("json") >= 0 || (mime.indexOf("xml") >= 0 && mime.indexOf("html") < 0)) return "api";
+  if (rt === "script" || mime.indexOf("javascript") >= 0 || mime.indexOf("ecmascript") >= 0) return "script";
+  if (rt === "stylesheet" || mime.indexOf("css") >= 0) return "style";
+  if (rt === "image" || mime.indexOf("image/") === 0) return "image";
+  if (rt === "font" || mime.indexOf("font") >= 0) return "font";
+  return "other";
+}
+// Status → pill color class (green 2xx / blue 3xx / yellow 4xx / orange 401·403 / red 5xx).
+function httpPillClass(st) {
+  const c = +st; if (!c) return "";
+  if (c === 401 || c === 403) return "s4";
+  if (c >= 500) return "s5"; if (c >= 400) return "s3"; if (c >= 300) return "s2"; if (c >= 200) return "s1";
+  return "";
+}
+function httpDefaultF() {
+  return { statusOff: new Set(), methodsOff: new Set(), typesOff: new Set(),
+    scopeIn: true, scopeOut: false, onlyParams: false, onlyErr: false, hlOnly: false,
+    code: "", path: "", host: "", mime: "", ext: "", sizeMin: "", sizeMax: "",
+    sort: "id", dir: "asc", group: "none" };
+}
+let httpF = httpDefaultF();
+let httpExpanded = {};
+let httpSelected = new Set(), httpLastCk = -1, httpLastRow = -1;   // browser-history-style multi-select
+let httpBodyIds = null, httpBodyTimer = null;   // body-search: Set of matching ids (null = off)
+let httpFindMarks = [], httpFindIdx = -1;       // Ctrl+F find-in-viewer
+const HTTP_HL_COLORS = [{ key: "", label: "None" }, { key: "red", label: "Red" }, { key: "orange", label: "Orange" },
+  { key: "yellow", label: "Yellow" }, { key: "green", label: "Green" }, { key: "blue", label: "Blue" }];
+let httpAnnot = {};   // per-project triage: { id: {hl, note} }
+function httpAnnotLoad() { try { httpAnnot = JSON.parse(localStorage.getItem("beatrix.http.annot." + activeProject) || "{}") || {}; } catch (e) { httpAnnot = {}; } }
+function httpAnnotSave() { try { localStorage.setItem("beatrix.http.annot." + activeProject, JSON.stringify(httpAnnot)); } catch (e) {} }
+function httpSetHighlight(ids, color) {
+  for (const id of ids) { const a = httpAnnot[id] = httpAnnot[id] || {}; if (color) a.hl = color; else delete a.hl; if (!a.hl && !a.note) delete httpAnnot[id]; }
+  httpAnnotSave(); renderHttpList();
+}
+async function httpAddNote(id) {
+  const cur = (httpAnnot[id] || {}).note || "";
+  const res = await confirmDialog({ title: "Note for request #" + id,
+    extraHtml: '<input id="bx-note" class="sm-fin" style="width:100%; box-sizing:border-box; margin-bottom:14px" value="' + escAttr(cur) + '" placeholder="e.g. IDOR candidate">',
+    confirmLabel: "Save note", collect: root => ((root.querySelector("#bx-note") || {}).value || "") });
+  if (res === false) return;
+  const a = httpAnnot[id] = httpAnnot[id] || {};
+  if (res) a.note = res; else delete a.note;
+  if (!a.hl && !a.note) delete httpAnnot[id];
+  httpAnnotSave(); renderHttpList();
+}
+function httpAllMethods() {
+  const seen = new Set(); for (const r of httpRows) if (r.method) seen.add(r.method);
+  const extra = [...seen].filter(m => SM_ALL_METHODS.indexOf(m) < 0).sort();
+  return SM_ALL_METHODS.filter(m => seen.has(m)).concat(extra);
+}
+function httpVisible() {
+  const f = httpF;
+  const codeP = smCodePred(f.code), pathP = smTextPred(f.path), hostP = smTextPred(f.host), mimeP = smTextPred(f.mime);
+  const extS = smExtSet(f.ext);
+  const smin = f.sizeMin !== "" && !isNaN(+f.sizeMin) ? +f.sizeMin : null;
+  const smax = f.sizeMax !== "" && !isNaN(+f.sizeMax) ? +f.sizeMax : null;
+  const q = ($("http-search").value || "").trim().toLowerCase();
+  const rows = httpRows.filter(r => {
+    const cls = smStatusClass(r.status);
+    if (cls && f.statusOff.has(cls)) return false;
+    if (r.method && f.methodsOff.has(r.method)) return false;
+    if (f.typesOff.has(httpKind(r))) return false;
+    if (!(f.scopeIn && f.scopeOut)) { if (r.in_scope && !f.scopeIn) return false; if (!r.in_scope && !f.scopeOut) return false; }
+    if (f.onlyParams && !/\?/.test(r.url || r.path || "")) return false;
+    if (f.onlyErr && !(+r.status >= 400)) return false;
+    if (codeP && !codeP(r.status)) return false;
+    if (pathP && !pathP(r.path || "")) return false;
+    if (hostP && !hostP(r.host || "")) return false;
+    if (mimeP && !mimeP(r.mime || "")) return false;
+    if (extS && !extS.has(smExtOf((r.path || "").split("?")[0]))) return false;
+    if (smin != null && (r.length || 0) < smin) return false;
+    if (smax != null && (r.length || 0) > smax) return false;
+    if (f.hlOnly && !(httpAnnot[r.id] || {}).hl) return false;
+    if (q && !((r.url || "").toLowerCase().includes(q) || ((httpAnnot[r.id] || {}).note || "").toLowerCase().includes(q) || (httpBodyIds && httpBodyIds.has(r.id)))) return false;
+    if (httpSiteFilter) {
+      if (r.host !== httpSiteFilter.host) return false;
+      if (httpSiteFilter.path && !(r.path || "/").startsWith(httpSiteFilter.path)) return false;
+    }
+    return true;
+  });
+  return httpSortRows(rows);
+}
+function httpSortRows(rows) {
+  const f = httpF, dir = f.dir === "desc" ? -1 : 1, key = f.sort;
+  const num = (key === "status" || key === "length" || key === "id" || key === "ts");
+  const val = r => key === "type" ? httpKind(r) : num ? +(r[key] || 0) : String(r[key] || "").toLowerCase();
+  return rows.slice().sort((a, b) => {
+    const va = val(a), vb = val(b);
+    if (va < vb) return -dir; if (va > vb) return dir;
+    return (a.id || 0) - (b.id || 0);
+  });
+}
+function httpSortBy(col) {
+  if (httpF.sort === col) httpF.dir = httpF.dir === "asc" ? "desc" : "asc";
+  else { httpF.sort = col; httpF.dir = "asc"; }
+  httpSaveF(); renderHttpList();
+  if ($("http-filters").classList.contains("open")) httpBuildPanel();
+}
+function renderHttpFilterBar() {
+  const bar = $("http-filterbar");
+  if (!httpSiteFilter) { bar.hidden = true; bar.innerHTML = ""; return; }
+  bar.hidden = false;
+  bar.innerHTML = 'Filtered to <b>' + esc(httpSiteFilter.host + (httpSiteFilter.path || "")) +
+    '</b> <span class="x" id="http-filter-x">clear ✕</span>';
+  $("http-filter-x").onclick = () => { httpSiteFilter = null; renderHttpList(); };
+}
+function httpHeadHtml() {
+  const f = httpF;
+  return '<thead><tr><th class="http-ck"><input type="checkbox" id="http-ck-all" title="Select all shown"></th>' + HTTP_COLS.map(c => {
+    const on = f.sort === c.k;
+    return '<th data-sort="' + c.k + '" class="' + (on ? "sorted" + (f.dir === "asc" ? " asc" : "") : "") + '" title="Sort by ' + esc(c.label) + '">' + esc(c.label) + '</th>';
+  }).join("") + '<th class="http-note-h">Note</th></tr></thead>';
+}
+function httpRowHtml(r) {
+  const an = httpAnnot[r.id] || {};
+  const kind = httpKind(r), kl = SM_KIND_LABEL[kind] || "", w = SM_WRITE.test(r.method || "");
+  const typeTxt = kl || esc((r.mime || "").replace("application/", ""));
+  return '<tr class="http-row' + (r.in_scope ? "" : " oos") + (r.id === httpSelId ? " sel" : "") + (an.hl ? " hl-" + an.hl : "") + '" data-id="' + r.id + '">' +
+    '<td class="http-ck"><input type="checkbox" class="http-rck" data-id="' + r.id + '"' + (httpSelected.has(r.id) ? " checked" : "") + '></td>' +
+    '<td>' + r.id + '</td>' +
+    '<td><span class="http-m' + (w ? " w" : "") + '">' + esc(r.method || "") + '</span></td>' +
+    '<td>' + (r.in_scope ? '<span class="http-scope" title="in scope"></span> ' : '') + esc(r.host || "") + '</td>' +
+    '<td class="pk-info">' + esc(r.path || "") + '</td>' +
+    '<td><span class="http-pill ' + httpPillClass(r.status) + '">' + (r.status || "") + '</span></td>' +
+    '<td><span class="http-type ' + kind + '">' + typeTxt + '</span></td>' +
+    '<td>' + repBytes(r.length || 0) + '</td>' +
+    '<td class="http-note" title="' + escAttr(an.note || "") + '">' + esc(an.note || "") + '</td></tr>';
+}
+function httpGroupKey(r) {
+  const g = httpF.group;
+  if (g === "host") return r.host || "(none)";
+  if (g === "status") return smStatusClass(r.status) || "none";
+  if (g === "method") return r.method || "none";
+  if (g === "type") return httpKind(r);
+  return "";
+}
+function httpGroupLabel(k) {
+  const g = httpF.group;
+  if (g === "type") return SM_KIND_LABEL[k] || k;
+  if (g === "status") return k === "none" ? "no status" : k;
+  if (g === "method") return k === "none" ? "no method" : k;
+  return k;
+}
+function httpGroupOrder(keys) {
+  const g = httpF.group, idx = (arr, k) => { const i = arr.indexOf(k); return i < 0 ? 999 : i; };
+  if (g === "status") return keys.sort((a, b) => idx(SM_STATUS, a) - idx(SM_STATUS, b));
+  if (g === "type") return keys.sort((a, b) => idx(SM_KINDS, a) - idx(SM_KINDS, b));
+  if (g === "method") return keys.sort((a, b) => idx(SM_ALL_METHODS, a) - idx(SM_ALL_METHODS, b) || a.localeCompare(b));
+  return keys.sort((a, b) => a.localeCompare(b));
+}
+function httpFlatTable(rows) {
+  return '<table class="pk-tbl">' + httpHeadHtml() + '<tbody>' + rows.map(httpRowHtml).join("") + '</tbody></table>';
+}
+function httpGroupedTable(rows) {
+  const by = {};
+  for (const r of rows) { const k = httpGroupKey(r); (by[k] = by[k] || []).push(r); }
+  const keys = httpGroupOrder(Object.keys(by));
+  let body = "";
+  for (const k of keys) {
+    const mem = by[k], open = (k in httpExpanded) ? httpExpanded[k] : true;
+    body += '<tr class="http-grp-row' + (open ? "" : " collapsed") + '" data-g="' + escAttr(k) + '">' +
+      '<td colspan="' + (HTTP_COLS.length + 2) + '"><span class="http-grp-tw"></span>' +
+      '<span class="http-grp-nm">' + esc(httpGroupLabel(k)) + '</span>' +
+      '<span class="http-grp-ct">' + mem.length + ' request' + (mem.length > 1 ? "s" : "") + '</span></td></tr>';
+    if (open) body += mem.map(httpRowHtml).join("");
+  }
+  return '<table class="pk-tbl http-gtbl">' + httpHeadHtml() + '<tbody>' + body + '</tbody></table>';
+}
+function httpOnSearchInput() {
+  const on = $("http-bodysearch").checked, q = ($("http-search").value || "").trim();
+  if (!on || !q) { httpBodyIds = null; renderHttpList(); return; }
+  clearTimeout(httpBodyTimer);
+  httpBodyTimer = setTimeout(async () => {
+    try {
+      const d = await (await fetch("/http/search?project=" + activeProject + "&q=" + encodeURIComponent(q))).json();
+      httpBodyIds = new Set(d.ids || []);
+    } catch (e) { httpBodyIds = new Set(); }
+    renderHttpList();
+  }, 180);
+  renderHttpList();   // immediate URL/note match while the body fetch is in flight
+}
+function renderHttpList() {
+  renderHttpFilterBar();
+  httpUpdateBadge();
+  const box = $("http-list"), rows = httpVisible();
+  if (!rows.length) {
+    box.innerHTML = '<div class="net-empty">' + (httpRows.length
+      ? 'No requests match the current filters. <a href="#" id="http-clear-filters">Clear filters</a>'
+      : "Launch the browser and start browsing — requests appear here. Right-click a request to send it to another module.") + '</div>';
+    const a = $("http-clear-filters"); if (a) a.onclick = e => { e.preventDefault(); httpResetF(); };
+    return;
+  }
+  const present = new Set(httpRows.map(r => r.id));          // drop selection for rows that vanished
+  [...httpSelected].forEach(id => { if (!present.has(id)) httpSelected.delete(id); });
+  box.innerHTML = httpSelbarHtml() + ((httpF.group === "none") ? httpFlatTable(rows) : httpGroupedTable(rows));
+  httpWireList(box);
+}
+function httpSelbarHtml() {
+  const n = httpSelected.size;
+  return '<div class="http-selbar' + (n ? "" : " empty") + '"><span><b>' + n + '</b> selected</span>' +
+    '<button class="http-sel-rep">\u21e5 Send to Repeater</button>' +
+    '<button class="http-sel-del">Delete selected</button>' +
+    '<button class="http-sel-none">Clear selection</button></div>';
+}
+function httpRenderSelbar() {
+  const bar = document.querySelector("#http-list .http-selbar"); if (!bar) return;
+  const n = httpSelected.size; bar.classList.toggle("empty", n === 0);
+  const b = bar.querySelector("b"); if (b) b.textContent = n;
+}
+function httpSyncRowChecks(box) {
+  box = box || document.getElementById("http-list"); if (!box) return;
+  box.querySelectorAll(".http-rck").forEach(c => { c.checked = httpSelected.has(parseInt(c.getAttribute("data-id"), 10)); });
+  const all = [...box.querySelectorAll(".http-rck")], ca = document.getElementById("http-ck-all");
+  if (ca) ca.checked = all.length > 0 && all.every(c => c.checked);
+}
+// ── Ctrl+F: find within the request/response viewer ──
+function httpFindClear() {
+  ["http-req", "http-resp"].forEach(pid => {
+    const el = $(pid); if (!el) return;
+    el.querySelectorAll("mark.bx-find").forEach(m => m.replaceWith(document.createTextNode(m.textContent)));
+    el.normalize();
+  });
+  httpFindMarks = []; httpFindIdx = -1;
+}
+function httpFindRun(q) {
+  httpFindClear();
+  q = (q || "").trim();
+  if (q) {
+    const ql = q.toLowerCase();
+    ["http-req", "http-resp"].forEach(pid => {
+      const root = $(pid); if (!root) return;
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null), tns = [];
+      let n; while ((n = w.nextNode())) tns.push(n);
+      for (const tn of tns) {
+        const txt = tn.nodeValue, low = txt.toLowerCase();
+        if (!low.includes(ql)) continue;
+        const frag = document.createDocumentFragment(); let i = 0, pos;
+        while ((pos = low.indexOf(ql, i)) >= 0) {
+          if (pos > i) frag.appendChild(document.createTextNode(txt.slice(i, pos)));
+          const mk = document.createElement("mark"); mk.className = "bx-find"; mk.textContent = txt.slice(pos, pos + ql.length);
+          frag.appendChild(mk); httpFindMarks.push(mk); i = pos + ql.length;
+        }
+        if (i < txt.length) frag.appendChild(document.createTextNode(txt.slice(i)));
+        tn.replaceWith(frag);
+      }
+    });
+    httpFindIdx = httpFindMarks.length ? 0 : -1;
+    httpFindShow();
+  }
+  httpFindCount();
+}
+function httpFindShow() {
+  httpFindMarks.forEach((m, i) => m.classList.toggle("cur", i === httpFindIdx));
+  if (httpFindIdx >= 0) httpFindMarks[httpFindIdx].scrollIntoView({ block: "center" });
+}
+function httpFindStep(d) {
+  if (!httpFindMarks.length) return;
+  httpFindIdx = (httpFindIdx + d + httpFindMarks.length) % httpFindMarks.length;
+  httpFindShow(); httpFindCount();
+}
+function httpFindCount() {
+  const c = $("http-find-count"); if (c) c.textContent = httpFindMarks.length ? ((httpFindIdx + 1) + "/" + httpFindMarks.length) : "0/0";
+}
+function httpFindOpen() {
+  const bar = $("http-findbar"); if (!bar) return;
+  bar.hidden = false; const inp = $("http-find"); if (inp) { inp.focus(); inp.select(); if (inp.value) httpFindRun(inp.value); }
+}
+function httpFindCloseBar() {
+  const bar = $("http-findbar"); if (bar) bar.hidden = true;
+  httpFindClear();
+}
+function httpUndo() {
+  (async () => {
+    const u = await (await fetch("/data/undo", { method: "POST", body: JSON.stringify({ store: "http", project: activeProject }) })).json();
+    if (u.ok) { httpSelected.clear(); await loadHttpFor(activeProject); toast("Restored."); } else toast(u.error || "Nothing to undo.");
+  })();
+}
+async function httpDeleteIds(ids) {
+  ids = (ids || []).filter(x => x != null);
+  if (!ids.length) return;
+  let r; try { r = await (await fetch("/data/delete", { method: "POST", body: JSON.stringify({ store: "http", project: activeProject, ids }) })).json(); }
+  catch (e) { toast("Couldn't delete."); return; }
+  httpSelected.clear(); await loadHttpFor(activeProject);
+  const n = (r && r.deleted != null) ? r.deleted : ids.length;
+  toast("Deleted " + n + " request" + (n === 1 ? "" : "s") + ".", { label: "Undo", ms: 9000, fn: httpUndo });
+}
+function httpWireList(box) {
+  box.querySelectorAll("tr.http-row").forEach(tr => {
+    const id = parseInt(tr.getAttribute("data-id"), 10);
+    tr.onclick = (e) => {
+      const rows = [...box.querySelectorAll("tr.http-row")], idx = rows.indexOf(tr);
+      if (e.shiftKey && httpLastRow >= 0 && httpLastRow < rows.length) {   // range into the selection
+        const a = Math.min(idx, httpLastRow), b = Math.max(idx, httpLastRow);
+        for (let i = a; i <= b; i++) httpSelected.add(parseInt(rows[i].getAttribute("data-id"), 10));
+        httpSyncRowChecks(box); httpRenderSelbar();
+      } else if (e.ctrlKey || e.metaKey) {                                 // toggle one
+        if (httpSelected.has(id)) httpSelected.delete(id); else httpSelected.add(id);
+        httpLastRow = idx; httpSyncRowChecks(box); httpRenderSelbar();
+      } else { httpSelect(id); httpLastRow = idx; }                        // plain click = view detail
+    };
+    tr.oncontextmenu = (e) => { e.preventDefault(); if (!httpSelected.has(id)) httpSelect(id); httpRowMenu(e, id); };
+  });
+  box.querySelectorAll("thead th[data-sort]").forEach(th => th.onclick = () => httpSortBy(th.getAttribute("data-sort")));
+  box.querySelectorAll("tr.http-grp-row").forEach(tr => tr.onclick = () => {
+    const k = tr.getAttribute("data-g");
+    httpExpanded[k] = !((k in httpExpanded) ? httpExpanded[k] : true);
+    renderHttpList();
+  });
+  box.querySelectorAll(".http-rck").forEach(cb => cb.onclick = (e) => {
+    e.stopPropagation();
+    const all = [...box.querySelectorAll(".http-rck")], curIdx = all.indexOf(cb);
+    const apply = (c, on) => { c.checked = on; const cid = parseInt(c.getAttribute("data-id"), 10); if (on) httpSelected.add(cid); else httpSelected.delete(cid); };
+    if (e.shiftKey && httpLastCk >= 0 && httpLastCk < all.length) {
+      const a = Math.min(curIdx, httpLastCk), b = Math.max(curIdx, httpLastCk), on = cb.checked;
+      for (let i = a; i <= b; i++) apply(all[i], on);
+    } else apply(cb, cb.checked);
+    httpLastCk = curIdx;
+    const ckAll = $("http-ck-all"); if (ckAll) ckAll.checked = all.length > 0 && all.every(c => c.checked);
+    httpRenderSelbar();
+  });
+  const ckAll = $("http-ck-all");
+  if (ckAll) ckAll.onclick = (e) => {
+    e.stopPropagation(); const on = ckAll.checked;
+    box.querySelectorAll(".http-rck").forEach(c => { c.checked = on; const cid = parseInt(c.getAttribute("data-id"), 10); if (on) httpSelected.add(cid); else httpSelected.delete(cid); });
+    httpRenderSelbar();
+  };
+  const rep = box.querySelector(".http-sel-rep"); if (rep) rep.onclick = () => { if (httpSelected.size) httpBulkToRepeater([...httpSelected]); };
+  const del = box.querySelector(".http-sel-del"); if (del) del.onclick = () => { if (httpSelected.size) httpDeleteIds([...httpSelected]); };
+  const none = box.querySelector(".http-sel-none"); if (none) none.onclick = () => { httpSelected.clear(); renderHttpList(); };
+}
+// Move the selection up/down the list with the arrow keys. Walks the VISIBLE rows in
+// DOM order, so it follows the current sort/group and naturally skips rows inside
+// collapsed groups. With nothing selected, Down picks the first row and Up the last.
+function httpMoveSelection(delta) {
+  const rows = [...document.querySelectorAll("#http-list tr.http-row")];
+  if (!rows.length) return;
+  const cur = rows.findIndex(tr => tr.getAttribute("data-id") === String(httpSelId));
+  const next = cur < 0 ? (delta > 0 ? 0 : rows.length - 1)
+                       : Math.max(0, Math.min(rows.length - 1, cur + delta));
+  const tr = rows[next]; if (!tr) return;
+  httpSelect(parseInt(tr.getAttribute("data-id"), 10));
+  tr.scrollIntoView({ block: "nearest" });
+}
+// ── Filter panel (mirrors smBuildPanel; adds Sort columns + direction) ──
+function httpActiveCount() {
+  const f = httpF; let c = 0;
+  if (f.statusOff.size) c++; if (f.methodsOff.size) c++; if (f.typesOff.size) c++;
+  if (!(f.scopeIn && !f.scopeOut)) c++;
+  if (f.onlyParams) c++; if (f.onlyErr) c++;
+  ["code", "path", "host", "mime", "ext", "sizeMin", "sizeMax"].forEach(k => { if (f[k]) c++; });
+  return c;
+}
+function httpUpdateBadge() { const b = $("http-filt-badge"); if (!b) return; const n = httpActiveCount(); b.textContent = n ? String(n) : ""; b.classList.toggle("on", n > 0); }
+function httpSyncScopeChk() { const c = $("http-scope-only"); if (c) c.checked = httpF.scopeIn && !httpF.scopeOut; }
+function httpBuildPanel() {
+  const f = httpF;
+  const sec = (title, hintEl, body) => '<section class="sm-sec"><div class="sm-sec-h"><span class="sm-sec-l">' + title + '</span>' + (hintEl || "") + '</div>' + body + '</section>';
+  const allnone = fac => '<span class="sm-allnone"><button data-all="' + fac + '" data-v="1">all</button><button data-all="' + fac + '" data-v="0">none</button></span>';
+  const statusChips = SM_STATUS.map(x => smChip("status", x, f.statusOff)).join("");
+  const typeChips = SM_KINDS.map(k => smChip("type", k, f.typesOff, SM_KIND_LABEL[k] || k)).join("");
+  const methods = httpAllMethods();
+  const methodChips = (methods.length ? methods : ["GET"]).map(m => smChip("method", m, f.methodsOff)).join("");
+  const scopeChips = '<button class="sm-fchip' + (f.scopeIn ? " on" : "") + '" data-scope="in">in scope</button>' +
+    '<button class="sm-fchip' + (f.scopeOut ? " on" : "") + '" data-scope="out">out of scope</button>';
+  const tog = (k, label, hint) => '<label class="sm-ftog"' + smH(label, hint) + '><input type="checkbox" data-attr="' + k + '"' + (f[k] ? " checked" : "") + '> ' + label + '</label>';
+  const fld = (k, title, hint, ex, ph) => '<div class="sm-fld"' + smH(title, hint, ex) + '><span class="sm-fld-l">' + title + '</span>' +
+    '<input class="sm-fin" data-txt="' + k + '" spellcheck="false" placeholder="' + (ph || "") + '" value="' + escAttr(f[k]) + '"></div>';
+  const sizeFld = '<div class="sm-fld"' + smH("Response size (bytes)", "Keep requests whose response length is within these byte bounds. Leave a box blank for no bound.", "min 0   max 2048") + '>' +
+    '<span class="sm-fld-l">Size</span><input class="sm-fin sm-fin-sz" data-txt="sizeMin" spellcheck="false" placeholder="min" value="' + escAttr(f.sizeMin) + '">' +
+    '<span class="sm-fld-dash">–</span><input class="sm-fin sm-fin-sz" data-txt="sizeMax" spellcheck="false" placeholder="max" value="' + escAttr(f.sizeMax) + '"></div>';
+  const q = c => '<span class="sm-pan-q"' + c + '>?</span>';
+  const sortSegs = HTTP_COLS.map(c => smSeg("sort", c.k, f.sort, c.label)).join("");
+  const dirSegs = smSeg("dir", "asc", f.dir, "Asc ▴") + smSeg("dir", "desc", f.dir, "Desc ▾");
+  const groupSegs = [["none", "None"], ["host", "Host"], ["status", "Status"], ["method", "Method"], ["type", "Type"]]
+    .map(p => smSeg("group", p[0], f.group, p[1])).join("");
+  const panel =
+    '<div class="sm-pan-hd"><span>Filter &amp; arrange</span><button class="sm-pan-reset" id="http-pan-reset">Reset all</button></div>' +
+    '<div class="sm-pan-body">' +
+    sec('Status' + allnone("status"), q(smH("Status class", "Show responses in the checked status classes; uncheck one to hide it.")), '<div class="sm-chips">' + statusChips + '</div>') +
+    sec('Method' + allnone("method"), q(smH("Request method", "Show requests that use any checked HTTP method.")), '<div class="sm-chips">' + methodChips + '</div>') +
+    sec('Type' + allnone("type"), q(smH("Resource type", "Show requests of the checked resource types (doc = HTML page, api = JSON/XHR, js/css/img/font = assets).")), '<div class="sm-chips">' + typeChips + '</div>') +
+    sec('Scope', q(smH("Scope", "In scope / out of scope is decided by your project's scope rules. Check both to show everything.")), '<div class="sm-chips">' + scopeChips + '</div>') +
+    sec('Attributes', "", '<div class="sm-togs">' + tog("onlyParams", "only with query params", "Show only requests whose URL carries a ?query string — the usual injection surface.") + tog("onlyErr", "only errors (4xx/5xx)", "Show only requests whose status code is 400 or above.") + tog("hlOnly", "only highlighted", "Show only requests you've color-highlighted (right-click → Highlight).") + '</div>') +
+    sec('Advanced match', q(smH("Advanced match", "Text fields combine with everything above (AND). Hover any field for its exact format.")),
+      fld("code", "Status code", "Exact codes or lo-hi ranges, comma-separated.", "403      401,403      400-499", "e.g. 400-499") +
+      fld("path", "Path", "Substring by default. Wrap in /…/ for a regex. Prefix with ! to exclude.", "/api/      /\\.php$/      !/static/", "substring, /regex/, !exclude") +
+      fld("host", "Host", "Same syntax as Path, matched against the host name.", "api.      /\\.acme\\.test$/      !cdn.", "substring, /regex/, !exclude") +
+      fld("mime", "MIME", "Substring of the response Content-Type.", "json      text/html      javascript", "substring of Content-Type") +
+      fld("ext", "Extension", "Comma-separated list, no dots. Blank = any.", "js,json      php,asp      css,map", "e.g. js,json,php") +
+      sizeFld) +
+    sec('Sort', q(smH("Sort", "Order the list by a column. Clicking a column header does the same and flips direction.")), '<div class="sm-segs">' + sortSegs + '</div>') +
+    sec('Direction', "", '<div class="sm-segs">' + dirSegs + '</div>') +
+    sec('Group by', q(smH("Group by", "Break the list into collapsible sections by Host / Status / Method / Type. None = one flat list.")), '<div class="sm-segs">' + groupSegs + '</div>') +
+    '</div>';
+  $("http-filters").innerHTML = panel;
+}
+function httpResetF() { httpF = httpDefaultF(); httpBuildPanel(); httpSaveF(); httpSyncScopeChk(); renderHttpList(); }
+function httpSaveF() {
+  try {
+    localStorage.setItem("beatrix.http.filters", JSON.stringify({
+      statusOff: [...httpF.statusOff], methodsOff: [...httpF.methodsOff], typesOff: [...httpF.typesOff],
+      scopeIn: httpF.scopeIn, scopeOut: httpF.scopeOut, onlyParams: httpF.onlyParams, onlyErr: httpF.onlyErr, hlOnly: httpF.hlOnly,
+      code: httpF.code, path: httpF.path, host: httpF.host, mime: httpF.mime, ext: httpF.ext, sizeMin: httpF.sizeMin, sizeMax: httpF.sizeMax,
+      sort: httpF.sort, dir: httpF.dir, group: httpF.group
+    }));
+  } catch (e) {}
+}
+function httpLoadF() {
+  try {
+    const j = JSON.parse(localStorage.getItem("beatrix.http.filters") || "null"); if (!j) return;
+    httpF.statusOff = new Set(j.statusOff || []); httpF.methodsOff = new Set(j.methodsOff || []); httpF.typesOff = new Set(j.typesOff || []);
+    Object.assign(httpF, { scopeIn: j.scopeIn !== false, scopeOut: !!j.scopeOut, onlyParams: !!j.onlyParams, onlyErr: !!j.onlyErr, hlOnly: !!j.hlOnly,
+      code: j.code || "", path: j.path || "", host: j.host || "", mime: j.mime || "", ext: j.ext || "", sizeMin: j.sizeMin || "", sizeMax: j.sizeMax || "",
+      sort: j.sort || "id", dir: j.dir || "asc", group: j.group || "none" });
+  } catch (e) {}
+}
+function httpRowMenu(e, id) {
+  const row = httpRows.find(r => r.id === id) || {};
+  const sel = [...httpSelected], host = row.host || "";
+  const items = [{ label: "\u21e5 Send to Repeater", fn: () => httpSendToRepeaterById(id, false) }];
+  if (sel.length > 1) items.push({ label: "\u21e5 Send " + sel.length + " selected to Repeater", fn: () => httpBulkToRepeater(sel) });
+  items.push({ label: "\u21e5 Send to AutoRepeater", fn: () => httpSendToRepeaterById(id, true) });
+  items.push({ sep: true });
+  if (row.url) items.push({ label: "\u2316 Scan URL with Nuclei", fn: () => scanUrlWithNuclei(row.url) });
+  if (host) {
+    items.push({ label: "\u2295 Add host to scope", fn: () => quickScopeAdd(host, false) });
+    items.push({ label: "\u2298 Exclude host from scope", fn: () => quickScopeAdd(host, true) });
+  }
+  if (row.url) items.push({ label: "\u2197 Open URL in Browser", fn: () => openInBrowser(row.url) });
+  items.push({ sep: true });
+  items.push({ label: "\u29c9 Copy", items: [
+    { label: "Copy URL", fn: () => copyText(row.url || "") },
+    { label: "Copy as curl", fn: () => httpCopyFromDetail(id, "curl") },
+    { label: "Copy request (raw)", fn: () => httpCopyFromDetail(id, "req") },
+    { label: "Copy response (raw)", fn: () => httpCopyFromDetail(id, "resp") },
+  ] });
+  items.push({ sep: true });
+  items.push({ label: "\u25a0 Highlight", items: HTTP_HL_COLORS.map(c => ({ label: (c.key ? "\u25cf " : "\u25cb ") + c.label, fn: () => httpSetHighlight(sel.length ? sel : [id], c.key) })) });
+  items.push({ label: "\u270e " + ((httpAnnot[id] || {}).note ? "Edit note\u2026" : "Add note\u2026"), fn: () => httpAddNote(id) });
+  items.push({ sep: true });
+  items.push({ label: "Delete this request", fn: () => httpDeleteIds([id]) });
+  if (sel.length) items.push({ label: "Delete selected (" + sel.length + ")", fn: () => httpDeleteIds(sel) });
+  showCtxMenu(e.clientX, e.clientY, items);
+}
+// Fetch a tx's detail, then route it (the list rows don't carry bodies).
+async function httpBulkToRepeater(ids) {
+  let n = 0;
+  for (const id of ids) {
+    try {
+      const d = await (await fetch("/http/detail?id=" + id + "&project=" + activeProject)).json();
+      const tx = d.tx; if (!tx) continue;
+      let target = ""; try { target = new URL(tx.url).origin; } catch (e) {}
+      await fetch("/repeater/new", { method: "POST", body: JSON.stringify({ project: activeProject, request: httpRawRequest(tx), target }) });
+      n++;
+    } catch (e) {}
+  }
+  document.querySelector('nav button[data-tab="repeater"]').click();
+  toast("Sent " + n + " to Repeater (" + n + " tab" + (n === 1 ? "" : "s") + ").");
+}
+async function httpCopyFromDetail(id, what) {
+  try {
+    const d = await (await fetch("/http/detail?id=" + id + "&project=" + activeProject)).json();
+    const tx = d.tx; if (!tx) { toast("Request not found."); return; }
+    if (what === "curl") copyText(toCurlFromRaw(httpRawRequest(tx), tx.url));
+    else if (what === "resp") copyText(httpRawResponse(tx));
+    else copyText(httpRawRequest(tx));
+  } catch (e) { toast("Copy failed."); }
+}
+async function httpSelect(id) {
+  httpSelId = id;
+  document.querySelectorAll("#http-list tr.http-row").forEach(tr =>
+    tr.classList.toggle("sel", tr.getAttribute("data-id") === String(id)));
+  const d = await (await fetch("/http/detail?id=" + id + "&project=" + activeProject)).json();
+  const tx = d.tx;
+  if (!tx || id !== httpSelId) return;
+  httpDetail = tx;
+  httpRenderDetail();
+}
+let httpDetail = null, httpPrettyOn = false, httpDecodeOn = false;
+function httpRawRequest(tx) {
+  let path = tx.path || "/";
+  try { const u = new URL(tx.url); path = u.pathname + (u.search || ""); } catch (e) {}
+  const lines = [(tx.method || "GET") + " " + path + " HTTP/1.1"];
+  const h = tx.req_headers || {};
+  if (!Object.keys(h).some(k => k.toLowerCase() === "host")) { try { lines.push("Host: " + new URL(tx.url).host); } catch (e) {} }
+  for (const k in h) { if (k.startsWith(":")) continue; lines.push(k + ": " + h[k]); }   // skip HTTP/2 pseudo-headers
+  let raw = lines.join("\r\n") + "\r\n\r\n";
+  if (tx.req_body) raw += tx.req_body;
+  return raw;
+}
+function httpRawResponse(tx) {
+  const lines = ["HTTP/1.1 " + (tx.status || "") + ""];
+  const h = tx.resp_headers || {};
+  for (const k in h) { if (k.startsWith(":")) continue; lines.push(k + ": " + h[k]); }
+  return lines.join("\r\n") + "\r\n\r\n" + (tx.resp_body || "");
+}
+// Repeater-grade (read-only) rendering of the selected transaction: syntax-highlight
+// request + response with tips, optional beautify, and a decode panel. Reuses the
+// Repeater's hlHttp / beautifyHttp / extractDecodables verbatim.
+function httpRenderDetail() {
+  const tx = httpDetail; if (!tx) return;
+  const reqRaw = httpRawRequest(tx), respRaw = httpRawResponse(tx), origin = reqOriginOf(reqRaw);
+  $("http-req").innerHTML = hlHttp(httpPrettyOn ? beautifyHttp(reqRaw) : reqRaw, "request", origin);
+  $("http-resp").innerHTML = hlHttp(httpPrettyOn ? beautifyHttp(respRaw) : respRaw, "response", origin);
+  const st = +tx.status || 0;
+  const cls = st >= 200 && st < 300 ? "ok" : st >= 400 ? "bad" : "dim";
+  const sh = $("http-resphdr");
+  if (sh) sh.innerHTML = "Response" + (st ? '  <span class="rep-status" style="text-transform:none; letter-spacing:0;"><span class="' + cls + '">' + st + "</span> \u00b7 " + (tx.length || 0) + " B</span>" : "");
+  const ds = $("http-detail-status");
+  if (ds) ds.innerHTML = tx.method
+    ? '<span class="http-m' + (/^(POST|PUT|DELETE|PATCH)$/.test(tx.method) ? " w" : "") + '">' + esc(tx.method) + '</span> ' +
+      '<span class="dim" title="' + escAttr((tx.host || "") + (tx.path || "")) + '">' + esc(tx.host || "") + '</span>'
+    : "";
+  httpRenderDecode(reqRaw, respRaw);
+  if (!$("http-findbar").hidden) httpFindRun($("http-find").value);   // keep find matches on the new request
+}
+function httpRenderDecode(reqRaw, respRaw) {
+  const panel = $("http-decoded"); if (!panel) return;
+  panel.hidden = !httpDecodeOn;
+  if (!httpDecodeOn) return;
+  const items = extractDecodables(reqRaw || "", "REQ").concat(extractDecodables(respRaw || "", "RESP"));
+  if (!items.length) { panel.innerHTML = '<div class="dec-empty">No cookies, tokens, or encoded values found in this request or response.</div>'; return; }
+  const rows = items.map(it => {
+    const fw = it.fw ? '<span class="dec-fw' + (it.fw.enc ? ' enc' : '') + '">' + esc(it.fw.fw) + (it.fw.enc ? ' \u00b7 encrypted' : '') + '</span>' : '';
+    let val;
+    if (it.dec && it.dec.kind !== "binary" && it.dec.kind !== "opaque") val = esc(it.dec.summary);
+    else if (it.fw && it.fw.note) val = esc(it.fw.note);
+    else if (it.dec) val = esc(it.dec.summary);
+    else val = "opaque \u2014 nothing to decode without the server key.";
+    return '<div class="dec-row"><span class="dec-src dec-' + it.src.toLowerCase() + '">' + it.src + '</span>' +
+      '<span class="dec-label">' + esc(it.label) + '</span>' + fw + '<div class="dec-val">' + val + '</div></div>';
+  }).join("");
+  panel.innerHTML = '<div class="dec-hdr">Decoded \u2014 ' + items.length + ' value' + (items.length > 1 ? 's' : '') + '</div>' + rows;
+}
+function setHttpPretty(on) {
+  httpPrettyOn = on;
+  const b = $("http-pretty"); if (b) { b.classList.toggle("on", on); b.textContent = on ? "Beautify: on" : "Beautify: off"; }
+  try { localStorage.setItem("beatrix.http.pretty", on ? "1" : "0"); } catch (e) {}
+  if (httpDetail) httpRenderDetail();
+}
+function setHttpDecode(on) {
+  httpDecodeOn = on;
+  const b = $("http-decode"); if (b) { b.classList.toggle("on", on); b.textContent = on ? "Decode: on" : "Decode: off"; }
+  try { localStorage.setItem("beatrix.http.decode", on ? "1" : "0"); } catch (e) {}
+  const p = $("http-decoded"); if (p) p.hidden = !on;
+  if (httpDetail) httpRenderDetail();
+}
+async function httpSendToRepeaterById(id, toAR) {
+  const d = await (await fetch("/http/detail?id=" + id + "&project=" + activeProject)).json();
+  const tx = d.tx; if (!tx) return;
+  const raw = httpRawRequest(tx);
+  let target = ""; try { target = new URL(tx.url).origin; } catch (e) {}
+  if (toAR) { sendToAutoRepeater(raw, target); return; }
+  sendIssueToRepeater({ url: tx.url, request: raw });   // reuse the Issues→Repeater bridge
+}
+// ── right-click context menu (route a request to another module) ──
+function showCtxMenu(x, y, items) {
+  hideCtxSub();
+  const m = $("ctxmenu"); m.innerHTML = "";
+  ctxBuildInto(m, items);
+  m.hidden = false;
+  m.style.left = Math.min(x, window.innerWidth - m.offsetWidth - 8) + "px";
+  m.style.top = Math.min(y, window.innerHeight - m.offsetHeight - 8) + "px";
+}
+function ctxBuildInto(m, items) {
+  for (const it of items) {
+    if (it.sep) { const s = document.createElement("div"); s.className = "sep"; m.appendChild(s); continue; }
+    const b = document.createElement("button");
+    b.textContent = it.label + (it.items ? "   \u25b8" : "");
+    if (it.items) {
+      b.classList.add("has-sub");
+      b.onmouseenter = () => ctxOpenSub(b, it.items);
+      b.onclick = (e) => { e.stopPropagation(); ctxOpenSub(b, it.items); };
+    } else {
+      b.onmouseenter = () => hideCtxSub();
+      b.onclick = () => { hideCtxMenu(); if (it.fn) it.fn(); };
+    }
+    m.appendChild(b);
+  }
+}
+let _ctxSub = null;
+function ctxOpenSub(anchor, items) {
+  hideCtxSub();
+  const sub = document.createElement("div"); sub.className = "ctxmenu"; sub.id = "ctxsub";
+  ctxBuildInto(sub, items);
+  document.body.appendChild(sub); sub.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  let left = r.right - 2, top = r.top;
+  if (left + sub.offsetWidth > window.innerWidth - 8) left = r.left - sub.offsetWidth + 2;
+  if (top + sub.offsetHeight > window.innerHeight - 8) top = window.innerHeight - sub.offsetHeight - 8;
+  sub.style.left = Math.max(6, left) + "px"; sub.style.top = Math.max(6, top) + "px";
+  _ctxSub = sub;
+}
+function hideCtxSub() { if (_ctxSub) { _ctxSub.remove(); _ctxSub = null; } }
+function hideCtxMenu() { const m = $("ctxmenu"); if (m) m.hidden = true; hideCtxSub(); }
+document.addEventListener("click", (e) => {
+  const m = $("ctxmenu");
+  if (m && !m.hidden && !m.contains(e.target) && !(_ctxSub && _ctxSub.contains(e.target))) hideCtxMenu();
+});
+
+// ── Shared cross-module routing (one coherent vocabulary everywhere) ──────────
+// A request menu (send a request to Repeater/AutoRepeater/Nuclei/Scope/Browser/Ghost + Copy)
+// and a host menu (scan/import/scope/open), both built from the existing per-destination fns.
+function _shq(sv) { return "'" + String(sv == null ? "" : sv).replace(/'/g, "'\\''") + "'"; }
+function toCurlFromRaw(raw, url) {
+  const norm = String(raw || "").replace(/\r\n/g, "\n");
+  const idx = norm.indexOf("\n\n");
+  const head = idx < 0 ? norm : norm.slice(0, idx), body = idx < 0 ? "" : norm.slice(idx + 2);
+  const lines = head.split("\n");
+  const first = (lines.shift() || "").split(/\s+/);
+  const method = (first[0] || "GET").toUpperCase();
+  const parts = ["curl -i -s -X " + method + " " + _shq(url || "")];
+  for (const ln of lines) {
+    const i = ln.indexOf(":"); if (i <= 0) continue;
+    const k = ln.slice(0, i).trim(), v = ln.slice(i + 1).trim();
+    if (!k || k.toLowerCase() === "host" || k.startsWith(":")) continue;
+    parts.push("-H " + _shq(k + ": " + v));
+  }
+  if (body) parts.push("--data-raw " + _shq(body));
+  return parts.join(" \\\n  ");
+}
+const DONATE_WALLETS = [{"cls": "xmr", "name": "Monero (XMR)", "coin": "Monero (XMR)", "color": "#ff6600", "icon": "<svg viewBox=\"0 0 256 256\" fill=\"none\"><circle cx=\"128\" cy=\"128\" r=\"128\" fill=\"#FF6600\"/><path d=\"M128 43L60 158V199H89V140L128 101L167 140V199H196V158L128 43Z\" fill=\"#fff\"/><path d=\"M43 177V199H89V177L60 158H43Z\" fill=\"#fff\" opacity=\"0.8\"/><path d=\"M213 177V199H167V177L196 158H213Z\" fill=\"#fff\" opacity=\"0.8\"/></svg>", "qr": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAklEQVR4AewaftIAAAufSURBVO3BQZLkwJEEQbeQ+v+XbefEE5IiwGKqO4auin+kqmqBSVXVEpOqqiUmVVVLTKqqlphUVS0xqapaYlJVtcSkqmqJSVXVEpOqqiUmVVVLTKqqlphUVS3xyUNAtlJzBchdap4Acpeau4CcqDkBspWaK0CeUHMXkDepuQJkKzV3TaqqlphUVS0xqapaYlJVtcSkqmqJSVXVEp/8BWp+GpC71HyLmitAToC8Ccib1LwJyImaEyBX1JwAOQFyRc2b1LxJzU8D8qZJVdUSk6qqJSZVVUtMqqqWmFRVLfHJFwF5k5o3ATlRcwXIE2ruUnMC5C41J0DuAvKEmm8A8psBOVHzJiBvUvMNk6qqJSZVVUtMqqqWmFRVLTGpqlpiUlW1xCf1H2pOgPw0ICdqfpqa30zNCZA3qbkLSP13k6qqJSZVVUtMqqqWmFRVLTGpqlpiUlW1xCf116g5AfImIFfUnAD5zdQ8oeYKkBM1J0CuAHmTmvrvJlVVS0yqqpaYVFUtMamqWmJSVbXEJ1+k5jcDcqLmCpAn1FwBcqLmBMhdak6AXFFzAuREzQmQK2pOgJyouaLmTWpOgJyouQLkRM2b1Gw0qapaYlJVtcSkqmqJSVXVEpOqqiUmVVVLfPIXAKn/DsgVNSdATtRcAXKi5n8JkBM1/xog/5pJVdUSk6qqJSZVVUtMqqqWmFRVLTGpqlrik4fU/GvU/GZqToB8A5ATNU+o+QY1T6h5E5C3qPlfMqmqWmJSVbXEpKpqiUlV1RKTqqol8I88AOREzRUgJ2reBOQuNSdArqg5AXKi5qcBOVFzBcjb1FwB8iY1TwC5S80JkCtq3gTkRM1dQE7UXAFyouauSVXVEpOqqiUmVVVLTKqqlphUVS0xqapaAv/Iy4BcUXMC5ETNFSAnat4E5IqaNwE5UXMXkCfU3AXkRM2bgJyouQLkTWreBOQuNd8C5ETNN0yqqpaYVFUtMamqWmJSVbXEpKpqiU8WAHJFzQmQEzVvAXKiZisgbwJyouYKkN8MyJvU3AXkNwNyouauSVXVEpOqqiUmVVVLTKqqlphUVS0xqapa4pNfQs0JkLvUnAC5ouZNQE7U3AXkRM1dau4C8oSaEyBX1JwA+RY1dwE5UXMFyImau9ScALmi5gkgV9S8aVJVtcSkqmqJSVXVEpOqqiUmVVVLTKqqlvjkHwXkRM0VICdq7gJyAuRNQK6o+RY1bwLyGwC5ouZEzQmQbwByouZNar5hUlW1xKSqaolJVdUSk6qqJSZVVUvgH3kZkCtqfgMgb1HzJiAnak6AXFFzAuREzZuA3KXmBMib1LwJyF1q3gTkRM0VICdqToBcUfOmSVXVEpOqqiUmVVVLTKqqlphUVS0xqapa4pOHgLwJyF1qToCcqHkLkCfUXFHzJiAnak6A3KXmN1BzBcgJkBM1b1JzBcib1JwAuaLmBMiJmm+YVFUtMamqWmJSVbXEpKpqiUlV1RKTqqolPnlIzQmQbwByouYEyFvUvAnItwA5UfMtaq4A+RY1dwF5k5o3ATlRcwXIiZoTIFfUvGlSVbXEpKpqiUlV1RKTqqolJlVVS3zyEJC7gDyh5gqQEyB3qXkTkBM1V9ScADlRcwXIm4A8oeYEyBU1J0BOgFxR8wSQK2reBOREzRUgJ2p+GpATNXdNqqqWmFRVLTGpqlpiUlW1xKSqaolJVdUSn/wFat4E5IqaJ4D8NCB3qblLzZvUPAHkRM2b1HwDkBM1bwJyF5ATNVfUnAD5aZOqqiUmVVVLTKqqlphUVS0xqapaYlJVtcQnXwTkCTV3AXkTkCtqTtScALkLyImau4B8i5pvAfINak6AfIOaEyAnQK6oeULNFSBvmlRVLTGpqlpiUlW1xKSqaolJVdUS+EdeBuSKmhMgJ2p+GpArak6A/GZqToB8i5qfBuRNak6AfIOau4CcqDkBckXNmyZVVUtMqqqWmFRVLTGpqlpiUlW1xKSqaolPfgk1dwH5FjVXgDyh5i4gJ2ruAnKXmieAvAnIbwbkLjV3ATkBcqJmo0lV1RKTqqolJlVVS0yqqpaYVFUtMamqWuKTf5Sau4CcALmi5gkgP03NCZArQE7UnKj5aWpOgLxJzQmQK0BO1Pw0IHcBOVFz16SqaolJVdUSk6qqJSZVVUtMqqqWmFRVLfHJFwE5UXMC5IqaEyAnaq6oeROQu9ScADkBcpea3wzIiZq7gPxmau5ScwLkLjUnQH7apKpqiUlV1RKTqqolJlVVS0yqqpbAP/IyIFfUvAnIiZoTIG9R8wSQb1DzBJArav5FQE7U3AXkRM1dQK6oeQLIm9R8w6SqaolJVdUSk6qqJSZVVUtMqqqWmFRVLYF/5AEg36LmLiBvUnMFyImau4D8Bmp+GpATNSdArqh5Ashdak6AXFFzAuSKmhMgJ2quADlRcxeQEzV3TaqqlphUVS0xqapaYlJVtcSkqmqJSVXVEp8sBuREzU8DcqLmLjVvAnIXkBM1b1JzAuREzV1A7lKzFZCNJlVVS0yqqpaYVFUtMamqWmJSVbXEJ3+BmruAnAC5C8hdak6AvAnIFTVvAvIEkG8B8iYgV9Q8oeYuIHcB2QrIN0yqqpaYVFUtMamqWmJSVbXEpKpqiUlV1RKf/BJqToDcpeYEyBUgJ2quADlRcxeQEzVvUvMbqLkLyImaK0BO1LxJzQmQb1BzAmSjSVXVEpOqqiUmVVVLTKqqlphUVS0xqapa4pOH1JwAuUvNm4B8g5oTICdq7gLyLUDepOYEyF1q7lLzBJC71LxJzTeoeULNFSBvmlRVLTGpqlpiUlW1xKSqaolJVdUSn/wFat6k5gqQEzX/GjV3AXlCzV1AToDcpeYJIFfU/C8BcqLmCpAn1HzDpKpqiUlV1RKTqqolJlVVS0yqqpaYVFUt8clDQN6k5gTIXUDuUvMmNXepeQLIFTW/gZoTIFeAnKi5C8ib1LxJzQmQu9ScALmi5jebVFUtMamqWmJSVbXEpKpqiUlV1RKTqqol8I98CZA3qXkTkLvUnAA5UfMmIHepuQvIE2p+MyB3qdkKyF1qftqkqmqJSVXVEpOqqiUmVVVLTKqqlvjkISB3qfkWIHepOQFyl5oTIHepOVFzF5ATNVfUnAB5Asg3qHkTkBM1dwH5aWpOgLxJzV2TqqolJlVVS0yqqpaYVFUtMamqWmJSVbXEJw+p+c3U3AXkLiBPqLkLyImaK0DeBORtaq4AOVFzAuRNaq4AeQLIXWreBOQuNSdArqh506SqaolJVdUSk6qqJSZVVUtMqqqW+OQhIFupuUvNFSBvAnKi5i41vwGQb1HzDWqeUHMFyF1ATtS8CciJmitATtTcNamqWmJSVbXEpKpqiUlV1RKTqqolJlVVS3zyF6j5aUDuUnOXmieA3AXkW9S8Sc0JkLuA3KXmNwDyFjW/AZArat40qapaYlJVtcSkqmqJSVXVEpOqqiUmVVVLfPJFQN6k5qcB+RY1J0C+Qc0TQH4zNSdAfhqQbwDyJiAnau6aVFUtMamqWmJSVbXEpKpqiUlV1RKf1P+LmhMgbwJyl5o3ATlR8yY1J0DeBOQuNb8ZkBM1V4D8ZpOqqiUmVVVLTKqqlphUVS0xqapaYlJVtcQn9R9ATtRcAXKi5gTIFTVvAnKi5k1AnlBzBcgTajYCcqLmLjUnQK6oOQHy0yZVVUtMqqqWmFRVLTGpqlpiUlW1xKSqaolPvkjNb6bmLjUnQE7UXAHyGwC5S80TQO5S8yY1J0DeBOSKmruAnKg5UXMFyImanzapqlpiUlW1xKSqaolJVdUSk6qqJT75C4BsBOQuNU8AuaLmBMiJmitA/kVA7lLzhJq7gJyouQLkRM1dQH4akBM1d02qqpaYVFUtMamqWmJSVbXEpKpqiUlV1RL4R6qqFphUVS0xqapaYlJVtcSkqmqJSVXVEpOqqiUmVVVLTKqqlphUVS0xqapaYlJVtcSkqmqJ/wMFYoWjhQJAcgAAAABJRU5ErkJggg==", "addr": "86pPpp65UMF9bhZNDTLFm16ECAYuoYUkiQwQrLji35bAEe2293HhANHFCU1E7CHZrY2NZB9FdEQspDV29jokS2NKEdTp2HQ"}, {"cls": "btc", "name": "Bitcoin (BTC)", "coin": "Bitcoin (BTC)", "color": "#f7931a", "icon": "<svg viewBox=\"0 0 256 256\" fill=\"none\"><circle cx=\"128\" cy=\"128\" r=\"128\" fill=\"#F7931A\"/><path d=\"M186.7 113.3c2.5-16.6-10.2-25.5-27.5-31.5l5.6-22.6-13.7-3.4-5.5 22c-3.6-.9-7.3-1.7-11-2.6l5.5-22.1-13.7-3.4-5.6 22.6c-3-.7-5.9-1.4-8.7-2.1l0-.1-18.9-4.7-3.7 14.7s10.2 2.3 9.9 2.5c5.6 1.4 6.6 5 6.4 7.9l-6.4 25.8c.4.1.9.2 1.4.4l-1.4-.4-9 36.1c-.7 1.7-2.4 4.2-6.2 3.3.1.2-10-2.5-10-2.5l-6.8 15.7 17.8 4.4c3.3.8 6.5 1.7 9.7 2.5l-5.7 22.8 13.7 3.4 5.6-22.6c3.7 1 7.4 1.9 10.9 2.8l-5.6 22.4 13.7 3.4 5.7-22.7c23.3 4.4 40.8 2.6 48.2-18.5 5.9-17-0.3-26.8-12.6-33.2 8.9-2.1 15.7-7.9 17.5-20zm-31.3 43.9c-4.2 17-32.8 7.8-42.1 5.5l7.5-30.1c9.3 2.3 39 6.9 34.6 24.6zm4.2-44.1c-3.9 15.5-27.6 7.6-35.3 5.7l6.8-27.3c7.7 1.9 32.5 5.5 28.5 21.6z\" fill=\"#fff\"/></svg>", "qr": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAklEQVR4AewaftIAAAeMSURBVO3BwXEkgQ0EwWrE+u9y6xyQwMdoYkFWZvoPknTAIElHDJJ0xCBJRwySdMQgSUcMknTEIElHDJJ0xCBJRwySdMQgSUcMknTEIElHDJJ0xCBJRwySdMQgSUcMknTEhwcl4a9qy2+VhE1bnpCEt7TlJ5KwacsmCX9VW54wSNIRgyQdMUjSEYMkHTFI0hGDJB0xSNIRgyQd8eFlbbkmCRclYdOWTVs2SXhCWzZJ+K3ack0S3jJI0hGDJB0xSNIRgyQdMUjSEYMkHTFI0hGDJB3x4Qsl4S1teUsS/rK2bJKwacsmCZsk/ERbvkkS3tKWbzJI0hGDJB0xSNIRgyQdMUjSEYMkHTFI0hGDJB3xQSe1ZZOETRI2bXlCEjZt2SRh05ZNEnTLIElHDJJ0xCBJRwySdMQgSUcMknTEIElHDJJ0xAd9nbZskvCWJGzasknCJgmbtrwpCZu26P9vkKQjBkk6YpCkIwZJOmKQpCMGSTpikKQjBkk64sMXaov+prZskrBpy6YtF7Xlrxok6YhBko4YJOmIQZKOGCTpiEGSjhgk6YhBko748LIk6B1t2SRh05ZNEjZt2SRh05ZNEjZt+YkkbNryhCTovxsk6YhBko4YJOmIQZKOGCTpiEGSjhgk6YhBko5I/0GvSMJT2vJNkvCEtnybJGzaov+/QZKOGCTpiEGSjhgk6YhBko4YJOmIQZKOGCTpiA8PSsKmLZskXNOWTVt+IgnfJAmbtuh/S8I1bfkmgyQdMUjSEYMkHTFI0hGDJB0xSNIRgyQdMUjSEYMkHfHhj2vLRUl4QluekIS3tGWThL+sLU9IwhPa8oRBko4YJOmIQZKOGCTpiEGSjhgk6YhBko4YJOmID0e1ZZOEJyRh05ZNEp7SlickYdOWJyRh05ZNEjZteVMSNm3ZJGHTlk0SntCWbzJI0hGDJB0xSNIRgyQdMUjSEYMkHTFI0hGDJB3x4RdryyYJm7ZskrBpy5uSsGnLE5Lwlra8KQlPSMITkvCEtmySsGnLWwZJOmKQpCMGSTpikKQjBkk6YpCkIwZJOmKQpCM+fKG2bJLwhLZskrBpyyYJP9GWJ7TlCUnYtGWThE0SntCWN7XlmiRs2vJNBkk6YpCkIwZJOmKQpCMGSTpikKQjBkk6YpCkIz68LAmbtjyhLU9oy1/Wlk0SrknCT7Rlk4S/KgmbtjxhkKQjBkk6YpCkIwZJOmKQpCMGSTpikKQjBkk6Iv2HFyVh05ZNEp7Qlk0SNm25KAmbtmyScE1b3pSETVuekIQntOWbDJJ0xCBJRwySdMQgSUcMknTEIElHDJJ0xCBJR3x4WVue0Ja3tGWThKe0ZZOEJ7TlLW3ZJGHTlk0SnpKEb5KEJ7TlmkGSjhgk6YhBko4YJOmIQZKOGCTpiEGSjhgk6Yj0H16UhE1bNkn4Jm15ShI2bXlCEn6jtmyS8BNteUsSNm15QhLe0pYnDJJ0xCBJRwySdMQgSUcMknTEIElHDJJ0xCBJR3x4UBI2bdkkYdOWb5KEi9ryliQ8oS1PaMtPJGHTlie0ZZOETVt+o0GSjhgk6YhBko4YJOmIQZKOGCTpiEGSjhgk6YgPX6gtmyRc05anJOGvSsIT2vITbdkk4QlteUISNm25ZpCkIwZJOmKQpCMGSTpikKQjBkk6YpCkIwZJOuLDF0rCN2nLE5LwE23ZtOWaJGza8oQkbJLwlLb8Rkl4QlueMEjSEYMkHTFI0hGDJB0xSNIRgyQdMUjSEYMkHTFI0hHpPzwkCZu2PCEJm7ZskvBbteUJSXhCWzZJ2LTlTUm4pi2bJDyhLW8ZJOmIQZKOGCTpiEGSjhgk6YhBko4YJOmIQZKOSP9Br0jCt2nLE5KwacsmCZu2vCkJm7a8JQnXtOUJgyQdMUjSEYMkHTFI0hGDJB0xSNIRgyQdMUjSER8elIS/qi2btvxEEjZt2SThmyThLUnYtOVNSdi05Qlt2SRh05ZvMkjSEYMkHTFI0hGDJB0xSNIRgyQdMUjSEYMkHfHhZW25JglPSMJPtGWThE1bNknYtOUJbXlLWzZJeFNbvklbNkl4QlueMEjSEYMkHTFI0hGDJB0xSNIRgyQdMUjSEYMkHfHhCyXhLW35NknYtOUJbXlCWzZJ+CZt+YkkbJLwTZLwGw2SdMQgSUcMknTEIElHDJJ0xCBJRwySdMQgSUd8kF7Slm+ShDe1ZZOEJ7Rlk4RrBkk6YpCkIwZJOmKQpCMGSTpikKQjBkk6YpCkIz7oT0vCN2nLJgmbtmza8qYk/EZtecsgSUcMknTEIElHDJJ0xCBJRwySdMQgSUcMknTEhy/Ult+oLU9JwjdpyxOSsGnLE5LwprZskrBpyxPasknCNxkk6YhBko4YJOmIQZKOGCTpiEGSjhgk6YhBko748LIk/FVJ+Im2bNqyScKmLZskPCEJm7Z8m7Y8IQmbtmyS8Ja2fJNBko4YJOmIQZKOGCTpiEGSjhgk6YhBko4YJOmI9B8k6YBBko4YJOmIQZKOGCTpiEGSjhgk6YhBko4YJOmIQZKOGCTpiEGSjhgk6YhBko4YJOmIQZKOGCTpiEGSjvgPPk4oXS/fqD4AAAAASUVORK5CYII=", "addr": "3P2grnY3sFL4tkJwGzrQ7F3yWPHFmK95fu"}, {"cls": "eth", "name": "Ethereum (ETH)", "coin": "Ethereum (ETH)", "color": "#627eea", "icon": "<svg viewBox=\"0 0 256 256\" fill=\"none\"><circle cx=\"128\" cy=\"128\" r=\"128\" fill=\"#627EEA\"/><path d=\"M128 28v72.4l61.2 27.4L128 28z\" fill=\"#fff\" opacity=\"0.6\"/><path d=\"M128 28L66.8 127.8 128 100.4V28z\" fill=\"#fff\"/><path d=\"M128 174.8v53.1l61.2-84.7L128 174.8z\" fill=\"#fff\" opacity=\"0.6\"/><path d=\"M128 227.9v-53.1l-61.2-31.6L128 227.9z\" fill=\"#fff\"/><path d=\"M128 163.6l61.2-35.8L128 100.4v63.2z\" fill=\"#fff\" opacity=\"0.2\"/><path d=\"M66.8 127.8l61.2 35.8V100.4l-61.2 27.4z\" fill=\"#fff\" opacity=\"0.6\"/></svg>", "qr": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAklEQVR4AewaftIAAAizSURBVO3BwZEcSRIEQfOQ5p9lPzBwOY9EoTpmTTX9A0laYJCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCUGSVriw1+QhN+sLbeS8KS2nCThRltuJeGkLSdJOGnLjSQ8qS0/ScJv1pYbgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQt8eEfaMs3S8LT2rJZEk7a8rS2nCThpC0nbfl2bflmSXjSIElLDJK0xCBJSwyStMQgSUsMkrTEIElLfPgCSXhSW56WhJO23EjCk9pykoSnJeGkLTeScKMtJ0k4acvTkvCktrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPuifSMJJW2605UYSbiThJ235Zm3RdxskaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkP+ifacpKEk7acJOGkLSdtOUnCSVtuJeGkLSdtuZGEk7boXYMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhC7RFZ0m4kYSTttxIwk/a8qQk3GjLSRJO2vK2tvxmgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQt8eEfSILutOUkCSdtOUnCSVtOkvDt2nKShJO2nCThpC23kvBfNkjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh/+grboLAknbbnRlhttOUnCSVve1paTJJy05W1t0f83SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtkf7BpSSctOUkCd+sLbeSoDttOUnCSVtOknDSlqcl4Zu15U2DJC0xSNISgyQtMUjSEoMkLTFI0hKDJC3x4S9oy5PaciMJJ235dm35r0vCSVtutOUkCTfacqstN5JwIwk32nJjkKQlBklaYpCkJQZJWmKQpCUGSVpikKQl0j/4j0vCrbacJOFJbXlSEk7acisJJ235Zkl4WluelISTtrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPvwFSThpy5uScNKWkyTcass3S8KNJPykLSdtOUnCm9qyXRI2GyRpiUGSlhgkaYlBkpYYJGmJQZKWGCRpiQ9/QVtuJOGkLU9Kwklbfru2nCThpC23knDSls3acisJN9qy2SBJSwyStMQgSUsMkrTEIElLDJK0xCBJS3z4B5Jw0paTJJy05UZbbiXhpC0nSXhSW06ScCMJP2nLSVtuJGG7JJy05U1JuNGWG4MkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhL0jCm5Jw0paTJJy05SdtOUnCk9pykoSTtny7JJy05SQJN9pyIwlPS8Kb2vKkQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKWSP/gUhJO2vLbJeFGWzZLwk/aciMJv11bTpJw0paTJDypLU8aJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJD39BW24k4Zu15Sdt0bvaciMJN9rytLacJOGkLTeS8KZBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJ9A9eloSTtpwk4UZbnpaEb9aWpyXhRltOknCjLSdJeFtb3pSEG225MUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh/+giTcaMtJEp6UhJO2/CQJT2rLSRJO2nKShBttudWWb9aWkySctOXbJeGkLW8aJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJD/9AW2605UYSTtrytracJOFNbXlaEk7actKWG0k4acuNJPykLU9KwpOScNKWG4MkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhCyThpC032nKShJO2/KQtN5Jwoy1PSsKttnyztpwk4aQtT0vCjbbcSMJJW540SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISH36BJNxoy9OS8Ju15VYSTtpyIwknbbmRhJO2PK0tJ0m40ZaTJJy05cYgSUsMkrTEIElLDJK0xCBJSwyStMQgSUt8+AJteVJbTpJw0pafJOFNSThpy0lbTpJwkoTtknDSlpMk3ErCN0vCSVueNEjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh++QBJO2nLSlpMknLTlVltOkvCktpwk4aQtN9qi368tbxokaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkPX6AtJ0m40ZaTJLytLZsl4VZbTpJw0paTtpwk4UlJeFoSTtpykoSTJJy05UmDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC2R/oGuJeGkLU9KwklbTpJw0panJeGkLSdJOGnLjSTcaMvTkvCktrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlBkla4sNfkITfrC0/acuNJNxoy5OScNIW3UvCSVvelISTtjxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPvwDbflmSbiVhJO2nLTlRhJO2vLt2nKShJO2nCThpC1va8s3a8ubBklaYpCkJQZJWmKQpCUGSVpikKQlBkla4sMXSMKT2vK2JJy05U1tOUnC05Jw0paTJDypLSdJOEnCt2vLSRJO2vKkQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKW+KB/oi03kvDNkvCTtpy05UZbTpJwkoSTttxoy60kPCkJJ205ScJJW24MkrTEIElLDJK0xCBJSwyStMQgSUsMkrTEB32FJNxoy40knLTlbUm40ZaTJDwpCbfa8s3a8qRBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpZI/+BSEk7a8s2ScNKWW0k4actJEm605UlJ+ElbTpJw0pYbSThpy9uS8KS2nCThpC1vGiRpiUGSlhgkaYlBkpYYJGmJQZKWGCRpiQ//QBJ+uyS8qS03knDSlltJuJGEG215UhLe1paTJNxIwklbnjRI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hLpH0jSAoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC3xP5wN9Su4h2NxAAAAAElFTkSuQmCC", "addr": "0x018eef3AF505Cd02402dF09eF87913222d1cf5C3"}, {"cls": "pepe", "name": "PEPE", "coin": "PEPE (ERC-20)", "color": "#3c9c2d", "icon": "<svg viewBox=\"0 0 256 256\" fill=\"none\"><circle cx=\"128\" cy=\"128\" r=\"128\" fill=\"#3C9C2D\"/><text x=\"128\" y=\"148\" text-anchor=\"middle\" fill=\"#fff\" font-size=\"100\" font-weight=\"bold\" font-family=\"Arial, sans-serif\">P</text></svg>", "qr": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAklEQVR4AewaftIAAAizSURBVO3BwZEcSRIEQfOQ5p9lPzBwOY9EoTpmTTX9A0laYJCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCUGSVriw1+QhN+sLbeS8KS2nCThRltuJeGkLSdJOGnLjSQ8qS0/ScJv1pYbgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQt8eEfaMs3S8LT2rJZEk7a8rS2nCThpC0nbfl2bflmSXjSIElLDJK0xCBJSwyStMQgSUsMkrTEIElLfPgCSXhSW56WhJO23EjCk9pykoSnJeGkLTeScKMtJ0k4acvTkvCktrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPuifSMJJW2605UYSbiThJ235Zm3RdxskaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkP+ifacpKEk7acJOGkLSdtOUnCSVtuJeGkLSdtuZGEk7boXYMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhC7RFZ0m4kYSTttxIwk/a8qQk3GjLSRJO2vK2tvxmgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQt8eEfSILutOUkCSdtOUnCSVtOkvDt2nKShJO2nCThpC23kvBfNkjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh/+grboLAknbbnRlhttOUnCSVve1paTJJy05W1t0f83SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtkf7BpSSctOUkCd+sLbeSoDttOUnCSVtOknDSlqcl4Zu15U2DJC0xSNISgyQtMUjSEoMkLTFI0hKDJC3x4S9oy5PaciMJJ235dm35r0vCSVtutOUkCTfacqstN5JwIwk32nJjkKQlBklaYpCkJQZJWmKQpCUGSVpikKQl0j/4j0vCrbacJOFJbXlSEk7acisJJ235Zkl4WluelISTtrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPvwFSThpy5uScNKWkyTcass3S8KNJPykLSdtOUnCm9qyXRI2GyRpiUGSlhgkaYlBkpYYJGmJQZKWGCRpiQ9/QVtuJOGkLU9Kwklbfru2nCThpC23knDSls3acisJN9qy2SBJSwyStMQgSUsMkrTEIElLDJK0xCBJS3z4B5Jw0paTJJy05UZbbiXhpC0nSXhSW06ScCMJP2nLSVtuJGG7JJy05U1JuNGWG4MkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhL0jCm5Jw0paTJJy05SdtOUnCk9pykoSTtny7JJy05SQJN9pyIwlPS8Kb2vKkQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKWSP/gUhJO2vLbJeFGWzZLwk/aciMJv11bTpJw0paTJDypLU8aJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJD39BW24k4Zu15Sdt0bvaciMJN9rytLacJOGkLTeS8KZBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJ9A9eloSTtpwk4UZbnpaEb9aWpyXhRltOknCjLSdJeFtb3pSEG225MUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh/+giTcaMtJEp6UhJO2/CQJT2rLSRJO2nKShBttudWWb9aWkySctOXbJeGkLW8aJGmJQZKWGCRpiUGSlhgkaYlBkpYYJGmJD/9AW2605UYSTtrytracJOFNbXlaEk7actKWG0k4acuNJPykLU9KwpOScNKWG4MkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHhCyThpC032nKShJO2/KQtN5Jwoy1PSsKttnyztpwk4aQtT0vCjbbcSMJJW540SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISH36BJNxoy9OS8Ju15VYSTtpyIwknbbmRhJO2PK0tJ0m40ZaTJJy05cYgSUsMkrTEIElLDJK0xCBJSwyStMQgSUt8+AJteVJbTpJw0pafJOFNSThpy0lbTpJwkoTtknDSlpMk3ErCN0vCSVueNEjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEh++QBJO2nLSlpMknLTlVltOkvCktpwk4aQtN9qi368tbxokaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkPX6AtJ0m40ZaTJLytLZsl4VZbTpJw0paTtpwk4UlJeFoSTtpykoSTJJy05UmDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC2R/oGuJeGkLU9KwklbTpJw0panJeGkLSdJOGnLjSTcaMvTkvCktrxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlBkla4sNfkITfrC0/acuNJNxoy5OScNIW3UvCSVvelISTtjxpkKQlBklaYpCkJQZJWmKQpCUGSVpikKQlPvwDbflmSbiVhJO2nLTlRhJO2vLt2nKShJO2nCThpC1va8s3a8ubBklaYpCkJQZJWmKQpCUGSVpikKQlBkla4sMXSMKT2vK2JJy05U1tOUnC05Jw0paTJDypLSdJOEnCt2vLSRJO2vKkQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKW+KB/oi03kvDNkvCTtpy05UZbTpJwkoSTttxoy60kPCkJJ205ScJJW24MkrTEIElLDJK0xCBJSwyStMQgSUsMkrTEB32FJNxoy40knLTlbUm40ZaTJDwpCbfa8s3a8qRBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpZI/+BSEk7a8s2ScNKWW0k4actJEm605UlJ+ElbTpJw0pYbSThpy9uS8KS2nCThpC1vGiRpiUGSlhgkaYlBkpYYJGmJQZKWGCRpiQ//QBJ+uyS8qS03knDSlltJuJGEG215UhLe1paTJNxIwklbnjRI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hLpH0jSAoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC3xP5wN9Su4h2NxAAAAAElFTkSuQmCC", "addr": "0x018eef3AF505Cd02402dF09eF87913222d1cf5C3"}, {"cls": "doge", "name": "Dogecoin (DOGE)", "coin": "Dogecoin (DOGE)", "color": "#c3a634", "icon": "<svg viewBox=\"0 0 256 256\" fill=\"none\"><circle cx=\"128\" cy=\"128\" r=\"128\" fill=\"#C3A634\"/><path d=\"M118 68h-30v120h30c39.8 0 72-26.9 72-60s-32.2-60-72-60zm0 100H108V88h10c28.7 0 52 17.9 52 40s-23.3 40-52 40z\" fill=\"#fff\"/></svg>", "qr": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAAAklEQVR4AewaftIAAAjySURBVO3BwZEbSRAEwcgy6K9y3ipwjUdzFigy3NMfSNICgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hIv/oAk/M3a8mlJOGnLJyXhnbbcSMJJW06S8ElteScJf7O23BgkaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkXv6At3ywJT0vCSVtuJOGkLTeS8LQknLTlSW35dm35Zkl40iBJSwyStMQgSUsMkrTEIElLDJK0xCBJS7z4Akl4UlueloSTtjypLTeS8GltuZGEG0k4actJEk7a8rQkPKktnzRI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hIv9CuScNKWk7acJOGkLSdtOUnCSVtuJeGkLSdtOUnCSVv03QZJWmKQpCUGSVpikKQlBklaYpCkJQZJWuKFfkVbntSWkyQ8KQnvtOWkLTeScCMJJ205aYueNUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEi++QFv+dkm40ZYnteXbJeGkLTeScJKEG215Wlv+ZoMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHiFyThX9eWkyTcSMJJW06ScNKWkyS805aTJJy05SQJJ2250ZaTJDwtCf+yQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKWSH+ga0n4pLZ8UhLeactJEjZri541SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtkf7gUhJO2nKShG/WlltJuNGWJyXhpC0nSbjVlpMkbNaWd5LwzdrySYMkLTFI0hKDJC0xSNISgyQtMUjSEoMkLZH+4MOScNKWG0k4acu3S8K/ri0nSThpy0kSTtrytCSctOVGEk7acpKEG225MUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEi9+QRJO2vJJSbjVlhtJOGnLjSQ8qS3vJOGkLX+zJLzTls3a8qRBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpZ48QvacpKEk7acJOGkLU9LwklbbiThpC032vJpSfiktpwk4WlJ+KQkfLNBkpYYJGmJQZKWGCRpiUGSlhgkaYlBkpZ48QuScNKWG225kYRbbXlSW06ScNKWkySctOUkCe+05UlJOEnCt2vLSRJutOVGEj5pkKQlBklaYpCkJQZJWmKQpCUGSVpikKQl0h98WBJO2nKShBtteVoSTtpyIwknbbmRhJO23ErCSVu+WRJO2vJOEk7a8s2ScNKWG4MkLTFI0hKDJC0xSNISgyQtMUjSEoMkLfHiD0jCjbbcaMuNJDytLTeScNKWT0rCO215UhJutOVJSdguCSdtedIgSUsMkrTEIElLDJK0xCBJSwyStMQgSUukP7iUhBttOUnCk9pyKwk32nIjCZ/Ulm+XhJO2nCThRlveScKNttxIwklbPmmQpCUGSVpikKQlBklaYpCkJQZJWmKQpCVe/IK2nCThRltOknCShG+XhBttuZGEkyS805YnJeGkLSdJOGnLSRJuteUkCSdJuNGWkySctOVJgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEukPdJSEd9pykoQbbTlJwpPacpKEd9pyIwknbTlJwpPacpKEW225kYRPasuNQZKWGCRpiUGSlhgkaYlBkpYYJGmJQZKWePEHJOGkLZ+UhBtteScJJ225kYSTtjwpCSdtuZWEk7acJOFGW24k4aQt7yThRhJutOWbDZK0xCBJSwyStMQgSUsMkrTEIElLDJK0RPqDD0vCjbboThKe1pYnJeFJbTlJwq223EjCN2vLjUGSlhgkaYlBkpYYJGmJQZKWGCRpiUGSlkh/cCkJT2rLjSTcaMs7SbjRlicl4aQtJ0k4acutJJy05UYSTtrypCS80xb9v0GSlhgkaYlBkpYYJGmJQZKWGCRpiUGSlnjxC9pyIwknbTlpy40k3GrLSRJutOWTkvBOW07aciMJN5Jwoy3bJeGkLSdJOGnLjUGSlhgkaYlBkpYYJGmJQZKWGCRpiUGSlnjxD0jC09rySUk4acuNttxKwklbTpJw0paTJJy05UYSTtryThJO2nIjCSdtOUnCSVueNEjSEoMkLTFI0hKDJC0xSNISgyQtMUjSEi8WaMtJEm605SQJ7yThpC032nKShBtJOGnLSRLeactJEm4k4UYSvl0STtpyIwk3knDSlhuDJC0xSNISgyQtMUjSEoMkLTFI0hKDJC3x4gsk4UZbbiTh09pykoSTtmzXlpMk3GjLSRJO2nKShJMkPC0JN9pyIwlPGiRpiUGSlhgkaYlBkpYYJGmJQZKWGCRpifQHupaEk7acJOGkLSdJuNGWpyXhpC0nSbjRlhtJuNGWpyXhk9rypEGSlhgkaYlBkpYYJGmJQZKWGCRpiUGSlhgkaYkXf0AS/mZteactN9rypLacJOHbteUkCTeScNKWkyTcSsJJW/5lgyQtMUjSEoMkLTFI0hKDJC0xSNISgyQt8eIXtOWbJeFWEm605SQJJ205ScJJW24k4VYSTtpy0pYbbTlJwtPaov83SNISgyQtMUjSEoMkLTFI0hKDJC0xSNISL75AEp7Ulk9ry422PCkJT2vLk5LwpLacJOEkCZ/Wls0GSVpikKQlBklaYpCkJQZJWmKQpCUGSVrihX5FEk7a8kltOUnCSVveScKNtpy0Zbu2nCThRhJutOUkCSdtuTFI0hKDJC0xSNISgyQtMUjSEoMkLTFI0hIv9CvaciMJ3ywJ77TlJAk3knDSlpMkPKktt9pyIwknbbnRlicNkrTEIElLDJK0xCBJSwyStMQgSUsMkrTEiy/Qlu3aciMJT2rLk9pyqy032nKShBtt+XZJuJGEk7Z80iBJSwyStMQgSUsMkrTEIElLDJK0xCBJS7z4BUn42yXhpC0nbTlJwjdLwq22fLMk3GjLrSSctOVGEk6ScNKWJw2StMQgSUsMkrTEIElLDJK0xCBJSwyStET6A0laYJCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCUGSVpikKQlBklaYpCkJQZJWmKQpCX+AwM7BG2c93NnAAAAAElFTkSuQmCC", "addr": "DPkA7XqoAu7T4aVYw4zUjQS5z3wAQgiPbr"}];
+// ── Support the developer: donation methods (shared by the popup + the opening splash) ──
+// DONATE_WALLETS (addresses / icons / QR images) is defined just above, generated verbatim
+// from the website's donate page so the two can never drift.
+function renderDonateWallets(container) {
+  if (!container) return;
+  container.innerHTML = DONATE_WALLETS.map((w, i) =>
+    '<div class="bx-wallet">' +
+      '<div class="bx-wallet-top">' +
+        '<span class="bx-wallet-icon">' + w.icon + '</span>' +
+        '<span class="bx-wallet-name" style="color:' + w.color + '">' + esc(w.coin) + '</span>' +
+      '</div>' +
+      '<div class="bx-wallet-body">' +
+        '<div class="bx-wallet-qr" data-qr="' + i + '" title="Click to enlarge"><img src="' + w.qr + '" alt="' + esc(w.coin) + ' QR"></div>' +
+        '<div class="bx-wallet-details">' +
+          '<div class="bx-wallet-addr">' + esc(w.addr) + '</div>' +
+          '<button class="bx-wallet-copy" data-copy="' + i + '">Copy address</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>').join("");
+  container.querySelectorAll(".bx-wallet-copy").forEach(b => b.onclick = () => {
+    const w = DONATE_WALLETS[+b.getAttribute("data-copy")];
+    copyText(w.addr);
+    b.textContent = "Copied!"; b.classList.add("copied");
+    setTimeout(() => { b.textContent = "Copy address"; b.classList.remove("copied"); }, 2000);
+  });
+  container.querySelectorAll(".bx-wallet-qr").forEach(q => q.onclick = () => {
+    const w = DONATE_WALLETS[+q.getAttribute("data-qr")];
+    bxQrZoom(w.qr, w.coin);
+  });
+}
+function bxQrZoom(src, label) {
+  $("bx-qr-zoom-img").src = src; $("bx-qr-zoom-label").textContent = label || "";
+  $("bx-qr-zoom").classList.add("open");
+}
+function openDonateModal() { renderDonateWallets($("donate-wallets")); $("donate-modal").classList.add("open"); }
+function closeDonateModal() { $("donate-modal").classList.remove("open"); }
+function showSplash() { renderDonateWallets($("splash-wallets")); $("splash-card").classList.add("open"); }
+function hideSplash() { $("splash-card").classList.remove("open"); }
+// The shell elements are static, so bind at script-eval like the other header controls.
+$("support-btn").onclick = openDonateModal;
+$("donate-cancel").onclick = closeDonateModal;
+$("donate-modal").addEventListener("click", e => { if (e.target === $("donate-modal")) closeDonateModal(); });
+$("splash-exit").onclick = hideSplash;
+$("bx-qr-zoom").onclick = () => $("bx-qr-zoom").classList.remove("open");
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if ($("bx-qr-zoom").classList.contains("open")) $("bx-qr-zoom").classList.remove("open");
+  else if ($("donate-modal").classList.contains("open")) closeDonateModal();
+  else if ($("splash-card").classList.contains("open")) hideSplash();
+});
+function copyText(t) {
+  if (navigator.clipboard) navigator.clipboard.writeText(t || "").then(() => toast("Copied."), () => toast("Copy failed."));
+  else toast("Clipboard unavailable here.");
+}
+function sendRawToRepeater(raw, url) { sendIssueToRepeater({ url: url, request: raw }); }
+async function bulkToRepeater(list) {
+  let n = 0;
+  for (const it of (list || [])) {
+    let target = ""; try { target = new URL(it.url).origin; } catch (e) {}
+    try { await fetch("/repeater/new", { method: "POST", body: JSON.stringify({ project: activeProject, request: it.raw || "", target }) }); n++; } catch (e) {}
+  }
+  document.querySelector('nav button[data-tab="repeater"]').click();
+  toast("Sent " + n + " to Repeater (" + n + " tab" + (n === 1 ? "" : "s") + ").");
+}
+function scanUrlWithNuclei(target) {
+  document.querySelector('nav button[data-tab="nuclei"]').click();
+  const t = $("nuc-target"); if (t) t.value = target || "";
+  toast("Target set in Nuclei \u2014 hit Run to scan.");
+}
+function scanHostWithNmap(host) {
+  document.querySelector('nav button[data-tab="network"]').click();
+  const t = $("net-target"); if (t) t.value = host || "";
+  toast("Target set in Network \u2014 pick a scan and hit Scan.");
+}
+function openInBrowser(url) {
+  document.querySelector('nav button[data-tab="browser"]').click();
+  const u = $("br-url"); if (u) u.value = url || "";
+  setTimeout(() => { try { brNavigate(); } catch (e) {} }, 200);
+}
+async function quickScopeAdd(host, exclude) {
+  if (!host) return;
+  const ep = exclude ? "/scope/exclude/add" : "/scope/add";
+  try { await fetch(ep, { method: "POST", body: JSON.stringify({ project: activeProject, text: host }) }); } catch (e) {}
+  toast(host + (exclude ? " excluded from scope." : " added to scope."));
+}
+function importHostsToMsf() {
+  document.querySelector('nav button[data-tab="metasploit"]').click();
+  setTimeout(() => { try { msfImport(); } catch (e) {} }, 180);
+}
+// ctx = { raw, url, response?, selection? [{raw,url}] }
+function routeReqMenu(ctx) {
+  ctx = ctx || {};
+  const raw = ctx.raw || "", url = ctx.url || "";
+  let host = "", origin = "";
+  try { const u = new URL(url); host = u.host; origin = u.origin; } catch (e) {}
+  const items = [{ label: "\u21e5 Send to Repeater", fn: () => sendRawToRepeater(raw, url) }];
+  if (ctx.selection && ctx.selection.length > 1)
+    items.push({ label: "\u21e5 Send " + ctx.selection.length + " selected to Repeater", fn: () => bulkToRepeater(ctx.selection) });
+  items.push({ label: "\u21e5 Send to AutoRepeater", fn: () => sendToAutoRepeater(raw, origin) });
+  items.push({ sep: true });
+  if (url) items.push({ label: "\u2316 Scan URL with Nuclei", fn: () => scanUrlWithNuclei(url) });
+  if (host) {
+    items.push({ label: "\u2295 Add host to scope", fn: () => quickScopeAdd(host, false) });
+    items.push({ label: "\u2298 Exclude host from scope", fn: () => quickScopeAdd(host, true) });
+  }
+  if (url) items.push({ label: "\u2197 Open URL in Browser", fn: () => openInBrowser(url) });
+  items.push({ sep: true });
+  items.push({ label: "\u29c9 Copy", items: [
+    { label: "Copy URL", fn: () => copyText(url) },
+    { label: "Copy as curl", fn: () => copyText(toCurlFromRaw(raw, url)) },
+    { label: "Copy request (raw)", fn: () => copyText(raw) },
+    { label: "Copy response (raw)", fn: () => copyText(ctx.response || "") },
+  ] });
+  return items;
+}
+function routeHostMenu(ctx) {
+  ctx = ctx || {};
+  const host = ctx.host || ctx.ip || "";
+  const asUrl = /^https?:\/\//.test(host) ? host : ("http://" + host);
+  return [
+    { label: "\u2316 Scan with nmap", fn: () => scanHostWithNmap(host) },
+    { label: "\u2316 Scan with Nuclei", fn: () => scanUrlWithNuclei(host) },
+    { label: "\u2630 Import into Metasploit", fn: importHostsToMsf },
+    { sep: true },
+    { label: "\u2295 Add to scope", fn: () => quickScopeAdd(host, false) },
+    { label: "\u2298 Exclude from scope", fn: () => quickScopeAdd(host, true) },
+    { label: "\u2197 Open in Browser", fn: () => openInBrowser(asUrl) },
+  ];
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideCtxMenu(); });
+// ── Site map module (host → path tree over the captured traffic) ──
+// ── Site map: collapsible, color-coded tree with a modular filter + arrange menu ──
+// Node color encodes HTTP-status significance (sig 0–5, server-side). `smExpanded[key]`
+// remembers open state; absent keys default to "open for the top level + first child
+// level" (smOpen). `smF` holds all filter + arrange state (persisted to localStorage).
+let smInited = false, smData = null, smView = [], smForce = false;
+const smExpanded = {};
+const SM_EMPTY = '<div class="net-empty">Nothing mapped yet. The site map is built by <b>Passive Scan</b> (light) and <b>Active Scan</b> (aggressive) \u2014 or just browse in the <b>Browser</b> / <b>HTTP</b> tabs. Click a node here to see its requests.</div>';
+const SM_KIND_LABEL = { doc: "doc", api: "api", script: "js", style: "css", image: "img", font: "font", other: "" };
+const SM_WRITE = /^(POST|PUT|DELETE|PATCH)$/;
+const SM_STATUS = ["1xx", "2xx", "3xx", "4xx", "5xx"];
+const SM_KINDS = ["doc", "api", "script", "style", "image", "font", "other"];
+// Full HTTP + WebDAV/extension method vocabulary, so any method is filterable even before
+// traffic uses it. Common verbs first, then WebDAV (RFC 4918), versioning (RFC 3253),
+// ACL/search/binding, CalDAV. Any non-standard method actually seen is appended (smAllMethods).
+const SM_ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+  "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK",
+  "VERSION-CONTROL", "REPORT", "CHECKOUT", "CHECKIN", "UNCHECKOUT", "MKWORKSPACE", "UPDATE",
+  "LABEL", "MERGE", "BASELINE-CONTROL", "MKACTIVITY",
+  "ORDERPATCH", "ACL", "SEARCH", "BIND", "UNBIND", "REBIND", "MKCALENDAR"];
+function smDefaultF() {
+  return { quick: "", statusOff: new Set(), methodsOff: new Set(), kindsOff: new Set(),
+    scopeIn: true, scopeOut: false, onlyParams: false, onlyErr: false,
+    code: "", path: "", host: "", mime: "", ext: "", sizeMin: "", sizeMax: "",
+    sort: "name", group: "host" };
+}
+let smF = smDefaultF();
+function smKey(host, path) { return host + "\u0000" + path; }
+function smOpen(key, depth) { return (key in smExpanded) ? smExpanded[key] : depth < 2; }
+function smStatusClass(st) {
+  if (st == null) return ""; const c = +st; if (isNaN(c)) return "";
+  return c >= 500 ? "5xx" : c >= 400 ? "4xx" : c >= 300 ? "3xx" : c >= 200 ? "2xx" : c >= 100 ? "1xx" : "";
+}
+function smApex(host) { const p = host.split("."); return p.length <= 2 ? host : p.slice(-2).join("."); }
+function smSub(host) { const p = host.split("."); return p.length <= 2 ? "(root)" : p.slice(0, -2).join("."); }
+function smExtOf(name) { const i = name.lastIndexOf("."); return i > 0 ? name.slice(i + 1).toLowerCase() : ""; }
+function smExtSet(str) {
+  const t = (str || "").split(",").map(x => x.trim().replace(/^\./, "").toLowerCase()).filter(Boolean);
+  return t.length ? new Set(t) : null;
+}
+// Free-text matcher: substring by default, /regex/ for regex, leading ! to negate. Invalid regex → matches all (no-op).
+function smTextPred(str) {
+  str = (str || "").trim(); if (!str) return null;
+  let neg = false;
+  if (str[0] === "!") { neg = true; str = str.slice(1).trim(); if (!str) return null; }
+  let base;
+  const rm = str.match(/^\/(.*)\/([a-z]*)$/);
+  if (rm) {
+    let re = null; try { re = new RegExp(rm[1], (rm[2] || "").includes("i") ? rm[2] : rm[2] + "i"); } catch (e) {}
+    base = re ? (s => re.test(s || "")) : (() => true);
+  } else { const low = str.toLowerCase(); base = s => (s || "").toLowerCase().includes(low); }
+  return neg ? (s => !base(s)) : base;
+}
+// Status-code matcher: comma-separated exact codes and lo-hi ranges.
+function smCodePred(str) {
+  str = (str || "").trim(); if (!str) return null;
+  const ranges = [];
+  for (let tok of str.split(",")) {
+    tok = tok.trim(); if (!tok) continue;
+    const m = tok.match(/^(\d{1,3})\s*-\s*(\d{1,3})$/);
+    if (m) ranges.push([+m[1], +m[2]]);
+    else if (/^\d{1,3}$/.test(tok)) ranges.push([+tok, +tok]);
+  }
+  if (!ranges.length) return null;
+  return code => { if (code == null) return false; const c = +code; return !isNaN(c) && ranges.some(([a, b]) => c >= a && c <= b); };
+}
+// Compile the current filter state into one predicate over an endpoint (leaf) node.
+function smCompile() {
+  const f = smF;
+  const codeP = smCodePred(f.code), pathP = smTextPred(f.path), hostP = smTextPred(f.host), mimeP = smTextPred(f.mime);
+  const extS = smExtSet(f.ext);
+  const smin = f.sizeMin !== "" && !isNaN(+f.sizeMin) ? +f.sizeMin : null;
+  const smax = f.sizeMax !== "" && !isNaN(+f.sizeMax) ? +f.sizeMax : null;
+  const quick = (f.quick || "").toLowerCase();
+  return function (n, host, path) {
+    const cls = smStatusClass(n.status);
+    if (cls && f.statusOff.has(cls)) return false;
+    if (f.methodsOff.size && n.methods && n.methods.length && n.methods.every(m => f.methodsOff.has(m))) return false;
+    if (n.kind && f.kindsOff.has(n.kind)) return false;
+    if (!(f.scopeIn && f.scopeOut)) { if (n.in_scope && !f.scopeIn) return false; if (!n.in_scope && !f.scopeOut) return false; }
+    if (f.onlyParams && !n.params) return false;
+    if (f.onlyErr && !(+n.status >= 400)) return false;
+    if (codeP && !codeP(n.status)) return false;
+    if (pathP && !pathP(path)) return false;
+    if (hostP && !hostP(host)) return false;
+    if (mimeP && !mimeP(n.mime || "")) return false;
+    if (extS && !extS.has(smExtOf(n.name || ""))) return false;
+    if (smin != null && (n.bytes || 0) < smin) return false;
+    if (smax != null && (n.bytes || 0) > smax) return false;
+    if (quick && !((path || "").toLowerCase().includes(quick) || (host || "").toLowerCase().includes(quick))) return false;
+    return true;
+  };
+}
+function smAnyText() { const f = smF; return !!(f.quick || f.code || f.path || f.host || f.mime || f.ext || f.sizeMin || f.sizeMax); }
+// Filter one host into an annotated copy: every kept node gets _host/_path, and
+// _pass marks whether it is itself a passing endpoint (vs. kept only as scaffolding).
+function smBuildHost(h, pass) {
+  function rec(n, isHost) {
+    const path = isHost ? "" : (rec._prefix + "/" + n.name);
+    const savedPrefix = rec._prefix; rec._prefix = path;
+    const keptKids = [];
+    for (const c of (n.children || [])) { const k = rec(c, false); if (k) keptKids.push(k); }
+    rec._prefix = savedPrefix;
+    const selfOk = !!n.leaf && pass(n, h.host, path);
+    if (!selfOk && !keptKids.length) return null;
+    return Object.assign({}, n, { _host: h.host, _path: path, _pass: selfOk, children: keptKids });
+  }
+  rec._prefix = "";
+  return rec(h, true);
+}
+function smFilteredHosts(pass) { const out = []; for (const h of (smData || [])) { const k = smBuildHost(h, pass); if (k) out.push(k); } return out; }
+function smFlatten(fh) { const out = []; const walk = n => { if (n._pass) out.push(n); (n.children || []).forEach(walk); }; fh.forEach(walk); return out; }
+function smAllMethods() {
+  const seen = new Set(); const walk = n => { (n.methods || []).forEach(m => seen.add(m)); (n.children || []).forEach(walk); };
+  (smData || []).forEach(walk);
+  const extra = [...seen].filter(m => SM_ALL_METHODS.indexOf(m) < 0).sort();
+  return SM_ALL_METHODS.concat(extra);
+}
+function smCmp() {
+  const s = smF.sort;
+  if (s === "count") return (a, b) => (b.count || 0) - (a.count || 0) || smNm(a).localeCompare(smNm(b));
+  if (s === "sig") return (a, b) => (b.sig || 0) - (a.sig || 0) || (b.count || 0) - (a.count || 0);
+  if (s === "recent") return (a, b) => (b.last_ts || 0) - (a.last_ts || 0) || smNm(a).localeCompare(smNm(b));
+  return (a, b) => (smDir(a) - smDir(b)) || smNm(a).localeCompare(smNm(b));   // name: folders first, then alpha
+}
+function smNm(n) { return (n._path || n.name || n.host || n.label || "").toLowerCase(); }
+function smDir(n) { return (n.children && n.children.length) ? 0 : 1; }
+function smLeafCmp() {
+  const s = smF.sort;
+  if (s === "count") return (a, b) => (b.count || 0) - (a.count || 0) || (a._host + a._path).localeCompare(b._host + b._path);
+  if (s === "sig") return (a, b) => (b.sig || 0) - (a.sig || 0) || (b.count || 0) - (a.count || 0);
+  if (s === "recent") return (a, b) => (b.last_ts || 0) - (a.last_ts || 0);
+  return (a, b) => (a._host + a._path).localeCompare(b._host + b._path);
+}
+// Build the top-level compartments for the chosen Group-by mode.
+function smCompartments(fh) {
+  const g = smF.group;
+  if (g === "host") return fh.map(h => ({ key: "host\u0000" + h.host, label: h.host, navHost: h.host,
+    sig: h.sig || 0, count: h.count || 0, in_scope: !!h.in_scope, last_ts: h.last_ts || 0, flat: false, nodes: h.children || [] }));
+  if (g === "domain" || g === "subdomain") {
+    const keyf = g === "domain" ? smApex : smSub, by = {};
+    for (const h of fh) { const k = keyf(h.host); (by[k] = by[k] || []).push(h); }
+    return Object.keys(by).map(k => {
+      const mem = by[k];
+      const kids = mem.map(h => Object.assign({}, h, { name: h.host, _host: h.host, _path: "" }));
+      return { key: g + "\u0000" + k, label: k, navHost: null,
+        sig: Math.max(0, ...mem.map(m => m.sig || 0)), count: mem.reduce((s, m) => s + (m.count || 0), 0),
+        in_scope: mem.some(m => m.in_scope), last_ts: Math.max(0, ...mem.map(m => m.last_ts || 0)),
+        flat: false, nodes: kids, badge: mem.length + " host" + (mem.length > 1 ? "s" : "") };
+    });
+  }
+  const leaves = smFlatten(fh), by = {}, add = (k, n) => (by[k] = by[k] || []).push(n);
+  for (const n of leaves) {
+    if (g === "type") add(n.kind || "other", n);
+    else if (g === "status") add(smStatusClass(n.status) || "none", n);
+    else (n.methods && n.methods.length ? n.methods : ["none"]).forEach(m => add(m, n));
+  }
+  return Object.keys(by).map(k => {
+    const mem = by[k];
+    return { key: g + "\u0000" + k, label: g === "type" ? (SM_KIND_LABEL[k] || k) : k, navHost: null,
+      sig: Math.max(0, ...mem.map(m => m.sig || 0)), count: mem.reduce((s, m) => s + (m.count || 0), 0),
+      in_scope: mem.some(m => m.in_scope), last_ts: Math.max(0, ...mem.map(m => m.last_ts || 0)),
+      flat: true, nodes: mem.slice().sort(smLeafCmp()), badge: mem.length + " endpoint" + (mem.length > 1 ? "s" : "") };
+  });
+}
+// Badges beside a node: method chips, kind tag, ? (params), status pill, scope dot.
+function smBadges(n) {
+  let b = "";
+  if (n.leaf && n.methods) for (const m of n.methods.slice(0, 3)) b += '<span class="sm-m' + (SM_WRITE.test(m) ? " w" : "") + '">' + esc(m) + '</span>';
+  const kl = n.leaf ? SM_KIND_LABEL[n.kind] : "";
+  if (kl) { const kc = (n.kind === "api" || n.kind === "doc" || n.kind === "script") ? " " + n.kind : ""; b += '<span class="sm-kind' + kc + '">' + kl + '</span>'; }
+  if (n.params) b += '<span class="sm-q" title="query parameters observed here">?</span>';
+  if (n.status != null) b += '<span class="sm-pill">' + esc(String(n.status)) + '</span>';
+  if (n.in_scope) b += '<span class="sm-scope" title="in scope"></span>';
+  return b;
+}
+function smNodeRow(n, dir) {
+  // Folder that is also an endpoint: flag when something worse lives inside it.
+  const warn = (dir && (n.dsig || 0) > (n.sig || 0)) ? '<i class="sm-dwarn w' + n.dsig + '" title="more significant responses inside"></i>' : "";
+  return '<div class="sm-row sig' + (n.sig || 0) + (dir ? " dir" : "") + '" data-host="' + esc(n._host) + '" data-path="' + esc(n._path) + '">' +
+    '<span class="sm-tw' + (dir ? "" : " leaf") + '"></span><span class="sm-dot">' + warn + '</span>' +
+    '<span class="sm-seg">' + esc(n.name) + '</span>' + smBadges(n) + '<span class="sm-count">' + n.count + '</span></div>';
+}
+function smEndpointRow(n) {
+  return '<div class="sm-row sig' + (n.sig || 0) + '" data-host="' + esc(n._host) + '" data-path="' + esc(n._path) + '">' +
+    '<span class="sm-tw leaf"></span><span class="sm-dot"></span>' +
+    '<span class="sm-ep-host">' + esc(n._host) + '</span><span class="sm-seg">' + esc(n._path || "/") + '</span>' +
+    smBadges(n) + '<span class="sm-count">' + n.count + '</span></div>';
+}
+function smRenderNodes(nodes, depth) {
+  return (nodes || []).slice().sort(smCmp()).map(n => {
+    const key = smKey(n._host, n._path), dir = !!(n.children && n.children.length), open = smForce || smOpen(key, depth);
+    const row = smNodeRow(n, dir);
+    if (!dir) return '<div class="sm-node" data-k="' + esc(key) + '">' + row + '</div>';
+    return '<div class="sm-node' + (open ? "" : " collapsed") + '" data-k="' + esc(key) + '">' + row +
+      '<div class="sm-kids"><div class="sm-kids-inner">' + smRenderNodes(n.children, depth + 1) + '</div></div></div>';
+  }).join("");
+}
+function smRenderCompartment(c) {
+  const open = smForce || smOpen(c.key, 0);
+  const body = c.flat ? c.nodes.map(smEndpointRow).join("") : smRenderNodes(c.nodes, 1);
+  const nameAttr = c.navHost != null ? ' data-host="' + esc(c.navHost) + '" title="view this host\'s requests"' : "";
+  return '<div class="sm-host' + (open ? "" : " collapsed") + '" data-k="' + esc(c.key) + '">' +
+    '<div class="sm-host-hd sig' + (c.sig || 0) + '">' +
+    '<span class="sm-tw"></span><span class="sm-dot"></span>' +
+    '<span class="sm-host-name"' + nameAttr + '>' + esc(c.label) + '</span>' +
+    (c.badge ? '<span class="sm-ghint">' + esc(c.badge) + '</span>' : "") +
+    (c.in_scope ? '<span class="sm-scope" title="in scope"></span>' : "") +
+    '<span class="sm-count">' + c.count + '</span></div>' +
+    '<div class="sm-host-kids"><div class="sm-kids-inner sm-host-body">' + body + '</div></div></div>';
+}
+function smRender() {
+  const box = $("sm-tree");
+  smUpdateBadge(); smSyncScopeChk();
+  if (!smData || !smData.length) { box.innerHTML = SM_EMPTY; $("sm-status").innerHTML = ""; return; }
+  const pass = smCompile(), fh = smFilteredHosts(pass), shown = smFlatten(fh).length;
+  let cmps = smCompartments(fh).sort(smCmp());
+  smView = cmps;
+  const active = smActiveCount() > 0 || smAnyText();
+  $("sm-status").innerHTML = '<span class="dim">' + smData.length + ' host(s) · ' + shown + ' endpoint(s)' + (active ? " shown" : "") + '</span>';
+  if (!cmps.length) { box.innerHTML = '<div class="net-empty">Nothing matches the current filters. <a href="#" id="sm-clear-link">Clear</a></div>'; const a = $("sm-clear-link"); if (a) a.onclick = e => { e.preventDefault(); smResetF(); }; return; }
+  smForce = smAnyText();
+  box.innerHTML = cmps.map(smRenderCompartment).join("");
+  smForce = false;
+  smWire(box);
+}
+function smToggle(el) { if (el) smExpanded[el.getAttribute("data-k")] = (el.classList.toggle("collapsed") === false); }
+function smNavigate(host, path) {
+  httpSiteFilter = { host: host, path: path || "" };
+  document.querySelector('nav button[data-tab="http"]').click();
+  renderHttpList();
+}
+function smWire(box) {
+  box.querySelectorAll(".sm-host-hd").forEach(hd => hd.onclick = () => smToggle(hd.closest(".sm-host")));
+  box.querySelectorAll(".sm-host-name[data-host]").forEach(nm => {
+    nm.onclick = e => { e.stopPropagation(); smNavigate(nm.getAttribute("data-host"), ""); };
+    nm.oncontextmenu = e => { e.preventDefault(); e.stopPropagation(); const h = nm.getAttribute("data-host"); showCtxMenu(e.clientX, e.clientY, routeHostMenu({ host: h, ip: h })); };
+  });
+  box.querySelectorAll(".sm-row").forEach(r => {
+    r.onclick = () => {
+      box.querySelectorAll(".sm-row.sel").forEach(x => x.classList.remove("sel"));
+      r.classList.add("sel"); smNavigate(r.getAttribute("data-host"), r.getAttribute("data-path"));
+    };
+    r.oncontextmenu = e => {
+      e.preventDefault();
+      const host = r.getAttribute("data-host") || "", path = r.getAttribute("data-path") || "";
+      if (path) showCtxMenu(e.clientX, e.clientY, routeReqMenu({ raw: "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\n\r\n", url: "https://" + host + path }));
+      else showCtxMenu(e.clientX, e.clientY, routeHostMenu({ host: host, ip: host }));
+    };
+  });
+  box.querySelectorAll(".sm-row .sm-tw:not(.leaf)").forEach(tw => tw.onclick = e => { e.stopPropagation(); smToggle(tw.closest(".sm-node")); });
+}
+function smSetAll(open) {
+  const walk = nodes => (nodes || []).forEach(n => { if (n.children && n.children.length) { smExpanded[smKey(n._host, n._path)] = open; walk(n.children); } });
+  for (const c of (smView || [])) { smExpanded[c.key] = open; if (!c.flat) walk(c.nodes); }
+  smRender();
+}
+// ── Filter + arrange panel ──
+function smActiveCount() {
+  const f = smF; let c = 0;
+  if (f.statusOff.size) c++; if (f.methodsOff.size) c++; if (f.kindsOff.size) c++;
+  if (!(f.scopeIn && !f.scopeOut)) c++;
+  if (f.onlyParams) c++; if (f.onlyErr) c++;
+  ["code", "path", "host", "mime", "ext", "sizeMin", "sizeMax"].forEach(k => { if (f[k]) c++; });
+  return c;
+}
+function smUpdateBadge() { const b = $("sm-filt-badge"); if (!b) return; const n = smActiveCount(); b.textContent = n ? String(n) : ""; b.classList.toggle("on", n > 0); }
+function smSyncScopeChk() { const c = $("sm-scope-only"); if (c) c.checked = smF.scopeIn && !smF.scopeOut; }
+function smChip(fac, val, off, label) { return '<button class="sm-fchip' + (off.has(val) ? "" : " on") + '" data-fac="' + fac + '" data-val="' + esc(val) + '">' + esc(label || val) + '</button>'; }
+function smH(t, hint, ex) { return ' data-hint-t="' + escAttr(t) + '" data-hint="' + escAttr(hint) + '"' + (ex ? ' data-ex="' + escAttr(ex) + '"' : ""); }
+function smSeg(attr, val, cur, label) { return '<button class="sm-seg-b' + (val === cur ? " on" : "") + '" data-' + attr + '="' + val + '">' + label + '</button>'; }
+function smBuildPanel() {
+  const f = smF;
+  const sec = (title, hintEl, body) => '<section class="sm-sec"><div class="sm-sec-h"><span class="sm-sec-l">' + title + '</span>' + (hintEl || "") + '</div>' + body + '</section>';
+  const allnone = fac => '<span class="sm-allnone"><button data-all="' + fac + '" data-v="1">all</button><button data-all="' + fac + '" data-v="0">none</button></span>';
+  const statusChips = SM_STATUS.map(s => smChip("status", s, f.statusOff)).join("");
+  const kindChips = SM_KINDS.map(k => smChip("kind", k, f.kindsOff, SM_KIND_LABEL[k] || k)).join("");
+  const methodChips = (smAllMethods().length ? smAllMethods() : ["GET"]).map(m => smChip("method", m, f.methodsOff)).join("");
+  const scopeChips = '<button class="sm-fchip' + (f.scopeIn ? " on" : "") + '" data-scope="in">in scope</button>' +
+    '<button class="sm-fchip' + (f.scopeOut ? " on" : "") + '" data-scope="out">out of scope</button>';
+  const tog = (k, label, hint) => '<label class="sm-ftog"' + smH(label, hint) + '><input type="checkbox" data-attr="' + k + '"' + (f[k] ? " checked" : "") + '> ' + label + '</label>';
+  const fld = (k, title, hint, ex, ph) => '<div class="sm-fld"' + smH(title, hint, ex) + '><span class="sm-fld-l">' + title + '</span>' +
+    '<input class="sm-fin" data-txt="' + k + '" spellcheck="false" placeholder="' + (ph || "") + '" value="' + escAttr(f[k]) + '"></div>';
+  const sizeFld = '<div class="sm-fld"' + smH("Response size (bytes)", "Keep endpoints whose largest response is within these byte bounds. Leave a box blank for no bound.", "min 0   max 2048") + '>' +
+    '<span class="sm-fld-l">Size</span><input class="sm-fin sm-fin-sz" data-txt="sizeMin" spellcheck="false" placeholder="min" value="' + escAttr(f.sizeMin) + '">' +
+    '<span class="sm-fld-dash">–</span><input class="sm-fin sm-fin-sz" data-txt="sizeMax" spellcheck="false" placeholder="max" value="' + escAttr(f.sizeMax) + '"></div>';
+  const q = c => '<span class="sm-pan-q"' + c + '>?</span>';
+  const panel =
+    '<div class="sm-pan-hd"><span>Filter &amp; arrange</span><button class="sm-pan-reset" id="sm-pan-reset">Reset all</button></div>' +
+    '<div class="sm-pan-body">' +
+    sec('Status' + allnone("status"), q(smH("Status class", "Show responses in the checked status classes; uncheck one to hide it.")), '<div class="sm-chips">' + statusChips + '</div>') +
+    sec('Method' + allnone("method"), q(smH("Request method", "Show endpoints that use any checked HTTP method.")), '<div class="sm-chips">' + methodChips + '</div>') +
+    sec('Type' + allnone("kind"), q(smH("Resource type", "Show endpoints of the checked resource types (doc = HTML page, api = JSON/XHR, js/css/img/font = assets).")), '<div class="sm-chips">' + kindChips + '</div>') +
+    sec('Scope', q(smH("Scope", "In scope / out of scope is decided by your project's scope rules. Check both to show everything.")), '<div class="sm-chips">' + scopeChips + '</div>') +
+    sec('Attributes', "", '<div class="sm-togs">' + tog("onlyParams", "only with query params", "Show only endpoints seen with a ?query string — the usual injection surface.") + tog("onlyErr", "only errors (4xx/5xx)", "Show only endpoints whose status code is 400 or above.") + '</div>') +
+    sec('Advanced match', q(smH("Advanced match", "Text fields combine with everything above (AND). Hover any field for its exact format.")),
+      fld("code", "Status code", "Exact codes or lo-hi ranges, comma-separated.", "403      401,403      400-499", "e.g. 400-499") +
+      fld("path", "Path", "Substring by default. Wrap in /…/ for a regex. Prefix with ! to exclude.", "/api/      /\\.php$/      !/static/", "substring, /regex/, !exclude") +
+      fld("host", "Host", "Same syntax as Path, matched against the host name.", "api.      /\\.acme\\.test$/      !cdn.", "substring, /regex/, !exclude") +
+      fld("mime", "MIME", "Substring of the response Content-Type.", "json      text/html      javascript", "substring of Content-Type") +
+      fld("ext", "Extension", "Comma-separated list, no dots. Blank = any.", "js,json      php,asp      css,map", "e.g. js,json,php") +
+      sizeFld) +
+    sec('Sort', q(smH("Sort", "Orders groups and the rows inside each one.")), '<div class="sm-segs">' +
+      smSeg("sort", "name", f.sort, "Name") + smSeg("sort", "count", f.sort, "Count") + smSeg("sort", "sig", f.sort, "Significance") + smSeg("sort", "recent", f.sort, "Recent") + '</div>') +
+    sec('Group by', q(smH("Group by", "Host / Domain / Subdomain keep the path tree. Type / Method / Status flatten everything into endpoint lists by that facet.")), '<div class="sm-segs">' +
+      smSeg("group", "host", f.group, "Host") + smSeg("group", "domain", f.group, "Domain") + smSeg("group", "subdomain", f.group, "Subdomain") +
+      smSeg("group", "type", f.group, "Type") + smSeg("group", "method", f.group, "Method") + smSeg("group", "status", f.group, "Status") + '</div>') +
+    '</div>';
+  $("sm-filters").innerHTML = panel;
+}
+function smResetF() { smF = smDefaultF(); $("sm-filter").value = ""; smBuildPanel(); smSaveF(); smRender(); }
+function smShowHint(el) {
+  const hint = el.getAttribute("data-hint"); if (!hint) return;
+  const t = $("sm-hint");
+  t.innerHTML = '<div class="sm-hint-t">' + esc(el.getAttribute("data-hint-t") || "") + '</div><div class="sm-hint-b">' + esc(hint) + '</div>' +
+    (el.getAttribute("data-ex") ? '<div class="sm-hint-ex">' + esc(el.getAttribute("data-ex")) + '</div>' : "");
+  t.style.display = "block";
+  const z = uiZoom(), r = el.getBoundingClientRect(), tw = t.offsetWidth, vw = window.innerWidth / z;
+  let left = r.left / z; if (left + tw > vw) left = Math.max(6, vw - tw - 6);
+  t.style.left = Math.round(left) + "px"; t.style.top = Math.round(r.bottom / z + 6) + "px";
+}
+function smHideHint() { const t = $("sm-hint"); if (t) t.style.display = "none"; }
+function smSaveF() {
+  try {
+    localStorage.setItem("beatrix.sm.filters", JSON.stringify({
+      statusOff: [...smF.statusOff], methodsOff: [...smF.methodsOff], kindsOff: [...smF.kindsOff],
+      scopeIn: smF.scopeIn, scopeOut: smF.scopeOut, onlyParams: smF.onlyParams, onlyErr: smF.onlyErr,
+      code: smF.code, path: smF.path, host: smF.host, mime: smF.mime, ext: smF.ext, sizeMin: smF.sizeMin, sizeMax: smF.sizeMax,
+      sort: smF.sort, group: smF.group
+    }));
+  } catch (e) {}
+}
+function smLoadF() {
+  try {
+    const j = JSON.parse(localStorage.getItem("beatrix.sm.filters") || "null"); if (!j) return;
+    smF.statusOff = new Set(j.statusOff || []); smF.methodsOff = new Set(j.methodsOff || []); smF.kindsOff = new Set(j.kindsOff || []);
+    Object.assign(smF, { scopeIn: j.scopeIn !== false, scopeOut: !!j.scopeOut, onlyParams: !!j.onlyParams, onlyErr: !!j.onlyErr,
+      code: j.code || "", path: j.path || "", host: j.host || "", mime: j.mime || "", ext: j.ext || "", sizeMin: j.sizeMin || "", sizeMax: j.sizeMax || "",
+      sort: j.sort || "name", group: j.group || "host" });
+  } catch (e) {}
+}
+function initSitemap() {
+  if (smInited) return; smInited = true;
+  smLoadF();
+  $("sm-refresh").onclick = () => loadSitemapFor(activeProject);
+  $("sm-scope-only").onchange = () => { smF.scopeOut = !$("sm-scope-only").checked; smF.scopeIn = true; smBuildPanel(); smSaveF(); smRender(); };
+  $("sm-expand").onclick = () => smSetAll(true);
+  $("sm-collapse").onclick = () => smSetAll(false);
+  $("sm-filter").addEventListener("input", () => { smF.quick = $("sm-filter").value.trim(); smRender(); });
+  // Filters popover (reuses the rep-gear lifecycle: toggle → place → outside-click/Esc closes).
+  const btn = $("sm-filt-btn"), pop = $("sm-filters");
+  btn.onclick = e => { e.stopPropagation(); const open = pop.classList.toggle("open"); if (open) { smBuildPanel(); placeFixedUnder(pop, btn); } };
+  pop.onclick = e => e.stopPropagation();
+  document.addEventListener("click", () => pop.classList.remove("open"));
+  document.addEventListener("keydown", e => { if (e.key === "Escape") { pop.classList.remove("open"); smHideHint(); } });
+  // One set of delegated handlers on the panel (survives innerHTML rebuilds).
+  pop.addEventListener("click", e => {
+    const chip = e.target.closest(".sm-fchip"), all = e.target.closest("[data-all]"), seg = e.target.closest(".sm-seg-b"), rst = e.target.closest("#sm-pan-reset");
+    if (rst) return smResetF();
+    if (chip) {
+      if (chip.dataset.scope) { if (chip.dataset.scope === "in") smF.scopeIn = !smF.scopeIn; else smF.scopeOut = !smF.scopeOut; chip.classList.toggle("on"); }
+      else { const off = { status: smF.statusOff, method: smF.methodsOff, kind: smF.kindsOff }[chip.dataset.fac]; const v = chip.dataset.val; if (off.has(v)) off.delete(v); else off.add(v); chip.classList.toggle("on"); }
+      smSaveF(); smRender(); return;
+    }
+    if (all) { const fac = all.dataset.all, on = all.dataset.v === "1"; const off = { status: smF.statusOff, method: smF.methodsOff, kind: smF.kindsOff }[fac]; const vals = fac === "status" ? SM_STATUS : fac === "kind" ? SM_KINDS : smAllMethods(); off.clear(); if (!on) vals.forEach(v => off.add(v)); smBuildPanel(); smSaveF(); smRender(); return; }
+    if (seg) { if (seg.dataset.sort) smF.sort = seg.dataset.sort; else if (seg.dataset.group) smF.group = seg.dataset.group; pop.querySelectorAll(".sm-seg-b").forEach(x => { if ((seg.dataset.sort && x.dataset.sort) || (seg.dataset.group && x.dataset.group)) x.classList.toggle("on", x === seg); }); smSaveF(); smRender(); return; }
+  });
+  pop.addEventListener("input", e => {
+    const inp = e.target.closest(".sm-fin");
+    if (inp) { smF[inp.dataset.txt] = inp.value.trim(); smSaveF(); smRender(); return; }
+    const chk = e.target.closest("input[data-attr]");
+    if (chk) { smF[chk.dataset.attr] = chk.checked; smSaveF(); smRender(); }
+  });
+  // Rich hover/focus tooltips for every field and section info icon.
+  const hintFrom = e => { const el = e.target.closest("[data-hint]"); if (el) smShowHint(el); else smHideHint(); };
+  pop.addEventListener("mouseover", hintFrom);
+  pop.addEventListener("focusin", hintFrom);
+  pop.addEventListener("mouseout", e => { if (!e.relatedTarget || !pop.contains(e.relatedTarget)) smHideHint(); });
+  pop.addEventListener("focusout", smHideHint);
+}
+async function loadSitemapFor(pid) {
+  if (pid === null) return; initSitemap();
+  let d;
+  try { d = await (await fetch("/http/sitemap?scope=0&project=" + pid)).json(); }
+  catch (e) { return; }
+  if (pid !== activeProject) return;
+  smData = d.hosts || [];
+  smRender();
+}
+// ── Packets pane (Wireshark-style viewer + scapy crafter/console) ──
+let pkInited = false, pkCaptures = [], pkCurrentCap = null, pkPackets = [],
+    pkCapturing = false, pkCapSince = 0, pkCapTimer = null, pkEnv = {};
+// Crafter recipe state: the chosen recipe, a packet picked in the Viewer for
+// the replay editor, and the last-selected viewer packet's dissection.
+let pkRecipe = null, pkResendCtx = null, pkSelDetail = null;
+
+function pkFillSelect(sel, items, selected) {
+  sel.innerHTML = "";
+  for (const it of items) {
+    const o = document.createElement("option");
+    o.value = it.v; o.textContent = it.t;
+    if (String(it.v) === String(selected)) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+function initPackets() {
+  if (pkInited) return; pkInited = true;
+  $("pk-open").onclick = () => $("pk-file").click();
+  $("pk-file").onchange = pkOpenFile;
+  $("pk-capstart").onclick = startCapture;
+  $("pk-capstop").onclick = stopCapture;
+  $("pk-capture").onchange = () => { const v = $("pk-capture").value; if (v) { pkCurrentCap = v; loadCapture(v); } };
+  $("pk-filter").addEventListener("keydown", e => {
+    if (e.key === "Enter" && pkCurrentCap && !pkCapturing) loadCapture(pkCurrentCap);
+  });
+  document.querySelectorAll("#pane-packets .pk-subtabs button").forEach(b =>
+    b.onclick = () => pkShowSubtab(b.getAttribute("data-pk")));
+  fillRecipes();
+  $("pk-recipe").onchange = onRecipeChange;
+  $("pk-recipe-scapy").onclick = pkEditAsScapy;
+  $("pk-resend-btn").onclick = () => { if (pkSelDetail) pkOpenResend(pkSelDetail.n); };
+  $("pk-craft-send").onclick = craftSend;
+  $("pk-con-run").onclick = conRun;
+  $("pk-con-in").addEventListener("keydown", e => { if (e.key === "Enter") conRun(); });
+  $("pk-export").onclick = pkExport;
+  $("pk-stream-btn").onclick = () => { if (pkSelDetail) pkFollowStream(pkSelDetail.n); };
+  $("pk-stream-close").onclick = closeStream;
+}
+function pkShowSubtab(name) {
+  document.querySelectorAll("#pane-packets .pk-subtabs button").forEach(b =>
+    b.classList.toggle("active", b.getAttribute("data-pk") === name));
+  document.querySelectorAll("#pane-packets .pk-pane").forEach(p =>
+    p.classList.toggle("active", p.id === "pk-" + name));
+  if (name === "stats") loadStats();
+}
+async function loadPacketsFor(pid) {
+  if (pid === null) return; initPackets();
+  try {
+    const env = await (await fetch("/packets/env?project=" + pid)).json();
+    if (pid !== activeProject) return;
+    pkEnv = env;
+    const ifs = (env.interfaces || ["lo"]).map(i => ({ v: i, t: i }));
+    pkFillSelect($("pk-iface"), ifs, (env.interfaces || [])[0]);
+    pkFillSelect($("pk-craft-iface"), ifs, (env.interfaces || [])[0]);
+    pkRenderCaptures(env.captures || []);
+    $("pk-capstart").disabled = !env.can_capture;
+    if (!env.can_capture) {
+      $("pk-status").innerHTML = '<span class="dim">live capture needs passwordless sudo — opening a pcap still works</span>';
+    }
+  } catch (e) {}
+}
+function pkRenderCaptures(caps) {
+  pkCaptures = caps;
+  const sel = $("pk-capture"); sel.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = ""; def.textContent = caps.length ? "— open capture —" : "— no captures —";
+  sel.appendChild(def);
+  for (const c of caps) {
+    const o = document.createElement("option");
+    o.value = c.id; o.textContent = (c.name || ("capture " + c.id)) + " (" + (c.packets || 0) + " pkts · " + c.source + ")";
+    sel.appendChild(o);
+  }
+  if (pkCurrentCap) sel.value = String(pkCurrentCap);
+}
+async function pkRefreshCaptures() {
+  try {
+    const env = await (await fetch("/packets/env?project=" + activeProject)).json();
+    pkRenderCaptures(env.captures || []);
+  } catch (e) {}
+}
+function pkB64(buf) {
+  let bin = ""; const bytes = new Uint8Array(buf), chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(bin);
+}
+function pkOpenFile() {
+  const f = $("pk-file").files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = async () => {
+    $("pk-status").innerHTML = '<span class="dim">uploading…</span>';
+    const d = await (await fetch("/packets/upload", { method: "POST", body: JSON.stringify({
+      project: activeProject, name: f.name, data: pkB64(rd.result) }) })).json();
+    if (!d.ok) { $("pk-status").innerHTML = '<span class="bad">' + esc(d.error || "upload failed") + '</span>'; return; }
+    await pkRefreshCaptures();
+    pkCurrentCap = d.capture_id; $("pk-capture").value = String(d.capture_id);
+    loadCapture(d.capture_id);
+  };
+  rd.readAsArrayBuffer(f);
+  $("pk-file").value = "";
+}
+async function loadCapture(cid) {
+  pkCurrentCap = cid;
+  const flt = encodeURIComponent($("pk-filter").value.trim());
+  const d = await (await fetch("/packets/list?id=" + cid + "&filter=" + flt + "&project=" + activeProject)).json();
+  if (d.error) { $("pk-status").innerHTML = '<span class="bad">' + esc(d.error) + '</span>'; return; }
+  renderPkList(d.packets || []);
+  $("pk-tree").innerHTML = ""; $("pk-hex").textContent = ""; closeStream();
+  if ($("pk-stats").classList.contains("active")) loadStats();
+  $("pk-status").innerHTML = '<span class="dim">' + d.total + ' packets' + (d.truncated ? " (capped)" : "") + '</span>';
+}
+function pkFmtBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(2) + " MB";
+}
+function closeStream() { const s = $("pk-stream"); if (s) s.hidden = true; }
+async function pkFollowStream(n) {
+  if (!pkCurrentCap) return;
+  const box = $("pk-stream"), body = $("pk-stream-body");
+  box.hidden = false; body.textContent = "following…";
+  let d;
+  try { d = await (await fetch("/packets/stream?id=" + pkCurrentCap + "&n=" + n + "&project=" + activeProject)).json(); }
+  catch (e) { body.textContent = "stream failed"; return; }
+  if (d.error) {
+    $("pk-stream-title").textContent = ""; $("pk-stream-legend").textContent = "";
+    body.innerHTML = '<div class="net-empty">' + esc(d.error) + '</div>'; return;
+  }
+  $("pk-stream-title").textContent = d.proto.toUpperCase() + "  " + d.client + "  ↔  " + d.server + "   (" + d.packets + " pkts)";
+  $("pk-stream-legend").innerHTML = '<span class="c">■ client→server</span>  <span class="s">■ server→client</span>';
+  if (!d.segments.length) { body.innerHTML = '<div class="net-empty">No payload in this stream (control packets only).</div>'; return; }
+  body.innerHTML = d.segments.map(seg =>
+    '<span class="pk-stream-seg ' + esc(seg.dir) + '">' + esc(seg.text) + '</span>').join("");
+}
+async function loadStats() {
+  const body = $("pk-stats-body");
+  if (!pkCurrentCap) { body.innerHTML = '<div class="net-empty">Open a capture first.</div>'; return; }
+  body.innerHTML = '<div class="net-empty">computing…</div>';
+  let d;
+  try { d = await (await fetch("/packets/stats?id=" + pkCurrentCap + "&project=" + activeProject)).json(); }
+  catch (e) { body.innerHTML = '<div class="net-empty">stats failed</div>'; return; }
+  if (d.error) { body.innerHTML = '<div class="net-empty">' + esc(d.error) + '</div>'; return; }
+  renderStats(d);
+}
+function renderStats(d) {
+  const protoRows = d.protocols.map(p =>
+    '<tr><td>' + esc(p.name) + '</td><td class="num">' + p.packets + '</td><td class="num">' + pkFmtBytes(p.bytes) + '</td></tr>').join("");
+  const convRows = d.conversations.map(c =>
+    '<tr><td>' + esc(c.proto) + '</td><td>' + esc(c.a) + '</td><td>' + esc(c.b) + '</td><td class="num">' + c.packets + '</td><td class="num">' + pkFmtBytes(c.bytes) + '</td></tr>').join("");
+  const endRows = d.endpoints.map(e =>
+    '<tr><td>' + esc(e.ip) + '</td><td class="num">' + e.packets + '</td><td class="num">' + pkFmtBytes(e.bytes) + '</td></tr>').join("");
+  $("pk-stats-body").innerHTML =
+    '<div class="dim" style="font-size:12px">' + d.total_packets + ' packets · ' + pkFmtBytes(d.total_bytes) + '</div>' +
+    '<h4>Protocols</h4><table class="pk-stats"><thead><tr><th>Protocol</th><th>Packets</th><th>Bytes</th></tr></thead><tbody>' + protoRows + '</tbody></table>' +
+    '<h4>Conversations</h4><table class="pk-stats"><thead><tr><th>Proto</th><th>Endpoint A</th><th>Endpoint B</th><th>Packets</th><th>Bytes</th></tr></thead><tbody>' + convRows + '</tbody></table>' +
+    '<h4>Endpoints</h4><table class="pk-stats"><thead><tr><th>Address</th><th>Packets</th><th>Bytes</th></tr></thead><tbody>' + endRows + '</tbody></table>';
+}
+async function pkExport() {
+  if (!pkCurrentCap) { $("pk-status").innerHTML = '<span class="dim">open a capture first</span>'; return; }
+  const flt = encodeURIComponent($("pk-filter").value.trim());
+  $("pk-status").innerHTML = '<span class="dim">exporting…</span>';
+  let d;
+  try { d = await (await fetch("/packets/export?id=" + pkCurrentCap + "&filter=" + flt + "&project=" + activeProject)).json(); }
+  catch (e) { $("pk-status").innerHTML = '<span class="bad">export failed</span>'; return; }
+  if (!d.ok) { $("pk-status").innerHTML = '<span class="bad">' + esc(d.error || "export failed") + '</span>'; return; }
+  const bin = atob(d.b64), arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([arr], { type: "application/vnd.tcpdump.pcap" }));
+  const a = document.createElement("a"); a.href = url; a.download = d.filename; a.click();
+  URL.revokeObjectURL(url);
+  $("pk-status").innerHTML = '<span class="dim">exported ' + d.written + ' of ' + d.total + ' packets</span>';
+}
+function renderPkList(packets) {
+  pkPackets = packets;
+  const box = $("pk-list");
+  if (!packets.length) {
+    box.innerHTML = '<div class="net-empty">No packets' + ($("pk-filter").value.trim() ? " match the filter." : ".") + '</div>';
+    return;
+  }
+  const rows = packets.map(p =>
+    '<tr class="pk-row proto-' + esc(p.proto) + '" data-n="' + p.no + '">' +
+    '<td>' + p.no + '</td><td>' + (p.time || 0).toFixed(4) + '</td><td>' + esc(p.src) + '</td>' +
+    '<td>' + esc(p.dst) + '</td><td class="pk-proto">' + esc(p.proto) + '</td>' +
+    '<td>' + p.length + '</td><td class="pk-info">' + esc(p.info) + '</td></tr>').join("");
+  box.innerHTML = '<table class="pk-tbl"><thead><tr><th>#</th><th>Time</th><th>Source</th>' +
+    '<th>Destination</th><th>Proto</th><th>Len</th><th>Info</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  box.querySelectorAll("tr.pk-row").forEach(r => r.onclick = () => {
+    box.querySelectorAll("tr.pk-row").forEach(x => x.classList.remove("active"));
+    r.classList.add("active"); pkDetail(parseInt(r.getAttribute("data-n")));
+  });
+}
+async function pkDetail(n) {
+  const d = await (await fetch("/packets/detail?id=" + pkCurrentCap + "&n=" + n + "&project=" + activeProject)).json();
+  const det = d.detail;
+  const bar = $("pk-detailbar");
+  if (!det) { $("pk-tree").innerHTML = '<div class="net-empty">no detail</div>'; $("pk-hex").textContent = ""; pkSelDetail = null; if (bar) bar.hidden = true; return; }
+  pkSelDetail = { n: n, layers: det.layers };      // remembered for the replay editor
+  renderPkTree(det.layers, $("pk-tree")); $("pk-hex").textContent = det.hex || "";
+  if (bar) bar.hidden = false;
+}
+function renderPkTree(layers, box) {
+  box.innerHTML = (layers || []).map(l =>
+    '<details open><summary>' + esc(l.name) + '</summary>' +
+    Object.entries(l.fields || {}).map(([k, v]) =>
+      '<div class="pk-field"><span class="pk-fname">' + esc(k) + '</span> = ' +
+      '<span class="pk-fval">' + esc(v === null ? "∅" : String(v)) + '</span></div>').join("") +
+    '</details>').join("");
+}
+async function startCapture() {
+  const iface = $("pk-iface").value, filter = $("pk-filter").value.trim();
+  const d = await (await fetch("/packets/capture/start", { method: "POST", body: JSON.stringify({
+    project: activeProject, iface, filter }) })).json();
+  if (!d.ok) { $("pk-status").innerHTML = '<span class="bad">' + esc(d.error || "capture failed") + '</span>'; return; }
+  pkCurrentCap = d.capture_id; pkPackets = []; pkCapSince = 0; pkCapturing = true;
+  $("pk-list").innerHTML = ""; $("pk-tree").innerHTML = ""; $("pk-hex").textContent = "";
+  $("pk-capstart").disabled = true; $("pk-capstop").disabled = false;
+  $("pk-status").innerHTML = '<span class="dim">capturing on ' + esc(iface || "default") + '…</span>';
+  clearInterval(pkCapTimer); pkCapTimer = setInterval(pollCapture, 700); pollCapture();
+}
+async function pollCapture() {
+  let d;
+  try { d = await (await fetch("/packets/capture/events?since=" + pkCapSince + "&project=" + activeProject)).json(); }
+  catch (e) { return; }
+  let added = false;
+  for (const ev of (d.events || [])) {
+    pkCapSince = Math.max(pkCapSince, ev.seq);
+    if (ev.type === "packet" && ev.detail) { pkPackets.push(ev.detail); added = true; }
+  }
+  if (added) renderPkList(pkPackets);
+  if (d.done) {
+    clearInterval(pkCapTimer); pkCapTimer = null; pkCapturing = false;
+    $("pk-capstart").disabled = !pkEnv.can_capture; $("pk-capstop").disabled = true;
+    $("pk-status").innerHTML = '<span class="dim">' + pkPackets.length + ' packets captured</span>';
+    pkRefreshCaptures();
+  }
+}
+async function stopCapture() {
+  await fetch("/packets/capture/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+}
+// ── Crafter: guided packet recipes ──────────────────────────────────────────
+// A recipe turns plain-English fields into a real packet. "spec" recipes build
+// a structured, allowlisted spec (no eval) and read the reply into a plain
+// verdict; "raw" is the full scapy expression for advanced users; "traceroute"
+// and "resend" use their own endpoints. The point: a newcomer picks a recipe
+// and fills blanks; the exact scapy is shown so they can learn and graduate to
+// the raw box and the Console.
+const PK_FLAGS = [["S", "SYN"], ["A", "ACK"], ["F", "FIN"], ["R", "RST"], ["P", "PSH"], ["U", "URG"]];
+const PK_PRESETS = [
+  { label: "ICMP echo", expr: 'IP(dst="127.0.0.1")/ICMP()' },
+  { label: "TCP SYN", expr: 'IP(dst="127.0.0.1")/TCP(dport=80,flags="S")' },
+  { label: "DNS query", expr: 'IP(dst="8.8.8.8")/UDP(dport=53)/DNS(rd=1,qd=DNSQR(qname="example.com"))' },
+  { label: "ARP who-has", expr: 'Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="192.168.1.1")' },
+];
+function pkQ(v) { return '"' + String(v).replace(/"/g, '\\"') + '"'; }
+function pkVerdict(cls, text) { return { cls: cls, text: text }; }
+function pkFindLayer(reply, name) { return reply && (reply.layers || []).find(l => l.name === name); }
+
+function pingVerdict(reply) {
+  if (!reply) return pkVerdict("warn", "No reply — the host may be down, or it's set to ignore pings (common on servers and firewalls).");
+  const icmp = pkFindLayer(reply, "ICMP"); const ty = icmp ? Number(icmp.fields.type) : null;
+  if (ty === 0) return pkVerdict("ok", "Host is ALIVE — it answered the ping (ICMP echo-reply).");
+  if (ty === 3) return pkVerdict("bad", "Unreachable — the network returned an ICMP 'destination unreachable'.");
+  if (ty === 11) return pkVerdict("warn", "A router reported the TTL expired on the way (ICMP time-exceeded).");
+  return pkVerdict("ok", "Got a reply — see the layers below.");
+}
+function tcpVerdict(reply) {
+  if (!reply) return pkVerdict("warn", "No reply — the port is most likely FILTERED (a firewall silently dropped the probe), or the host is down.");
+  const t = pkFindLayer(reply, "TCP"); const f = t ? String(t.fields.flags || "") : "";
+  if (f.indexOf("R") >= 0) return pkVerdict("bad", "Port CLOSED — the host answered with a RST (nothing is listening there).");
+  if (f.indexOf("S") >= 0 && f.indexOf("A") >= 0) return pkVerdict("ok", "Port OPEN — got a SYN-ACK (a service is listening and accepted the handshake).");
+  const icmp = pkFindLayer(reply, "ICMP");
+  if (icmp) return pkVerdict("warn", "Filtered — an ICMP error came back instead of a TCP reply (type " + icmp.fields.type + ").");
+  return pkVerdict("ok", "Got a reply, but not a clear open/closed signal — see the layers below.");
+}
+function udpVerdict(reply) {
+  if (!reply) return pkVerdict("warn", "No reply — with UDP, 'open' and 'filtered' look the same. The port may be open but silent, or filtered.");
+  const icmp = pkFindLayer(reply, "ICMP");
+  if (icmp) {
+    const ty = Number(icmp.fields.type), code = Number(icmp.fields.code);
+    if (ty === 3 && code === 3) return pkVerdict("bad", "Port CLOSED — the host replied ICMP 'port unreachable'.");
+    return pkVerdict("warn", "An ICMP error came back (type " + ty + " code " + code + ") — likely filtered.");
+  }
+  if (pkFindLayer(reply, "UDP")) return pkVerdict("ok", "Port OPEN — a UDP response came back from the service.");
+  return pkVerdict("ok", "Got a reply — see the layers below.");
+}
+function arpVerdict(reply) {
+  if (!reply) return pkVerdict("warn", "No reply — that IP isn't answering ARP here (not present, or you're not on the same LAN segment).");
+  const a = pkFindLayer(reply, "ARP");
+  if (a && Number(a.fields.op) === 2) return pkVerdict("ok", "Host is on the LAN — its MAC address is " + String(a.fields.hwsrc) + ".");
+  return pkVerdict("ok", "Got an ARP reply — see the layers below.");
+}
+function dnsVerdict(reply) {
+  if (!reply) return pkVerdict("warn", "No reply — the DNS server didn't answer (unreachable, or UDP/53 is blocked).");
+  const d = pkFindLayer(reply, "DNS");
+  if (!d) return pkVerdict("warn", "The reply wasn't DNS — see the layers below.");
+  const n = Number(d.fields.ancount || 0);
+  if (n > 0) return pkVerdict("ok", "Resolved — the server returned " + n + " answer" + (n === 1 ? "" : "s") + ". The records are in the DNS layer below (the 'an' field).");
+  return pkVerdict("warn", "The server answered with 0 records (rcode " + String(d.fields.rcode) + ") — the name may not exist, or has no record of that type.");
+}
+function genericVerdict(reply) {
+  if (!reply) return pkVerdict("dim", "No reply (or the mode was send-only).");
+  return pkVerdict("ok", "Got a reply — see the layers below.");
+}
+
+const PK_RECIPES = [
+  { id: "ping", cat: "Reachability", kind: "spec", mode: "sr1",
+    label: "Ping a host  (is it alive?)",
+    desc: "Sends an ICMP echo request — the classic “are you there?” probe.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", ph: "IP or hostname", req: true, hint: "Who to ping. Hostnames are resolved for you." }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.host } }, { name: "ICMP", fields: {} }] }),
+    scapy: f => "IP(dst=" + pkQ(f.host) + ")/ICMP()",
+    verdict: pingVerdict },
+  { id: "tcp-port", cat: "TCP", kind: "spec", mode: "sr1",
+    label: "Check a TCP port  (SYN)",
+    desc: "Sends a lone SYN — the first step of the TCP handshake — and reads what comes back. This is exactly how a SYN (“half-open”) scan decides whether a port is open.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Port", type: "num", def: 80, hint: "The TCP port to test (e.g. 80, 443, 22)." }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.host } }, { name: "TCP", fields: { dport: +f.port, flags: "S" } }] }),
+    scapy: f => "IP(dst=" + pkQ(f.host) + ")/TCP(dport=" + (+f.port) + ',flags="S")',
+    verdict: tcpVerdict },
+  { id: "tcp-custom", cat: "TCP", kind: "spec", mode: "sr1",
+    label: "Custom TCP packet  (pick the flags)",
+    desc: "Build a TCP segment by hand — choose the flags, ports and sequence number. Great for seeing how different flag combinations get answered (SYN, bare ACK, FIN/Xmas…).",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Dest port", type: "num", def: 80 },
+             { k: "sport", label: "Source port", type: "num", def: "", ph: "(optional)", hint: "Leave blank to let scapy choose." },
+             { k: "flags", label: "TCP flags", type: "flags", def: "S", hint: "SYN opens a handshake; a bare ACK probes firewalls; FIN+PSH+URG is an “Xmas” packet." },
+             { k: "seq", label: "Seq number", type: "num", def: "", ph: "(optional)" }],
+    build: f => { const tf = { dport: +f.port, flags: f.flags || "S" }; if (f.sport !== "" && f.sport != null) tf.sport = +f.sport; if (f.seq !== "" && f.seq != null) tf.seq = +f.seq; return { layers: [{ name: "IP", fields: { dst: f.host } }, { name: "TCP", fields: tf }] }; },
+    scapy: f => { let a = "dport=" + (+f.port) + ",flags=" + pkQ(f.flags || "S"); if (f.sport !== "" && f.sport != null) a = "sport=" + (+f.sport) + "," + a; if (f.seq !== "" && f.seq != null) a += ",seq=" + (+f.seq); return "IP(dst=" + pkQ(f.host) + ")/TCP(" + a + ")"; },
+    verdict: tcpVerdict },
+  { id: "udp", cat: "UDP", kind: "spec", mode: "sr1",
+    label: "UDP probe",
+    desc: "Sends a UDP datagram, optionally with a payload. UDP has no handshake, so a closed port usually answers with an ICMP “port unreachable”, while an open one may reply or stay silent.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Port", type: "num", def: 53 },
+             { k: "payload", label: "Payload", type: "text", def: "", ph: "(optional text)", hint: "Bytes to include. Many UDP services only reply to a well-formed request." }],
+    build: f => { const ls = [{ name: "IP", fields: { dst: f.host } }, { name: "UDP", fields: { dport: +f.port } }]; if (f.payload) ls.push({ name: "Raw", fields: { load: f.payload } }); return { layers: ls }; },
+    scapy: f => "IP(dst=" + pkQ(f.host) + ")/UDP(dport=" + (+f.port) + ")" + (f.payload ? "/Raw(load=" + pkQ(f.payload) + ")" : ""),
+    verdict: udpVerdict },
+  { id: "dns", cat: "DNS", kind: "spec", mode: "sr1",
+    label: "DNS lookup  (query a name server)",
+    desc: "Asks a DNS server to resolve a name — building a real DNS query (UDP/53) so you can see the raw question and answer records.",
+    fields: [{ k: "server", label: "DNS server", type: "text", def: "8.8.8.8", req: true, hint: "Which resolver to ask (8.8.8.8 = Google, 1.1.1.1 = Cloudflare)." },
+             { k: "name", label: "Name to look up", type: "text", def: "example.com", req: true },
+             { k: "type", label: "Record type", type: "select", def: "A", options: [["A", "A (IPv4)"], ["AAAA", "AAAA (IPv6)"], ["MX", "MX (mail)"], ["TXT", "TXT"], ["NS", "NS (name servers)"], ["CNAME", "CNAME (alias)"], ["SOA", "SOA"], ["PTR", "PTR (reverse)"]] }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.server } }, { name: "UDP", fields: { dport: 53 } }, { name: "DNS", fields: { rd: 1, qd: { _layer: "DNSQR", fields: { qname: f.name, qtype: f.type || "A" } } } }] }),
+    scapy: f => "IP(dst=" + pkQ(f.server) + ")/UDP(dport=53)/DNS(rd=1,qd=DNSQR(qname=" + pkQ(f.name) + ",qtype=" + pkQ(f.type || "A") + "))",
+    verdict: dnsVerdict },
+  { id: "arp", cat: "Layer 2 (LAN)", kind: "spec", mode: "sr1",
+    label: "ARP who-has  (find a host on your LAN)",
+    desc: "Broadcasts “who has this IP?” on the local network and reads the MAC that answers. Only works for hosts on your own layer-2 segment (not across routers).",
+    fields: [{ k: "host", label: "Target IP (on your LAN)", type: "text", def: "", ph: "e.g. 192.168.1.1", req: true, hint: "Must be an IP on the same network segment as you." }],
+    build: f => ({ layers: [{ name: "Ether", fields: { dst: "ff:ff:ff:ff:ff:ff" } }, { name: "ARP", fields: { pdst: f.host } }] }),
+    scapy: f => 'Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=' + pkQ(f.host) + ")",
+    verdict: arpVerdict },
+  { id: "traceroute", cat: "Path", kind: "traceroute", mode: "sr1",
+    label: "Traceroute  (map the path to a host)",
+    desc: "Sends probes with an increasing TTL, so each router on the way answers in turn — revealing the hops between you and the target. TCP mode gets through more firewalls than classic ICMP.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "8.8.8.8", req: true },
+             { k: "proto", label: "Probe type", type: "select", def: "tcp", options: [["tcp", "TCP SYN (firewall-friendly)"], ["icmp", "ICMP (classic ping-style)"], ["udp", "UDP"]] },
+             { k: "dport", label: "Port", type: "num", def: 80, hint: "Destination port for TCP/UDP probes (ignored for ICMP)." },
+             { k: "maxttl", label: "Max hops", type: "num", def: 20, hint: "Stop after this many hops (1–30)." }],
+    scapy: f => "sr(IP(dst=" + pkQ(f.host) + ",ttl=(1," + (+f.maxttl || 20) + "))/" + (f.proto === "icmp" ? "ICMP()" : (f.proto === "udp" ? "UDP(dport=" + (+f.dport) + ")" : "TCP(dport=" + (+f.dport) + ',flags="S")')) + ")" },
+  { id: "ttl", cat: "Firewall analysis", kind: "spec", mode: "sr1",
+    label: "TTL probe  (set the IP time-to-live)",
+    desc: "Sends a TCP SYN with a chosen IP TTL. Seeing which TTLs get a reply helps locate a filtering hop, or craft a packet that expires just past a firewall.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Port", type: "num", def: 80 },
+             { k: "ttl", label: "IP TTL", type: "num", def: 64, hint: "Hops before the packet is dropped (1–255)." }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.host, ttl: +f.ttl || 64 } }, { name: "TCP", fields: { dport: +f.port, flags: "S" } }] }),
+    scapy: f => "IP(dst=" + pkQ(f.host) + ",ttl=" + (+f.ttl || 64) + ")/TCP(dport=" + (+f.port) + ',flags="S")',
+    verdict: tcpVerdict },
+  { id: "sport", cat: "Firewall analysis", kind: "spec", mode: "sr1",
+    label: "Source-port probe  (weak-ACL bypass)",
+    desc: "Sends a SYN from a chosen SOURCE port. Firewalls that trust common server source ports (53 DNS, 88 Kerberos, 20 FTP-data) may let it through — if a filtered port suddenly answers, that's a reportable ACL weakness.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Dest port", type: "num", def: 80 },
+             { k: "sport", label: "Source port", type: "num", def: 53, hint: "Try 53 (DNS), 88 (Kerberos), 20 (FTP-data), 67 (DHCP)." }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.host } }, { name: "TCP", fields: { sport: +f.sport || 53, dport: +f.port, flags: "S" } }] }),
+    scapy: f => "IP(dst=" + pkQ(f.host) + ")/TCP(sport=" + (+f.sport || 53) + ",dport=" + (+f.port) + ',flags="S")',
+    verdict: tcpVerdict },
+  { id: "fragment", cat: "Firewall analysis", kind: "spec", mode: "sr1", fragment: true,
+    label: "Fragmented SYN  (IP reassembly test)",
+    desc: "Splits a TCP SYN across tiny IP fragments. A firewall that forwards fragments without reassembling may pass a SYN to a port it would otherwise block — a reportable misconfig. A reply means the target reassembled and answered.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "127.0.0.1", req: true },
+             { k: "port", label: "Port", type: "num", def: 80 },
+             { k: "fragsize", label: "Fragment size", type: "num", def: 8, hint: "Bytes per IP fragment — 8 splits the TCP header (use multiples of 8)." }],
+    build: f => ({ layers: [{ name: "IP", fields: { dst: f.host } }, { name: "TCP", fields: { dport: +f.port, flags: "S" } }] }),
+    scapy: f => "fragment(IP(dst=" + pkQ(f.host) + ")/TCP(dport=" + (+f.port) + ',flags="S"), fragsize=' + (+f.fragsize || 8) + ")",
+    verdict: tcpVerdict },
+  { id: "tls", cat: "TLS", kind: "tls", mode: "sr1",
+    label: "TLS probe  (version + certificate)",
+    desc: "Opens a TLS connection and reads back the negotiated protocol version, cipher, and the server certificate (subject, issuer, validity, SANs). Unprivileged — no root needed.",
+    fields: [{ k: "host", label: "Target host", type: "text", def: "example.com", req: true },
+             { k: "port", label: "Port", type: "num", def: 443, hint: "The TLS port (443 HTTPS, 8443, 993 IMAPS, …)." }],
+    verdict: genericVerdict },
+  { id: "resend", cat: "Advanced", kind: "resend", mode: "sr1",
+    label: "Resend / edit a captured packet",
+    desc: "Take a packet from the Viewer, tweak a field or two, and fire it back out. Open the Viewer, click a packet, then hit “Resend ✎” — or pick a packet there and come back.",
+    verdict: genericVerdict },
+  { id: "raw", cat: "Advanced", kind: "raw", mode: "sr1",
+    label: "Raw scapy expression  (advanced)",
+    desc: "Type any scapy expression. It's evaluated as scapy Python in this project's root worker — the same power as the Console, but with reply parsing and the verdict/trees below.",
+    verdict: genericVerdict },
+];
+
+function pkRecipeById(id) { return PK_RECIPES.find(r => r.id === id) || PK_RECIPES[0]; }
+function fillRecipes() {
+  const sel = $("pk-recipe"); sel.innerHTML = "";
+  const cats = {}; PK_RECIPES.forEach(r => (cats[r.cat] = cats[r.cat] || []).push(r));
+  for (const c of Object.keys(cats)) {
+    const og = document.createElement("optgroup"); og.label = c;
+    cats[c].forEach(r => { const o = document.createElement("option"); o.value = r.id; o.textContent = r.label; og.appendChild(o); });
+    sel.appendChild(og);
+  }
+  pkRecipe = PK_RECIPES[0]; sel.value = pkRecipe.id; renderRecipeFields();
+}
+function onRecipeChange() { pkRecipe = pkRecipeById($("pk-recipe").value); pkResendCtx = null; renderRecipeFields(); }
+function pkFieldHtml(f) {
+  const id = "pkf-" + f.k; let ctrl;
+  if (f.type === "select") {
+    ctrl = '<select id="' + id + '">' + f.options.map(o =>
+      '<option value="' + esc(o[0]) + '"' + (String(o[0]) === String(f.def) ? " selected" : "") + ">" + esc(o[1]) + "</option>").join("") + "</select>";
+  } else if (f.type === "flags") {
+    const cur = String(f.def || "");
+    ctrl = '<span class="pk-flagset">' + PK_FLAGS.map(fl =>
+      '<label class="pk-flag"><input type="checkbox" data-flag="' + fl[0] + '"' + (cur.indexOf(fl[0]) >= 0 ? " checked" : "") + "> " + fl[0] +
+      '<span class="pk-flagname">' + fl[1] + "</span></label>").join("") + "</span>";
+  } else {
+    const t = (f.type === "num") ? "number" : "text";
+    ctrl = '<input id="' + id + '" type="' + t + '" value="' + esc(f.def === undefined ? "" : String(f.def)) + '" placeholder="' + esc(f.ph || "") + '" spellcheck="false">';
+  }
+  return '<div class="pk-field-row"><label class="pk-field-label" for="' + id + '">' + esc(f.label) + '</label>' +
+    '<div class="pk-field-ctrl">' + ctrl + (f.hint ? '<div class="pk-field-hint">' + esc(f.hint) + "</div>" : "") + "</div></div>";
+}
+function pkRawFieldsHtml() {
+  return '<div class="pk-craftrow pk-rawpresets"><span class="net-cmdlabel">quick-fill</span>' +
+    PK_PRESETS.map(p => '<button class="pk-preset" data-expr="' + esc(p.expr) + '">' + esc(p.label) + "</button>").join("") + "</div>" +
+    '<div class="pk-craftrow"><input id="pk-craft-expr" type="text" spellcheck="false" placeholder="scapy expression — e.g. IP(dst=&quot;127.0.0.1&quot;)/TCP(dport=80,flags=&quot;S&quot;)"></div>';
+}
+function renderRecipeFields() {
+  const r = pkRecipe, fc = $("pk-recipe-fields");
+  $("pk-recipe-desc").innerHTML = esc(r.desc);
+  if (r.kind === "raw") fc.innerHTML = pkRawFieldsHtml();
+  else if (r.kind === "resend") renderResendFields();
+  else fc.innerHTML = (r.fields || []).map(pkFieldHtml).join("");
+  const isTrace = r.kind === "traceroute";
+  $("pk-craft-mode").closest("label").style.display = isTrace ? "none" : "";
+  $("pk-craft-save").closest("label").style.display = isTrace ? "none" : "";
+  if (!isTrace) $("pk-craft-mode").value = r.mode || "sr1";
+  $("pk-craft-timeout").value = isTrace ? 1 : 3;
+  $("pk-recipe-scapy").style.display = (r.kind === "spec") ? "" : "none";
+  // live scapy preview + conveniences
+  fc.querySelectorAll("input, select").forEach(e => { e.oninput = updateScapyPreview; e.onchange = updateScapyPreview; });
+  fc.querySelectorAll("input").forEach(e => e.addEventListener("keydown", ev => { if (ev.key === "Enter") craftSend(); }));
+  if (r.kind === "raw") fc.querySelectorAll(".pk-preset").forEach(b =>
+    b.onclick = () => { const i = $("pk-craft-expr"); if (i) i.value = b.getAttribute("data-expr"); });
+  updateScapyPreview();
+}
+function readRecipeFields() {
+  const r = pkRecipe, out = {};
+  for (const f of (r.fields || [])) {
+    if (f.type === "flags") {
+      let s = ""; document.querySelectorAll("#pk-recipe-fields .pk-flag input[data-flag]").forEach(cb => { if (cb.checked) s += cb.getAttribute("data-flag"); });
+      out[f.k] = s;
+    } else { const e = $("pkf-" + f.k); out[f.k] = e ? e.value.trim() : f.def; }
+  }
+  return out;
+}
+function updateScapyPreview() {
+  const r = pkRecipe, box = $("pk-scapy-preview");
+  if (!r.scapy || r.kind === "raw" || r.kind === "resend") { box.hidden = true; return; }
+  let s = ""; try { s = r.scapy(readRecipeFields()); } catch (e) { s = ""; }
+  box.hidden = !s;
+  box.innerHTML = s ? '<span class="pk-scapy-label">builds</span> <code>' + esc(s) + "</code>" : "";
+}
+function pkEditAsScapy() {
+  if (pkRecipe.kind !== "spec") return;
+  let expr = ""; try { expr = pkRecipe.scapy(readRecipeFields()); } catch (e) { expr = ""; }
+  $("pk-recipe").value = "raw"; onRecipeChange();
+  const i = $("pk-craft-expr"); if (i) i.value = expr;
+}
+
+// ── replay editor ──
+function renderResendFields() {
+  const fc = $("pk-recipe-fields");
+  if (!pkResendCtx || !pkSelDetail) {
+    fc.innerHTML = '<div class="pk-field-hint pk-resend-hint">Open the <b>Viewer</b>, click a packet, then hit <b>Resend ✎</b> to load it here for editing.</div>';
+    return;
+  }
+  const L = name => (pkSelDetail.layers || []).find(l => l.name === name);
+  const ip = L("IP"), tcp = L("TCP"), udp = L("UDP"), raw = L("Raw");
+  const row = (k, label, val) => '<div class="pk-field-row"><label class="pk-field-label">' + esc(label) +
+    '</label><div class="pk-field-ctrl"><input id="pkr-' + k + '" type="text" value="' + esc(val == null ? "" : String(val)) + '" spellcheck="false"></div></div>';
+  let html = '<div class="pk-field-hint pk-resend-hint">Editing packet #' + pkResendCtx.index +
+    ' from the current capture. Blank = keep the original. Lengths &amp; checksums are recomputed for you.</div>';
+  if (ip) { html += row("IP.dst", "IP dst", ip.fields.dst) + row("IP.src", "IP src", ip.fields.src); }
+  if (tcp) { html += row("TCP.dport", "TCP dport", tcp.fields.dport) + row("TCP.sport", "TCP sport", tcp.fields.sport) + row("TCP.flags", "TCP flags", tcp.fields.flags); }
+  if (udp) { html += row("UDP.dport", "UDP dport", udp.fields.dport) + row("UDP.sport", "UDP sport", udp.fields.sport); }
+  if (raw) { html += row("Raw.load", "Payload", raw.fields.load); }
+  if (!ip && !tcp && !udp && !raw) html += '<div class="pk-field-hint">This packet has no editable IP/TCP/UDP/Raw fields.</div>';
+  fc.innerHTML = html;
+}
+function readResendOverrides() {
+  const ov = {}, get = id => { const e = $("pkr-" + id); return e ? e.value.trim() : ""; };
+  const put = (layer, field, val, asNum) => { if (val === "") return; ov[layer] = ov[layer] || {}; ov[layer][field] = asNum ? (+val) : val; };
+  put("IP", "dst", get("IP.dst")); put("IP", "src", get("IP.src"));
+  put("TCP", "dport", get("TCP.dport"), true); put("TCP", "sport", get("TCP.sport"), true); put("TCP", "flags", get("TCP.flags"));
+  put("UDP", "dport", get("UDP.dport"), true); put("UDP", "sport", get("UDP.sport"), true);
+  put("Raw", "load", get("Raw.load"));
+  return ov;
+}
+function pkOpenResend(n) {
+  if (!pkSelDetail) return;
+  pkResendCtx = { capture_id: pkCurrentCap, index: n };
+  pkRecipe = pkRecipeById("resend"); $("pk-recipe").value = "resend";
+  renderRecipeFields();
+  pkShowSubtab("crafter");
+}
+
+// ── send + render ──
+function pkCraftStatus(cls, msg) { $("pk-craft-status").innerHTML = '<span class="' + cls + '">' + esc(msg) + "</span>"; }
+function showVerdict(v) { const el = $("pk-verdict"); el.hidden = false; el.className = "pk-verdict pk-v-" + (v.cls || "dim"); el.textContent = v.text; }
+function renderSentReply(d, mode) {
+  const out = $("pk-craft-out"); out.innerHTML = "";
+  const block = (title, pkt) => {
+    const div = document.createElement("div"); div.className = "net-dsec";
+    const h = document.createElement("h4"); h.textContent = title + " — " + (pkt.summary || ""); div.appendChild(h);
+    const t = document.createElement("div"); renderPkTree(pkt.layers, t); div.appendChild(t); out.appendChild(div);
+  };
+  if (d.sent) block("Sent", d.sent);
+  if (d.reply) block("Reply", d.reply);
+  else if (mode === "sr1") out.insertAdjacentHTML("beforeend", '<div class="net-empty">No reply received.</div>');
+}
+async function craftSend() {
+  const r = pkRecipe;
+  if (r.kind === "traceroute") return runTraceroute();
+  if (r.kind === "tls") return runTlsProbe();
+  const mode = $("pk-craft-mode").value, iface = $("pk-craft-iface").value;
+  const timeout = parseInt($("pk-craft-timeout").value, 10) || 3;
+  const save = $("pk-craft-save").checked;
+  const body = { project: activeProject, mode: mode, iface: iface, timeout: timeout };
+  let endpoint = "/scapy/send";
+  if (r.kind === "resend") {
+    // For /scapy/resend, capture_id is the SOURCE packet's capture; the save
+    // target (if any) is out_capture_id — the two must not be conflated.
+    if (!pkResendCtx) { pkCraftStatus("bad", "pick a packet in the Viewer first"); return; }
+    endpoint = "/scapy/resend";
+    body.capture_id = pkResendCtx.capture_id; body.index = pkResendCtx.index;
+    body.overrides = readResendOverrides();
+    if (save && pkCurrentCap) body.out_capture_id = pkCurrentCap;
+  } else if (r.kind === "raw") {
+    const i = $("pk-craft-expr"), expr = i ? i.value.trim() : "";
+    if (!expr) { pkCraftStatus("bad", "enter a scapy expression"); return; }
+    body.expr = expr;
+    if (save && pkCurrentCap) body.capture_id = pkCurrentCap;   // scapy_send: capture_id is the save target
+  } else {
+    const f = readRecipeFields();
+    for (const x of (r.fields || [])) if (x.req && !f[x.k]) { pkCraftStatus("bad", "enter the " + x.label.toLowerCase()); return; }
+    let spec; try { spec = r.build(f); } catch (e) { pkCraftStatus("bad", "check the fields"); return; }
+    body.spec = spec;
+    if (r.fragment) body.fragsize = parseInt(f.fragsize, 10) || 8;   // IP fragmentation test
+    if (save && pkCurrentCap) body.capture_id = pkCurrentCap;   // scapy_send: capture_id is the save target
+  }
+  pkCraftStatus("dim", "sending…"); $("pk-verdict").hidden = true; $("pk-craft-out").innerHTML = "";
+  let d;
+  try { d = await (await fetch(endpoint, { method: "POST", body: JSON.stringify(body) })).json(); }
+  catch (e) { pkCraftStatus("bad", "request failed"); return; }
+  if (!d.ok) { pkCraftStatus("bad", d.error || "send failed"); return; }
+  pkCraftStatus("ok", "sent");
+  if (mode === "sr1" && r.verdict) showVerdict(r.verdict(d.reply));
+  else if (mode !== "sr1") showVerdict(pkVerdict("dim", "Packet sent (no reply was requested)."));
+  renderSentReply(d, mode);
+}
+async function runTlsProbe() {
+  const f = readRecipeFields();
+  if (!f.host) { pkCraftStatus("bad", "enter a target host"); return; }
+  pkCraftStatus("dim", "connecting…"); $("pk-verdict").hidden = true; $("pk-craft-out").innerHTML = "";
+  let d;
+  try {
+    d = await (await fetch("/scapy/tls", { method: "POST", body: JSON.stringify({
+      project: activeProject, target: f.host, port: parseInt(f.port, 10) || 443,
+      timeout: parseInt($("pk-craft-timeout").value, 10) || 5 }) })).json();
+  } catch (e) { pkCraftStatus("bad", "request failed"); return; }
+  const res = (d && d.result) || {};
+  if (!d.ok) {
+    pkCraftStatus("bad", res.error || (d && d.error) || "probe failed");
+    showVerdict(pkVerdict("bad", "TLS probe failed: " + (res.error || (d && d.error) || ""))); return;
+  }
+  pkCraftStatus("ok", "connected");
+  showVerdict(pkVerdict("ok", "TLS " + (res.version || "?") + " · " + ((res.cipher || [])[0] || "cipher ?")));
+  const rows = [], add = (k, v) => { if (v != null && v !== "") rows.push([k, v]); };
+  add("Version", res.version);
+  add("Cipher", (res.cipher || []).join(" / "));
+  if (res.subject) add("Subject", res.subject.commonName || JSON.stringify(res.subject));
+  if (res.issuer) add("Issuer", res.issuer.commonName || JSON.stringify(res.issuer));
+  add("Valid from", res.notBefore); add("Valid to", res.notAfter);
+  if (res.san && res.san.length) add("SANs", res.san.join(", "));
+  $("pk-craft-out").innerHTML = '<table class="net-ports rep-code"><tbody>' +
+    rows.map(x => '<tr><td>' + esc(x[0]) + '</td><td>' + esc(String(x[1])) + '</td></tr>').join("") + '</tbody></table>';
+}
+async function runTraceroute() {
+  const f = readRecipeFields();
+  if (!f.host) { pkCraftStatus("bad", "enter a host to trace"); return; }
+  const per = parseInt($("pk-craft-timeout").value, 10) || 1;
+  pkCraftStatus("dim", "tracing… (up to " + (+f.maxttl || 20) + " hops)"); $("pk-verdict").hidden = true; $("pk-craft-out").innerHTML = "";
+  let d;
+  try {
+    d = await (await fetch("/scapy/traceroute", { method: "POST", body: JSON.stringify({
+      project: activeProject, host: f.host, proto: f.proto, dport: +f.dport || 80, maxttl: +f.maxttl || 20, timeout: per }) })).json();
+  } catch (e) { pkCraftStatus("bad", "request failed"); return; }
+  if (!d.ok) { pkCraftStatus("bad", d.error || "traceroute failed"); return; }
+  pkCraftStatus("ok", "done"); renderTrace(d);
+}
+function renderTrace(d) {
+  const hops = d.hops || [], reached = hops.some(h => h.last);
+  showVerdict(pkVerdict(reached ? "ok" : "warn", reached
+    ? ("Reached " + d.target + " (" + d.target_ip + ") in " + hops.length + " hop" + (hops.length === 1 ? "" : "s") + ".")
+    : ("Stopped after " + hops.length + " hops without reaching " + d.target + " — the later hops are likely filtered.")));
+  const rows = hops.map(h => "<tr><td class='pk-hopn'>" + h.ttl + "</td><td>" +
+    (h.ip ? esc(h.ip) : "<span class='dim'>* no response</span>") + (h.last ? " <span class='pk-hoptag'>target</span>" : "") +
+    "</td><td class='pk-hoprtt'>" + (h.rtt != null ? h.rtt + " ms" : "") + "</td></tr>").join("");
+  $("pk-craft-out").innerHTML = "<table class='pk-tbl pk-trace'><thead><tr><th>#</th><th>Router / host</th><th>RTT</th></tr></thead><tbody>" + rows + "</tbody></table>";
+}
+async function conRun() {
+  const code = $("pk-con-in").value;
+  if (!code.trim()) return;
+  const out = $("pk-con-out");
+  out.textContent += ">>> " + code + "\n";
+  const d = await (await fetch("/scapy/console", { method: "POST", body: JSON.stringify({
+    project: activeProject, code }) })).json();
+  out.textContent += (d.ok ? (d.out || "") : (d.error || "error")) + "\n";
+  $("pk-con-in").value = ""; out.scrollTop = out.scrollHeight;
+}
+
+// ── Recon pane (recon-ng-style OSINT) ──
+let rcCatalog = [], rcInited = false, rcSince = 0, rcPollTimer = null, rcRunning = false,
+    rcWorkspace = { tables: {}, counts: {} }, rcKind = "ip", rcLog = "";
+let rcSort = { idx: null, dir: 1 };   // active column sort for the current table
+let rcActiveFacets = {};              // { facetId: Set(selected values) } — AND across facets, OR within
+let rcFacetOpen = false;              // grouping panel visible?
+let rcFacetMore = {};                 // { facetId: true } → show all groups, not just the top ones
+let rcView = "table";                 // "table" | "map"
+let rcMapField = null;                // facet id the relationship map groups by
+let rcMapExpanded = {};               // { groupValue: true } expanded group nodes in the map
+const RC_LABELS = { ip: "IPs", subdomain: "Subdomains", origin: "Origins",
+                    netblock: "Netblocks", contact: "Contacts", domain: "Domains" };
+const RC_COLS = {
+  ip: [{ h: "IP", key: 1, r: x => esc(x.key) },
+       { h: "Org", r: x => esc(x.org || "") + (x.cdn ? ' <span class="rc-cdn">' + esc(x.cdn) + '</span>' : "") },
+       { h: "Netblock", r: x => esc(x.netblock || "") }, { h: "ASN", r: x => esc(x.asn || "") },
+       { h: "Country", r: x => esc(x.country || "") }, { h: "PTR", r: x => esc(x.ptr || "") },
+       { h: "Ports", r: x => esc((x.ports || []).join(", ")) },
+       { h: "Vulns", r: x => (x.vulns || []).length ? '<span class="rc-vuln">' + esc(x.vulns.join(", ")) + "</span>" : "" }],
+  subdomain: [{ h: "Name", key: 1, r: x => esc(x.key) }, { h: "IPs", r: x => esc((x.ips || []).join(", ")) },
+       { h: "Sources", r: x => esc((x.sources || []).join(", ")) }],
+  origin: [{ h: "Candidate IP", key: 1, r: x => esc(x.key) }, { h: "For", r: x => esc(x.domain || "") },
+       { h: "Score", r: x => (x.score || 0) + "%" },
+       { h: "Verified", r: x => x.verified ? '<span class="rc-verified">✓ Host-header</span>' : '<span class="rc-unver">unverified</span>' },
+       { h: "Evidence", r: x => esc(x.evidence || "") }],
+  netblock: [{ h: "CIDR", key: 1, r: x => esc(x.key) }, { h: "Org", r: x => esc(x.org || "") },
+       { h: "Country", r: x => esc(x.country || "") }],
+  contact: [{ h: "Email", key: 1, r: x => esc(x.key) }, { h: "Role", r: x => esc(x.role || "") },
+       { h: "Sources", r: x => esc((x.sources || []).join(", ")) }],
+  domain: [{ h: "Domain", key: 1, r: x => esc(x.key) }, { h: "Registrar", r: x => esc(x.registrar || "") },
+       { h: "Registered", r: x => esc(x.registered || "") }, { h: "Expires", r: x => esc(x.expires || "") }],
+};
+
+function initRecon() {
+  if (rcInited) return; rcInited = true;
+  fetch("/recon/catalog").then(r => r.json()).then(d => { rcCatalog = d.components || []; fillReconComponents(); });
+  $("rc-run").onclick = runRecon;
+  $("rc-stop").onclick = () => fetch("/recon/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+  $("rc-sweep-go").onclick = reconSweepGo;
+  $("rc-import").onclick = importNmapIPs;
+  $("rc-clear").onclick = () => {
+    if (rcRunning) { toast("Stop the recon run first."); return; }
+    clearWithUndo("recon", "Clear the OSINT workspace?",
+      "This removes all collected recon entities and run history for this project.", "Clear workspace",
+      async () => { const r = await (await fetch("/recon/clear", { method: "POST", body: JSON.stringify({ project: activeProject }) })).json(); return { ok: r.ok !== false }; },
+      async () => { await loadReconWorkspace(); });
+  };
+  $("rc-component").onchange = onReconComponent;
+  $("rc-target").addEventListener("keydown", e => { if (e.key === "Enter") runRecon(); });
+  $("rc-filter").addEventListener("input", renderReconTable);
+  document.querySelectorAll("#pane-recon .rc-etabs button").forEach(b => b.onclick = () => {
+    rcKind = b.getAttribute("data-rc");
+    document.querySelectorAll("#pane-recon .rc-etabs button").forEach(x => x.classList.toggle("active", x === b));
+    rcSort = { idx: null, dir: 1 }; rcActiveFacets = {}; rcFacetMore = {}; rcMapExpanded = {}; rcMapField = null;
+    renderReconTable();
+  });
+  $("rc-group-toggle").onclick = () => { rcFacetOpen = !rcFacetOpen; renderReconTable(); };
+  document.querySelectorAll("#pane-recon .rc-viewtoggle button").forEach(b => b.onclick = () => {
+    rcView = b.getAttribute("data-view");
+    document.querySelectorAll("#pane-recon .rc-viewtoggle button").forEach(x => x.classList.toggle("active", x === b));
+    renderReconTable();
+  });
+  $("rc-map-field").onchange = () => { rcMapField = $("rc-map-field").value; rcMapExpanded = {}; renderReconTable(); };
+}
+function fillReconComponents() {
+  const sel = $("rc-component"); sel.innerHTML = "";
+  const clusters = {};
+  for (const c of rcCatalog) (clusters[c.cluster] = clusters[c.cluster] || []).push(c);
+  for (const cl of Object.keys(clusters)) {
+    const og = document.createElement("optgroup"); og.label = cl;
+    for (const c of clusters[cl]) {
+      const o = document.createElement("option");
+      o.value = c.name; o.textContent = c.label;
+      o.dataset.needs = c.needs; o.dataset.opts = (c.opts || []).join(",");
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  onReconComponent();
+}
+function onReconComponent() {
+  const o = $("rc-component").selectedOptions[0]; if (!o) return;
+  const needs = o.dataset.needs, hasOpts = o.dataset.opts;
+  const hint = { domain: "domain (example.com)", ip: "IP address", cidr: "CIDR (10.0.0.0/24)", host: "host or IP" }[needs] || "target";
+  $("rc-target").placeholder = "target — " + hint + " — authorized only";
+  $("rc-opts").hidden = !hasOpts;
+  if (hasOpts) $("rc-opts").placeholder = hasOpts.indexOf("words") >= 0
+    ? "subdomain wordlist (space/comma-separated; blank = built-in list)" : "options";
+}
+async function loadReconFor(pid) {
+  if (pid === null) return;
+  initRecon();
+  await loadReconWorkspace();
+  if (pid !== activeProject) return;
+  try {   // a component still running in this project → re-attach its live log
+    const ev = await (await fetch("/recon/events?since=0&project=" + pid)).json();
+    if (pid !== activeProject) return;
+    if (!ev.done && !rcPollTimer) { setReconRunning(true); startReconPolling(); }
+  } catch (e) {}
+  try {   // re-attach to a live/interrupted full sweep (progress chip or Resume banner)
+    const sw = await (await fetch("/recon/sweep/state?project=" + pid)).json();
+    if (pid === activeProject) renderReconSweep(sw);
+  } catch (e) {}
+}
+async function loadReconWorkspace() {
+  try {
+    const d = await (await fetch("/recon/workspace?project=" + activeProject)).json();
+    rcWorkspace = d; renderReconCounts(); renderReconTabs(); renderReconTable();
+  } catch (e) {}
+}
+function renderReconCounts() {
+  const c = rcWorkspace.counts || {};
+  $("rc-counts").innerHTML = ["domain", "subdomain", "ip", "netblock", "contact", "origin"].map(k =>
+    '<div class="rc-crow"><span>' + RC_LABELS[k] + '</span><b>' + (c[k] || 0) + '</b></div>').join("");
+}
+function renderReconTabs() {
+  const c = rcWorkspace.counts || {};
+  document.querySelectorAll("#pane-recon .rc-etabs button").forEach(b => {
+    const k = b.getAttribute("data-rc");
+    b.innerHTML = RC_LABELS[k] + (c[k] ? ' <span class="rc-badge">' + c[k] + '</span>' : "");
+  });
+}
+// ── Recon: sorting, faceted grouping, and the relationship map ──
+// Grouping the raw columns is useless on recon data (PTRs/IPs are ~all unique), so we
+// group on NORMALIZED keys — hostnames → registrable domain, IPs → /24 — which is what
+// surfaces the real trends (e.g. 163 PTRs under cloudwaysapps.com).
+const RC_IPV4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+const RC_MULTI_SUFFIX = new Set(["co.uk","org.uk","gov.uk","ac.uk","me.uk","com.au","net.au","org.au",
+  "co.nz","co.za","co.jp","com.br","co.in","com.cn","com.mx","co.kr","com.tr","com.sg"]);
+function rcRegDomain(host) {
+  host = String(host || "").toLowerCase().replace(/\.+$/, "").trim();
+  if (!host || RC_IPV4.test(host)) return "";
+  const p = host.split(".").filter(Boolean);
+  if (p.length < 2) return "";
+  const last2 = p.slice(-2).join(".");
+  return (RC_MULTI_SUFFIX.has(last2) && p.length >= 3) ? p.slice(-3).join(".") : last2;
+}
+function rcSlash24(ip) {
+  ip = String(ip || "").trim();
+  if (!RC_IPV4.test(ip)) return "";
+  const p = ip.split("."); return p[0] + "." + p[1] + "." + p[2] + ".0/24";
+}
+function rcCellText(col, row) {
+  return String(col.r(row)).replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
+}
+function rcCmp(a, b) {                                     // numeric-, IPv4-, then text-aware
+  const numRe = /^[-+]?[\d,]*\.?\d+%?$/;
+  if (numRe.test(a) && numRe.test(b)) return parseFloat(a.replace(/,/g, "")) - parseFloat(b.replace(/,/g, ""));
+  if (RC_IPV4.test(a) && RC_IPV4.test(b)) {
+    const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+    for (let i = 0; i < 4; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
+    return 0;
+  }
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+// Each facet maps a row to 0+ normalized group values. Empty facets auto-hide downstream.
+function rcFacetDefs(kind) {
+  const dom = h => { const d = rcRegDomain(h); return d ? [d] : []; };
+  const src = r => (r.sources || []).map(s => String(s).split(" ")[0]);
+  switch (kind) {
+    case "ip": return [
+      { id: "ptrdom", label: "PTR domain", vals: r => dom(r.ptr) },
+      { id: "net24", label: "/24", vals: r => { const s = rcSlash24(r.key); return s ? [s] : []; } },
+      { id: "org", label: "Org", vals: r => r.org ? [r.org] : [] },
+      { id: "country", label: "Country", vals: r => r.country ? [r.country] : [] },
+      { id: "asn", label: "ASN", vals: r => r.asn ? ["AS" + String(r.asn).replace(/^AS/i, "")] : [] }];
+    case "subdomain": return [
+      { id: "parent", label: "Parent domain", vals: r => dom(r.key) },
+      { id: "ip24", label: "Resolved /24", vals: r => Array.from(new Set((r.ips || []).map(rcSlash24).filter(Boolean))) },
+      { id: "src", label: "Source", vals: src }];
+    case "origin": return [
+      { id: "for", label: "For domain", vals: r => r.domain ? (dom(r.domain).length ? dom(r.domain) : [r.domain]) : [] },
+      { id: "verified", label: "Verified", vals: r => [r.verified ? "verified" : "unverified"] }];
+    case "netblock": return [
+      { id: "org", label: "Org", vals: r => r.org ? [r.org] : [] },
+      { id: "country", label: "Country", vals: r => r.country ? [r.country] : [] }];
+    case "contact": return [
+      { id: "role", label: "Role", vals: r => r.role ? [r.role] : [] },
+      { id: "src", label: "Source", vals: src }];
+    case "domain": return [
+      { id: "registrar", label: "Registrar", vals: r => r.registrar ? [r.registrar] : [] }];
+    default: return [];
+  }
+}
+function rcAllRows() { return (rcWorkspace.tables && rcWorkspace.tables[rcKind]) || []; }
+// Rows passing the text filter + every active facet EXCEPT `exceptId` (drill-down counts).
+function rcRowsExcept(exceptId) {
+  let rows = rcAllRows();
+  const defs = {}; rcFacetDefs(rcKind).forEach(d => defs[d.id] = d);
+  for (const fid in rcActiveFacets) {
+    if (fid === exceptId) continue;
+    const sel = rcActiveFacets[fid], d = defs[fid];
+    if (!sel || !sel.size || !d) continue;
+    rows = rows.filter(r => d.vals(r).some(v => sel.has(v)));
+  }
+  const f = $("rc-filter").value.trim().toLowerCase();
+  if (f) rows = rows.filter(r => JSON.stringify(r).toLowerCase().indexOf(f) >= 0);
+  return rows;
+}
+function rcFilteredRows() { return rcRowsExcept(null); }
+function rcGroupsFor(def, rows) {
+  const m = new Map();
+  for (const r of rows) for (const v of def.vals(r)) m.set(v, (m.get(v) || 0) + 1);
+  return Array.from(m, ([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+}
+function renderReconFacets() {
+  const panel = $("rc-facets");
+  panel.hidden = !rcFacetOpen;
+  $("rc-group-toggle").classList.toggle("on", rcFacetOpen);
+  if (!rcFacetOpen) return;
+  let html = "", any = false;
+  for (const def of rcFacetDefs(rcKind)) {
+    const groups = rcGroupsFor(def, rcRowsExcept(def.id));
+    const sel = rcActiveFacets[def.id];
+    if (!groups.length || (groups[0].count < 2 && !(sel && sel.size))) continue;   // no real aggregation
+    any = true;
+    const max = groups[0].count || 1;
+    const limit = rcFacetMore[def.id] ? groups.length : 12;
+    html += '<div class="rc-facet"><div class="rc-facet-h">' + esc(def.label) + "<span>" + groups.length + "</span></div>";
+    for (const g of groups.slice(0, limit)) {
+      html += '<button class="rc-grp' + (sel && sel.has(g.value) ? " active" : "") + '" data-fid="' + esc(def.id) +
+        '" data-val="' + encodeURIComponent(g.value) + '">' +
+        '<span class="rc-grp-bar" style="width:' + Math.max(6, Math.round(g.count / max * 100)) + '%"></span>' +
+        '<span class="rc-grp-label" title="' + esc(g.value) + '">' + esc(g.value) + "</span>" +
+        '<span class="rc-grp-n">' + g.count + "</span></button>";
+    }
+    if (groups.length > 12) html += '<button class="rc-more" data-more="' + esc(def.id) + '">' +
+      (rcFacetMore[def.id] ? "show less" : "+" + (groups.length - 12) + " more") + "</button>";
+    html += "</div>";
+  }
+  panel.innerHTML = any ? html : '<div class="rc-facets-empty">No groupable patterns in this table yet — values are all distinct.</div>';
+  panel.querySelectorAll(".rc-grp").forEach(b => b.onclick = () => {
+    const fid = b.getAttribute("data-fid"), val = decodeURIComponent(b.getAttribute("data-val"));
+    const set = rcActiveFacets[fid] || (rcActiveFacets[fid] = new Set());
+    if (set.has(val)) { set.delete(val); if (!set.size) delete rcActiveFacets[fid]; } else set.add(val);
+    renderReconTable();
+  });
+  panel.querySelectorAll(".rc-more").forEach(b => b.onclick = () => {
+    const fid = b.getAttribute("data-more"); rcFacetMore[fid] = !rcFacetMore[fid]; renderReconFacets();
+  });
+}
+function renderReconChips() {
+  const box = $("rc-chips"), defs = {}; rcFacetDefs(rcKind).forEach(d => defs[d.id] = d);
+  let html = "";
+  for (const fid in rcActiveFacets) {
+    const d = defs[fid]; if (!d) continue;
+    for (const val of rcActiveFacets[fid])
+      html += '<span class="rc-chip"><b>' + esc(d.label) + ':</b> ' + esc(val) +
+        '<button data-fid="' + esc(fid) + '" data-val="' + encodeURIComponent(val) + '" title="Remove">✕</button></span>';
+  }
+  box.innerHTML = html;
+  box.querySelectorAll("button").forEach(b => b.onclick = () => {
+    const fid = b.getAttribute("data-fid"), val = decodeURIComponent(b.getAttribute("data-val"));
+    const set = rcActiveFacets[fid]; if (set) { set.delete(val); if (!set.size) delete rcActiveFacets[fid]; }
+    renderReconTable();
+  });
+}
+function renderReconTable() {
+  renderReconFacets();
+  renderReconChips();
+  const tableView = rcView !== "map";
+  $("rc-table").hidden = !tableView; $("rc-map").hidden = tableView; $("rc-map-bar").hidden = tableView;
+  if (!tableView) { renderReconMap(); return; }
+  const cols = RC_COLS[rcKind];
+  let rows = rcFilteredRows();
+  if (rcSort.idx != null && cols[rcSort.idx]) {
+    const col = cols[rcSort.idx], dir = rcSort.dir;
+    rows = rows.slice().sort((a, b) => dir * rcCmp(rcCellText(col, a), rcCellText(col, b)));
+  }
+  const box = $("rc-table");
+  if (!rows.length) {
+    const filtered = $("rc-filter").value.trim() || Object.keys(rcActiveFacets).length;
+    box.innerHTML = '<div class="net-empty">No ' + rcKind + ' entities' + (filtered ? " match the current filter" : " yet") + ".</div>";
+    return;
+  }
+  const head = "<tr>" + cols.map((c, i) =>
+    '<th class="rc-sortable" data-ci="' + i + '">' + c.h +
+    (rcSort.idx === i ? ' <span class="rc-arr">' + (rcSort.dir > 0 ? "▲" : "▼") + "</span>" : "") + "</th>").join("") + "<th></th></tr>";
+  const body = rows.map(r => "<tr>" + cols.map(c =>
+    "<td" + (c.key ? ' class="rc-key"' : "") + ">" + c.r(r) + "</td>").join("") +
+    "<td>" + reconActions(rcKind, r) + "</td></tr>").join("");
+  box.innerHTML = '<table class="rc-tbl"><thead>' + head + "</thead><tbody>" + body + "</tbody></table>";
+  box.querySelectorAll("th.rc-sortable").forEach(th => th.onclick = () => {
+    const i = +th.getAttribute("data-ci");
+    if (rcSort.idx !== i) rcSort = { idx: i, dir: 1 };
+    else if (rcSort.dir > 0) rcSort.dir = -1;
+    else rcSort = { idx: null, dir: 1 };
+    renderReconTable();
+  });
+  box.querySelectorAll("[data-act]").forEach(b => b.onclick = () =>
+    reconAct(b.getAttribute("data-act"), JSON.parse(decodeURIComponent(b.getAttribute("data-row")))));
+}
+// Zenmap-style node-link map: root → group nodes (sized by count) → expand to members.
+function renderReconMap() {
+  const defs = rcFacetDefs(rcKind).filter(d => rcGroupsFor(d, rcAllRows()).some(g => g.count >= 2));
+  const sel = $("rc-map-field");
+  if (sel.dataset.kind !== rcKind) {
+    sel.innerHTML = defs.map(d => '<option value="' + esc(d.id) + '">' + esc(d.label) + "</option>").join("");
+    sel.dataset.kind = rcKind;
+    rcMapField = defs.length ? defs[0].id : null;
+  }
+  if (!rcMapField || !defs.find(d => d.id === rcMapField)) rcMapField = defs.length ? defs[0].id : null;
+  if (rcMapField) sel.value = rcMapField;
+  const box = $("rc-map"), def = defs.find(d => d.id === rcMapField);
+  if (!def) { box.innerHTML = '<div class="net-empty">No groupable patterns to map yet.</div>'; $("rc-map-note").textContent = ""; return; }
+  const rows = rcFilteredRows(), groups = rcGroupsFor(def, rows);
+  if (!groups.length) { box.innerHTML = '<div class="net-empty">Nothing to map under the current filter.</div>'; $("rc-map-note").textContent = ""; return; }
+  const top = groups;                                   // render EVERY group — nothing is hidden
+  $("rc-map-note").textContent = " · " + groups.length + " group" + (groups.length === 1 ? "" : "s") +
+    " · " + rows.length + " rows";
+  const max = groups[0].count || 1, colX = [44, 310, 580], rowH = 30;
+  const rootY = 30 + (top.length * rowH) / 2;
+  const nodes = [{ x: colX[0], y: rootY, r: 7, cls: "rnode", label: RC_LABELS[rcKind], meta: rows.length + " rows" }];
+  const edges = [], panels = []; let y = 30, maxY = rootY;
+  const MEMBER_CIRCLES = 14;                             // small groups keep the radial look; big ones get a scroll panel
+  for (const g of top) {
+    const gy = y; y += rowH;
+    const r = 4 + Math.sqrt(g.count / max) * 9, expanded = !!rcMapExpanded[g.value];
+    nodes.push({ x: colX[1], y: gy, r, cls: "gnode" + (expanded ? "" : " collapsed"), label: g.value, meta: String(g.count), gval: g.value });
+    edges.push([colX[0], rootY, colX[1], gy]); maxY = Math.max(maxY, gy);
+    if (expanded) {
+      const members = rows.filter(m => def.vals(m).indexOf(g.value) >= 0);
+      if (members.length <= MEMBER_CIRCLES) {
+        members.forEach(m => {
+          const my = y; y += rowH * 0.8;
+          nodes.push({ x: colX[2], y: my, r: 3, cls: "lnode", label: m.key, key: m.key });
+          edges.push([colX[1], gy, colX[2], my]); maxY = Math.max(maxY, my);
+        });
+      } else {
+        // Big group → a scrollable panel holding EVERY member, each still clickable (no dead "+N more").
+        const visRows = Math.min(members.length, 11), panelH = visRows * 20 + 24, panelW = 266, py = y;
+        edges.push([colX[1], gy, colX[2], py + 16]);
+        panels.push({ x: colX[2], y: py, w: panelW, h: panelH, members: members });
+        maxY = Math.max(maxY, py + panelH); y += panelH + 10;
+      }
+    }
+  }
+  const W = 880, H = Math.max(maxY + 34, 140);
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '">';
+  for (const e of edges) { const mx = (e[0] + e[2]) / 2;
+    svg += '<path class="edge" d="M' + e[0] + " " + e[1] + " C" + mx + " " + e[1] + " " + mx + " " + e[3] + " " + e[2] + " " + e[3] + '"/>'; }
+  for (const n of nodes) {
+    const ga = n.gval != null ? ' data-g="' + encodeURIComponent(n.gval) + '"' : "";
+    const ka = n.key != null ? ' data-k="' + encodeURIComponent(n.key) + '"' : "";
+    if (n.r > 0) svg += '<circle class="' + n.cls + '" cx="' + n.x + '" cy="' + n.y + '" r="' + n.r + '"' + ga + ka + "></circle>";
+    svg += '<text x="' + (n.x + (n.r || 0) + 6) + '" y="' + (n.y + 4) + '"' + (n.gval != null ? ' style="cursor:pointer"' + ga : "") + ">" + esc(n.label) + "</text>";
+    if (n.meta) svg += '<text class="meta" x="' + (n.x + n.r + 6) + '" y="' + (n.y + 15) + '">' + esc(n.meta) + "</text>";
+  }
+  for (const p of panels) {
+    svg += '<foreignObject x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h + '">' +
+      '<div xmlns="http://www.w3.org/1999/xhtml" class="rc-mapmore">' +
+      '<div class="rc-mapmore-hd">' + p.members.length + ' members · scroll</div>' +
+      p.members.map(m => '<div class="rc-mapmore-item" data-k="' + encodeURIComponent(m.key) +
+        '" title="' + esc(m.key) + '">' + esc(m.key) + "</div>").join("") +
+      "</div></foreignObject>";
+  }
+  box.innerHTML = svg + "</svg>";
+  box.querySelectorAll("[data-g]").forEach(el => el.onclick = () => {
+    const g = decodeURIComponent(el.getAttribute("data-g")); rcMapExpanded[g] = !rcMapExpanded[g]; renderReconMap();
+  });
+  box.querySelectorAll("[data-k]").forEach(el => el.onclick = () => {   // circles AND panel items pivot to the table
+    $("rc-filter").value = decodeURIComponent(el.getAttribute("data-k")); rcView = "table";
+    document.querySelectorAll("#pane-recon .rc-viewtoggle button").forEach(x => x.classList.toggle("active", x.getAttribute("data-view") === "table"));
+    renderReconTable();
+  });
+  bxMapPan(box);
+}
+function reconActions(kind, row) {
+  const R = encodeURIComponent(JSON.stringify(row));
+  const btn = (act, label) => '<button data-act="' + act + '" data-row="' + R + '">' + label + "</button>";
+  let acts = [];
+  if (kind === "ip") acts = [btn("rdap", "RDAP"), btn("scan", "Scan"), btn("repeater", "Repeater")];
+  else if (kind === "subdomain") acts = [btn("resolve", "Resolve"), btn("scan", "Scan")];
+  else if (kind === "origin") acts = [btn("repeater", "Verify"), btn("scan", "Scan")];
+  else if (kind === "netblock") acts = [btn("sweep", "Sweep")];
+  return '<div class="rc-acts">' + acts.join("") + "</div>";
+}
+function reconAct(act, row) {
+  if (act === "rdap") runReconComponent("rdap_ip", row.key);
+  else if (act === "resolve") runReconComponent("resolve", row.key);
+  else if (act === "sweep") runReconComponent("reverse_sweep", row.key);
+  else if (act === "scan") sendToNetwork(row.key);
+  else if (act === "repeater") openOriginInRepeater(row.domain || row.ptr || row.key, row.key);
+}
+function runReconComponent(name, target) {
+  $("rc-component").value = name; onReconComponent();
+  $("rc-target").value = target; runRecon();
+}
+function sendToNetwork(target) {
+  document.querySelector('nav button[data-tab="network"]').click();
+  $("net-target").value = target;
+  if (typeof syncNetPreview === "function") syncNetPreview();
+}
+async function openOriginInRepeater(host, ip) {
+  const req = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: beatrix-origin-check\r\n" +
+    "Accept: */*\r\nConnection: close\r\n\r\n";
+  await fetch("/repeater/new", { method: "POST", body: JSON.stringify({
+    project: activeProject, request: req, target: "https://" + ip }) });
+  document.querySelector('nav button[data-tab="repeater"]').click();
+}
+
+// ── Metasploit "battlestation" module ──────────────────────────────────────
+// Bridges the interactive msf console (over msfrpcd) into the GUI. The HUD polls
+// /msf/status; the terminal polls /msf/console/read?since= with a cursor (same
+// pattern as ghost/hunt) and posts input to /msf/console/write; Tab completes via
+// /msf/console/tabcomplete. Boot is lazy — msfrpcd is heavy, so nothing starts
+// until the operator hits "Boot".
+let msfInited = false, msfStatusTimer = null, msfConsoleTimer = null;
+let msfCursor = 0, msfRunning = false, msfBooting = false, msfConsoleBusy = false;
+let msfHistory = [], msfHistIdx = 0;
+let msfPanel = null, msfLastStatus = {}, msfCurMod = null, msfHomeLoaded = false, msfLoadedProject = null;
+let msfSeshId = null, msfSeshTimer = null, msfModType = "exploit", msfModNames = {}, msfModSearch = "", msfDBColl = "hosts";
+let msfModCache = {}, msfInfoCache = {}, msfSort = {};
+const MSF_RANK_ORD = { manual:0, low:1, average:2, normal:3, good:4, great:5, excellent:6 };
+const msfGet = (p) => fetch(p).then(r => r.json()).catch(() => ({}));
+const msfPost = (p, b) => fetch(p, { method: "POST", body: JSON.stringify(b || {}) }).then(r => r.json()).catch(() => ({}));
+const msfPanelBody = () => $("msf-panel-body");
+function msfSetTitle(t, tools) { $("msf-panel-title").textContent = t; $("msf-panel-tools").innerHTML = tools || ""; }
+// Generic sortable table used by every MSF list. cols: [{h, get(row), cell(row)?, cls?, nosort?}].
+// Reuses the recon comparator rcCmp (numeric / IPv4 / text aware). Sort state per stateKey.
+function msfSortTable(container, cols, rows, stateKey, opts) {
+  opts = opts || {};
+  const st = msfSort[stateKey] || (msfSort[stateKey] = { idx: null, dir: 1 });
+  const keyOf = (c, r) => String(c.get ? (c.get(r) == null ? "" : c.get(r)) : "");
+  let show = rows.slice();
+  if (st.idx != null && cols[st.idx] && !cols[st.idx].nosort) {
+    const col = cols[st.idx], dir = st.dir;
+    show.sort((a, b) => dir * rcCmp(keyOf(col, a), keyOf(col, b)));
+  }
+  const head = "<tr>" + cols.map((c, i) => c.nosort
+    ? "<th>" + esc(c.h || "") + "</th>"
+    : '<th class="rc-sortable" data-ci="' + i + '">' + esc(c.h) + (st.idx === i ? ' <span class="rc-arr">' + (st.dir > 0 ? "▲" : "▼") + "</span>" : "") + "</th>").join("") + "</tr>";
+  const bodyHtml = show.map(r => "<tr" + (opts.onRow ? ' class="msf-rowlink"' : "") + ">" +
+    cols.map(c => "<td" + (c.cls ? ' class="' + c.cls + '"' : "") + ">" + (c.cell ? c.cell(r) : esc(keyOf(c, r))) + "</td>").join("") + "</tr>").join("");
+  container.innerHTML = '<table class="rc-tbl"><thead>' + head + "</thead><tbody>" + bodyHtml + "</tbody></table>";
+  container.querySelectorAll("th.rc-sortable").forEach(th => th.onclick = () => {
+    const i = +th.getAttribute("data-ci");
+    if (st.idx !== i) { st.idx = i; st.dir = 1; } else if (st.dir > 0) st.dir = -1; else { st.idx = null; st.dir = 1; }
+    msfSortTable(container, cols, rows, stateKey, opts);
+  });
+  if (opts.onRow) container.querySelectorAll("tbody tr").forEach((tr, i) =>
+    tr.onclick = (e) => { if (!e.target.closest("[data-stop]")) opts.onRow(show[i], tr); });
+  if (opts.afterRender) opts.afterRender(container, show);
+  return show;
+}
+function normalizeSearch(results) {
+  return (Array.isArray(results) ? results : []).filter(r => r && !r.error).map(r => {
+    const full = r.fullname || ((r.type ? r.type + "/" : "") + r.name);
+    const short = (r.type && full.indexOf(r.type + "/") === 0) ? full.slice(r.type.length + 1) : full;
+    return { type: r.type, short, full, rank: r.rank || "", info: r.name || "", date: r.disclosuredate || "" };
+  });
+}
+// Lazily fill module Description cells as they scroll into view (one module.info each, cached).
+function msfLazyDescriptions(container) {
+  const cells = container.querySelectorAll(".msf-desc[data-mn]");
+  if (!cells.length || typeof IntersectionObserver === "undefined") return;
+  const io = new IntersectionObserver((ents, obs) => ents.forEach(async en => {
+    if (!en.isIntersecting) return;
+    const el = en.target; obs.unobserve(el);
+    const type = el.getAttribute("data-mt"), name = el.getAttribute("data-mn"), k = type + "/" + name;
+    if (msfInfoCache[k] !== undefined) { el.textContent = msfInfoCache[k]; return; }
+    try {
+      const d = await msfGet("/msf/module/info?type=" + encodeURIComponent(type) + "&name=" + encodeURIComponent(name));
+      const desc = (d && !d.error && d.description) ? String(d.description).replace(/\s+/g, " ").trim() : "";
+      msfInfoCache[k] = desc; el.textContent = desc;
+    } catch (e) {}
+  }), { root: container.closest("#msf-panel-body") || null, rootMargin: "150px" });
+  cells.forEach(c => io.observe(c));
+}
+function msfShowView(which) {
+  $("msf-panel").classList.toggle("hidden", which !== "panel");
+  $("msf-console-view").classList.toggle("hidden", which !== "console");
+  if (which === "console") setTimeout(() => $("msf-in").focus(), 0);
+}
+function initMetasploit() {
+  if (msfInited) return; msfInited = true;
+  const inp = $("msf-in");
+  $("msf-boot-btn").onclick = bootMetasploit;
+  $("msf-back-btn").onclick = msfBack; $("msf-back-btn2").onclick = msfBack;
+  $("msf-out").addEventListener("mousedown", e => { if (window.getSelection().isCollapsed) setTimeout(() => inp.focus(), 0); });
+  // Delegated navigation: rail items, in-panel links, and section (advanced) toggles.
+  $("pane-metasploit").addEventListener("click", (e) => {
+    const open = e.target.closest("[data-msf-open]");
+    if (open) { if (msfSeshTimer && open.getAttribute("data-msf-open") !== "sessions") { clearTimeout(msfSeshTimer); msfSeshTimer = null; } msfOpenPanel(open.getAttribute("data-msf-open")); return; }
+    const tog = e.target.closest("[data-msf-toggle]");
+    if (tog) { const el = $(tog.getAttribute("data-msf-toggle")); if (el) el.style.display = el.style.display === "none" ? "block" : "none"; return; }
+  });
+  inp.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      const v = inp.value;
+      if (v.trim()) { msfHistory.push(v); if (msfHistory.length > 300) msfHistory.shift(); }
+      msfHistIdx = msfHistory.length; inp.value = "";
+      msfEcho(($("msf-prompt").textContent || "msf >") + " " + v);
+      await fetch("/msf/console/write", { method: "POST", body: JSON.stringify({ data: v }) }).catch(() => {});
+      msfPumpConsole();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (msfHistIdx > 0) { msfHistIdx--; inp.value = msfHistory[msfHistIdx] || ""; }
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (msfHistIdx < msfHistory.length - 1) { msfHistIdx++; inp.value = msfHistory[msfHistIdx] || ""; }
+      else { msfHistIdx = msfHistory.length; inp.value = ""; }
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      try {
+        const d = await (await fetch("/msf/console/tabcomplete", { method: "POST", body: JSON.stringify({ line: inp.value }) })).json();
+        const tabs = d.tabs || [];
+        if (tabs.length === 1) inp.value = tabs[0];
+        else if (tabs.length > 1) {
+          let pre = tabs[0]; for (const t of tabs) while (!t.startsWith(pre)) pre = pre.slice(0, -1);
+          if (pre.length > inp.value.length) inp.value = pre;
+          msfEcho(tabs.join("    "));
+        }
+      } catch (err) {}
+    }
+  });
+}
+function msfEcho(text) {
+  const out = $("msf-out");
+  out.textContent += (out.textContent && !out.textContent.endsWith("\n") ? "\n" : "") + text + "\n";
+  out.scrollTop = out.scrollHeight;
+}
+async function bootMetasploit() {
+  $("msf-boot-btn").disabled = true;
+  $("msf-boot-status").innerHTML = '<div class="msf-spinner"></div><p>Booting Metasploit RPC…</p>';
+  try { await fetch("/msf/start", { method: "POST", body: "{}" }); } catch (e) {}
+  msfStatusTick();
+}
+function msfSetBoot(mode, err) {
+  const boot = $("msf-boot");
+  if (mode === "running") { boot.classList.add("hidden"); return; }
+  boot.classList.remove("hidden");
+  if (mode === "booting") {
+    $("msf-boot-btn").disabled = true;
+    $("msf-boot-status").innerHTML = '<div class="msf-spinner"></div><p>Booting Metasploit RPC — loading framework…</p>';
+  } else {
+    $("msf-boot-btn").disabled = false;
+    $("msf-boot-status").innerHTML = err ? '<div class="msf-boot-err">' + esc(err) + "</div>" : "";
+  }
+}
+async function msfStatusTick() {
+  if (activeTab !== "metasploit") return;             // stop polling when the tab isn't visible
+  let s = {};
+  try { s = await (await fetch("/msf/status")).json(); } catch (e) { s = { running: false, error: "suite unreachable" }; }
+  if (activeTab !== "metasploit") return;
+  msfLastStatus = s; msfRunning = !!s.running; msfBooting = !!s.booting;
+  $("msf-led").className = "msf-led " + (s.running ? "on" : s.booting ? "boot" : "off");
+  $("msf-ver").textContent = s.version ? ("v" + s.version + (s.api ? " · api " + s.api : "")) : "";
+  $("msf-n-sessions").textContent = s.sessions || 0;
+  $("msf-n-jobs").textContent = s.jobs || 0;
+  $("msf-stat-db").classList.toggle("hot", s.running ? !s.db : true);
+  $("msf-db").textContent = s.running ? (s.db ? "connected" : "none") : "—";
+  const sTile = $("msf-n-sessions").closest(".msf-stat"); if (sTile) sTile.classList.toggle("warn", (s.sessions || 0) > 0);
+  msfSetBoot(s.running ? "running" : s.booting ? "booting" : "idle", s.error);
+  if (s.running) {
+    msfStartConsole();
+    if (!msfHomeLoaded) { msfHomeLoaded = true; msfStack = [{ view: "home" }]; msfRenderStackTop(); }
+    else if ((msfStack[msfStack.length - 1] || {}).view === "home") msfHomeLive();   // keep live lists fresh
+  }
+  clearTimeout(msfStatusTimer);
+  msfStatusTimer = setTimeout(msfStatusTick, s.running ? 4000 : s.booting ? 2500 : 6000);
+}
+function msfStartConsole() { if (!msfConsoleTimer) msfPumpConsole(); }   // self-reschedules; guard double loops
+async function msfPumpConsole() {
+  clearTimeout(msfConsoleTimer); msfConsoleTimer = null;
+  if (activeTab !== "metasploit" || !msfRunning) return;
+  let d = {};
+  try { d = await (await fetch("/msf/console/read?since=" + msfCursor)).json(); } catch (e) { d = {}; }
+  if (activeTab !== "metasploit") return;
+  if (d.ok) {
+    if (d.data) {
+      const out = $("msf-out"), atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+      out.textContent += d.data; if (atBottom) out.scrollTop = out.scrollHeight;
+    }
+    if (typeof d.cursor === "number") msfCursor = d.cursor;
+    if (d.prompt) $("msf-prompt").textContent = d.prompt.replace(/\s+$/, "");
+    msfConsoleBusy = !!d.busy;
+  }
+  msfConsoleTimer = setTimeout(msfPumpConsole, msfConsoleBusy ? 350 : 1100);
+}
+async function loadMetasploitFor(pid) {
+  if (pid === null) return;
+  initMetasploit();
+  if (pid !== msfLoadedProject) {    // switched projects → a different, isolated msfrpcd; reset the view
+    msfLoadedProject = pid; msfHomeLoaded = false; msfStack = []; msfCurMod = null;
+    msfCursor = 0; $("msf-out").textContent = "";
+    if (msfSeshTimer) { clearTimeout(msfSeshTimer); msfSeshTimer = null; }
+  }
+  $("msf-ws").textContent = (projects.find(p => p.id === pid) || {}).name || "—";
+  msfStatusTick();   // boots/attaches THIS project's instance; renders home when running
+  msfRefreshTargets();   // show the recon-targets count in the status bar from the start
+}
+
+// ── Metasploit GUI: browser-style navigation — a back button + a landing home ──
+// No sidebar. A nav stack drives drill-in; one back button (top-left) retraces it.
+// The home is the root: module search, destinations, and the LIVE Sessions/Jobs
+// lists that populate as you work.
+let msfStack = [];
+function msfNav(desc) { msfStack.push(desc); msfRenderStackTop(); }
+function msfBack() { if (msfStack.length > 1) { msfStack.pop(); msfRenderStackTop(); } }
+function msfOpenPanel(name) { msfNav({ view: name }); }   // used by delegated [data-msf-open] + shortcuts
+function msfRenderStackTop() {
+  const d = msfStack[msfStack.length - 1] || { view: "home" };
+  if (msfSeshTimer && d.view !== "session") { clearTimeout(msfSeshTimer); msfSeshTimer = null; }
+  msfPanel = d.view;
+  const T = { home:"Metasploit", modules:"Modules", configure:"Configure", sessions:"Sessions",
+    jobs:"Jobs", database:"Database", payloads:"Payload Generator — msfvenom", plugins:"Plugins",
+    commands:"Command Catalog", datastore:"Datastore", import:"Targets — from Recon" };
+  if (T[d.view]) msfSetTitle(T[d.view], "");
+  if (d.view === "console") msfShowView("console"); else msfShowView("panel");
+  switch (d.view) {
+    case "home": msfHome(); break;
+    case "modules": msfModules(); break;
+    case "configure": msfCurMod ? msfModuleDetail(msfCurMod.type, msfCurMod.name)
+      : (msfPanelBody().innerHTML = '<div class="msf-note">No module selected — search for one under <b>Modules</b>.</div>'); break;
+    case "module": msfModuleDetail(d.type, d.name); break;
+    case "sessions": msfSessions(); break;
+    case "session": msfSessionDetail(d.id, d.meta || {}); break;
+    case "jobs": msfJobs(); break;
+    case "database": msfDB(); break;
+    case "payloads": msfPayloads(d.prefill); break;
+    case "plugins": msfPlugins(); break;
+    case "commands": msfCommands(); break;
+    case "datastore": msfDatastore(); break;
+    case "import": msfImport(); break;
+    case "console": break;
+  }
+  const show = msfStack.length > 1 ? "visible" : "hidden";
+  const b1 = $("msf-back-btn"), b2 = $("msf-back-btn2");
+  if (b1) b1.style.visibility = show; if (b2) b2.style.visibility = show;
+}
+function msfHome() {
+  msfPanelBody().innerHTML =
+    '<div class="msf-home">' +
+    '<div class="msf-home-sec">Find &amp; run a module</div>' +
+    '<input class="msf-search" id="msf-home-search" placeholder="search modules — e.g. smb, scanner, apache…  (Enter)">' +
+    '<div class="msf-home-links">' +
+      '<a data-msf-open="import">Import from Recon</a>' +
+      '<a data-msf-open="modules">Browse all modules</a>' +
+      '<a data-msf-open="payloads">Generate payload (msfvenom)</a>' +
+      '<a data-msf-open="database">Database</a>' +
+      '<a data-msf-open="plugins">Plugins</a>' +
+      '<a data-msf-open="commands">Command catalog</a>' +
+      '<a data-msf-open="datastore">Datastore</a>' +
+      '<a data-msf-open="console">Console</a></div>' +
+    '<div class="msf-home-live"><div class="msf-home-col"><div class="msf-home-sec">Sessions <span id="msf-home-nse" class="msf-home-n"></span></div><div id="msf-home-sessions" class="msf-note">—</div></div>' +
+    '<div class="msf-home-col"><div class="msf-home-sec">Jobs <span id="msf-home-nj" class="msf-home-n"></span></div><div id="msf-home-jobs" class="msf-note">—</div></div></div>' +
+    '<div class="msf-home-sec">Instance</div><div class="msf-note" style="padding:0">This project runs its own isolated Metasploit instance. ' +
+      '<a id="msf-stop-inst" style="color:var(--msf-hot);cursor:pointer">Stop it</a> to free memory (it reboots next time you open this project).</div></div>';
+  const si = $("msf-home-search");
+  si.addEventListener("keydown", e => { if (e.key === "Enter" && si.value.trim()) { msfModType = "search"; msfModSearch = si.value.trim(); msfNav({ view: "modules" }); } });
+  $("msf-stop-inst").onclick = async () => { await msfPost("/msf/stop", {}); msfHomeLoaded = false; msfRunning = false; msfStatusTick(); };
+  msfHomeLive();
+}
+async function msfHomeLive() {
+  if ((msfStack[msfStack.length - 1] || {}).view !== "home") return;
+  const sd = await msfGet("/msf/sessions"); const sids = sd && !sd.error ? Object.keys(sd) : [];
+  const se = $("msf-home-sessions"), sn = $("msf-home-nse");
+  if (se) {
+    if (sn) sn.textContent = sids.length ? "(" + sids.length + ")" : "";
+    se.className = sids.length ? "msf-home-list" : "msf-note";
+    se.innerHTML = sids.length ? sids.map(id => '<div class="msf-home-item" data-sid="' + esc(id) + '"><b>' + esc(id) + "</b>" + esc(sd[id].type || "") + " · " + esc(sd[id].session_host || sd[id].tunnel_peer || "") + "</div>").join("")
+      : "No active sessions yet — they appear here when a module lands one.";
+    se.querySelectorAll("[data-sid]").forEach(x => x.onclick = () => msfNav({ view: "session", id: x.getAttribute("data-sid"), meta: sd[x.getAttribute("data-sid")] }));
+  }
+  const jd = await msfGet("/msf/jobs"); const jids = jd && !jd.error ? Object.keys(jd) : [];
+  const je = $("msf-home-jobs"), jn = $("msf-home-nj");
+  if (je) {
+    if (jn) jn.textContent = jids.length ? "(" + jids.length + ")" : "";
+    je.className = jids.length ? "msf-home-list" : "msf-note";
+    je.innerHTML = jids.length ? jids.map(id => '<div class="msf-home-item" data-jid="' + esc(id) + '"><b>' + esc(id) + "</b>" + esc(String(jd[id])) + "</div>").join("")
+      : "No running jobs — background runs appear here.";
+    je.querySelectorAll("[data-jid]").forEach(x => x.onclick = () => msfNav({ view: "jobs" }));
+  }
+}
+// Generic options-form generator — the heart of complete coverage (any module type,
+// every option incl. advanced/evasion), driven by module.options' schema.
+function msfCtrl(name, o) {
+  const t = o.type || "string", def = o.default != null ? o.default : "";
+  if (t === "bool") return '<input type="checkbox" data-opt="' + esc(name) + '"' + (def === true || def === "true" ? " checked" : "") + ">";
+  if (t === "enum" && o.enums) return '<select data-opt="' + esc(name) + '">' + o.enums.map(e => '<option' + (String(e) === String(def) ? " selected" : "") + ">" + esc(String(e)) + "</option>").join("") + "</select>";
+  const typ = (t === "integer" || t === "port") ? ' type="number"' : ' type="text"';
+  return "<input" + typ + ' data-opt="' + esc(name) + '" value="' + esc(String(def)) + '" placeholder="' + esc(t) + '">';
+}
+function msfOptRow(name, o) {
+  return '<div class="msf-frow"><label>' + esc(name) + (o.required ? '<span class="req">*</span>' : "") +
+    '<span class="desc">' + esc(o.desc || "") + "</span></label><div>" + msfCtrl(name, o) + "</div></div>";
+}
+function msfRenderOptionsForm(schema, formId) {
+  const std = [], adv = [];
+  for (const k of Object.keys(schema || {})) (schema[k].advanced || schema[k].evasion ? adv : std).push(k);
+  let html = '<div class="msf-form" id="' + (formId || "msf-optform") + '">' + std.map(k => msfOptRow(k, schema[k])).join("");
+  if (adv.length) {
+    const aid = (formId || "msf-optform") + "-adv";
+    html += '<div class="msf-sec" data-msf-toggle="' + aid + '">▸ Advanced / evasion (' + adv.length + ")</div>" +
+      '<div id="' + aid + '" style="display:none">' + adv.map(k => msfOptRow(k, schema[k])).join("") + "</div>";
+  }
+  return html + "</div>";
+}
+function msfFormValues(root) {
+  const out = {};
+  (root || document).querySelectorAll("[data-opt]").forEach(el => {
+    const k = el.getAttribute("data-opt");
+    const v = el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
+    if (v !== "" && v != null) out[k] = v;
+  });
+  return out;
+}
+async function msfModules() {
+  const types = ["exploit","auxiliary","post","payload","encoder","nop","evasion"];
+  msfPanelBody().innerHTML =
+    '<div class="msf-chips" id="msf-modchips">' + types.map(t => '<button class="msf-chip' + (t === msfModType ? " active" : "") + '" data-mt="' + t + '">' + t + "</button>").join("") +
+      '<button class="msf-chip' + (msfModType === "search" ? " active" : "") + '" data-mt="search">search all</button></div>' +
+    '<input class="msf-search" id="msf-modsearch" placeholder="filter / search modules…" value="' + esc(msfModSearch) + '">' +
+    '<div id="msf-modresults" class="msf-note">Loading…</div>';
+  $("msf-modchips").querySelectorAll("[data-mt]").forEach(b => b.onclick = () => { msfModType = b.getAttribute("data-mt"); msfModules(); });
+  const si = $("msf-modsearch"); si.oninput = () => { msfModSearch = si.value; msfModRender(); };
+  msfModRender();
+}
+async function msfModRender() {
+  const box = $("msf-modresults"); if (!box) return;
+  box.className = "msf-note"; box.innerHTML = "Loading…";
+  let rows = [];
+  try {
+    if (msfModType === "search") {
+      if (!msfModSearch.trim()) { box.innerHTML = "Type a query to search across every module (name, path, CVE, platform…)."; return; }
+      rows = normalizeSearch((await msfPost("/msf/module/search", { query: msfModSearch })).results);
+    } else {
+      // Browse a whole type via search("type:X") — gives rank + name + date for every module.
+      if (!msfModCache[msfModType]) msfModCache[msfModType] = normalizeSearch((await msfPost("/msf/module/search", { query: "type:" + msfModType })).results);
+      rows = msfModCache[msfModType];
+      const q = msfModSearch.trim().toLowerCase();
+      if (q) rows = rows.filter(r => (r.full + " " + r.info).toLowerCase().indexOf(q) >= 0);
+    }
+  } catch (e) { rows = []; }
+  if (!rows.length) { box.innerHTML = "No modules match."; return; }
+  const capped = rows.slice(0, 600);
+  box.className = "";
+  box.innerHTML = '<div class="msf-note" style="padding:0 0 8px">' + rows.length + " modules" +
+    (rows.length > 600 ? " (showing 600 — refine with the filter)" : "") + " · click a header to sort</div><div id=\"msf-modtable\"></div>";
+  msfSortTable($("msf-modtable"), [
+    { h: "Module", get: r => r.full, cls: "rc-key" },
+    { h: "Rank", get: r => (MSF_RANK_ORD[r.rank] != null ? MSF_RANK_ORD[r.rank] : -1), cell: r => esc(r.rank || "") },
+    { h: "Disclosure", get: r => r.date || "" },
+    { h: "Name", get: r => r.info || "" },
+    { h: "Description", nosort: true, cls: "rc-desc", cell: r => '<span class="msf-desc" data-mt="' + esc(r.type) + '" data-mn="' + esc(r.short) + '">…</span>' },
+  ], capped, "modules", {
+    onRow: r => msfNav({ view: "module", type: r.type, name: r.short }),
+    afterRender: (c) => msfLazyDescriptions(c),
+  });
+}
+async function msfModuleDetail(type, name) {
+  msfPanel = "configure"; msfShowView("panel");
+  msfSetTitle(type + "/" + name, "");
+  const body = msfPanelBody(); body.innerHTML = '<div class="msf-note">Loading module…</div>';
+  const [info, opts] = await Promise.all([
+    msfGet("/msf/module/info?type=" + encodeURIComponent(type) + "&name=" + encodeURIComponent(name)),
+    msfGet("/msf/module/options?type=" + encodeURIComponent(type) + "&name=" + encodeURIComponent(name))]);
+  if (info.error) { body.innerHTML = '<div class="msf-note">Could not load: ' + esc(info.error_message || "error") + "</div>"; return; }
+  msfCurMod = { type, name, full: type + "/" + name, opts: opts || {}, info };
+  let refs = (info.references || []).map(r => Array.isArray(r) ? r.join("-") : String(r)).slice(0, 8).join(" · ");
+  let html = '<div class="msf-mod-head"><span class="name">' + esc(info.name || name) + '</span><span class="full">' + esc(type + "/" + name) +
+    '</span><span class="rank">' + esc(info.rank || "") + '</span><div class="desc">' + esc(info.description || "") + (refs ? '<br><span style="color:var(--muted)">' + esc(refs) + "</span>" : "") + "</div></div>";
+  if (type === "exploit") html += '<div class="msf-frow"><label>PAYLOAD<span class="desc">compatible payload</span></label><div><select id="msf-payload"><option value="">— none —</option></select></div></div><div id="msf-payload-opts"></div>';
+  if (info.targets && Object.keys(info.targets).length)
+    html += '<div class="msf-frow"><label>TARGET</label><div><select id="msf-target">' + Object.keys(info.targets).map(k => '<option value="' + esc(k) + '">' + esc(k) + " — " + esc(String(info.targets[k])) + "</option>").join("") + "</select></div></div>";
+  html += msfRenderOptionsForm(opts) +
+    '<div class="msf-actions"><button class="msf-btn" id="msf-run">' + (type === "exploit" ? "Exploit" : "Run") + "</button>" +
+    (info.check ? '<button class="msf-btn ghost" id="msf-check">Check</button>' : "") +
+    '<button class="msf-btn ghost" id="msf-setg">Set as globals</button><button class="msf-btn ghost" id="msf-copy">Copy commands</button></div><div id="msf-run-out"></div>';
+  body.innerHTML = html;
+  if (type === "exploit") {
+    const pd = await msfGet("/msf/module/payloads?name=" + encodeURIComponent(name));
+    const sel = $("msf-payload"); (pd.payloads || []).forEach(p => { const o = document.createElement("option"); o.value = p; o.textContent = p; sel.appendChild(o); });
+    sel.onchange = async () => {
+      const po = $("msf-payload-opts"); po.innerHTML = "";
+      if (!sel.value) return;
+      const pop = await msfGet("/msf/module/options?type=payload&name=" + encodeURIComponent(sel.value));
+      if (pop && !pop.error) po.innerHTML = '<div class="msf-sec">Payload options</div>' + msfRenderOptionsForm(pop, "msf-payload-optform") +
+        '<div class="msf-actions" style="margin-top:8px"><button class="msf-btn ghost" id="msf-gen-standalone">Generate standalone (msfvenom)</button></div>';
+      const gs = $("msf-gen-standalone");
+      if (gs) gs.onclick = () => {
+        const pv = msfFormValues($("msf-payload-optform"));
+        const opts = Object.keys(pv).map(k => k + "=" + pv[k]).join(" ");
+        msfNav({ view: "payloads", prefill: { payload: sel.value, options: opts } });
+      };
+    };
+  }
+  $("msf-run").onclick = () => msfRunModule(false);
+  if ($("msf-check")) $("msf-check").onclick = () => msfRunModule("check");
+  $("msf-setg").onclick = () => msfComposeAndRun("setg");
+  $("msf-copy").onclick = () => msfComposeAndRun("copy");
+}
+function msfCompose() {
+  const m = msfCurMod, cmds = ["use " + m.full];
+  const tgt = $("msf-target"); if (tgt && tgt.value) cmds.push("set TARGET " + tgt.value);
+  const opts = msfFormValues($("msf-optform")); for (const k in opts) cmds.push("set " + k + " " + opts[k]);
+  const pay = $("msf-payload");
+  if (pay && pay.value) { cmds.push("set PAYLOAD " + pay.value); const po = msfFormValues($("msf-payload-optform")); for (const k in po) cmds.push("set " + k + " " + po[k]); }
+  return cmds;
+}
+async function msfRunModule(mode) {
+  const cmds = msfCompose();
+  cmds.push(mode === "check" ? "check" : (msfCurMod.type === "exploit" ? "exploit -j -z" : "run -j"));
+  await msfPost("/msf/exec", { commands: cmds });
+  msfOpenPanel("console");            // "Both": watch the live output in the console
+}
+async function msfComposeAndRun(mode) {
+  if (mode === "setg") {
+    const cmds = msfCompose().slice(1).map(c => c.replace(/^set /, "setg "));
+    await msfPost("/msf/exec", { commands: cmds });
+    $("msf-run-out").innerHTML = '<div class="msf-sec">Set ' + cmds.length + " option(s) as globals.</div>";
+  } else {
+    $("msf-run-out").innerHTML = '<div class="msf-sec">Commands / resource script</div><pre class="msf-out2">' + esc(msfCompose().join("\n")) + "</pre>";
+  }
+}
+async function msfSessions() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Loading sessions…</div>';
+  const d = await msfGet("/msf/sessions");
+  if (d && d.error) { b.innerHTML = '<div class="msf-note">' + esc(d.error_message || "error") + "</div>"; return; }
+  const ids = Object.keys(d || {});
+  if (!ids.length) { b.innerHTML = '<div class="msf-note">No active sessions. A session opens here when a module lands one.</div>'; return; }
+  const rows = ids.map(id => Object.assign({ _id: id }, d[id]));
+  b.innerHTML = '<div id="msf-sesstable"></div>';
+  msfSortTable($("msf-sesstable"), [
+    { h: "ID", get: r => r._id, cls: "rc-key" },
+    { h: "Type", get: r => r.type || "" },
+    { h: "Host", get: r => r.session_host || r.tunnel_peer || "" },
+    { h: "Info", get: r => r.info || r.via_exploit || "" },
+  ], rows, "sessions", { onRow: r => msfNav({ view: "session", id: r._id, meta: r }) });
+}
+async function msfSessionDetail(id, meta) {
+  msfPanel = "session"; msfSeshId = id;
+  msfSetTitle("Session " + id + " · " + (meta.type || ""), "");
+  msfPanelBody().innerHTML =
+    '<div class="msf-actions" style="margin:0 0 10px"><button class="msf-btn danger" id="msf-sesh-kill">Kill session</button></div>' +
+    '<pre id="msf-sesh-out" class="msf-out2" style="max-height:320px"></pre>' +
+    '<div class="msf-inrow" style="background:#070a09;border:1px solid var(--edge);border-top:0"><span class="msf-prompt">&gt;</span>' +
+      '<input id="msf-sesh-in" class="msf-in" placeholder="command into session…  (Enter)"></div>' +
+    '<div class="msf-sec">Compatible post-modules — click to configure &amp; run</div><div id="msf-sesh-compat" class="msf-note">Loading…</div>';
+  $("msf-sesh-kill").onclick = async () => { await msfPost("/msf/session/stop", { id }); msfOpenPanel("sessions"); };
+  $("msf-sesh-in").addEventListener("keydown", async e => { if (e.key === "Enter") { const v = e.target.value; e.target.value = ""; await msfPost("/msf/session/write", { id, data: v }); setTimeout(msfSeshPump, 300); } });
+  msfSeshPump();
+  const c = await msfGet("/msf/session/compatible?id=" + encodeURIComponent(id));
+  const mods = (c && c.modules) || [];
+  const comp = $("msf-sesh-compat"); if (!comp) return;
+  comp.className = ""; comp.innerHTML = mods.length ? mods.slice(0, 500).map(m => '<span class="msf-cmd" data-post="' + esc(m) + '">' + esc(m) + "</span>").join("") : '<div class="msf-note">None reported.</div>';
+  comp.querySelectorAll("[data-post]").forEach(el => el.onclick = () => msfNav({ view: "module", type: "post", name: el.getAttribute("data-post").replace(/^post\//, "") }));
+}
+async function msfSeshPump() {
+  clearTimeout(msfSeshTimer); msfSeshTimer = null;
+  if (msfPanel !== "session" || !msfSeshId) return;
+  const r = await msfPost("/msf/session/read", { id: msfSeshId });
+  if (r && r.ok && r.data) { const o = $("msf-sesh-out"); if (o) { o.textContent += r.data; o.scrollTop = o.scrollHeight; } }
+  msfSeshTimer = setTimeout(msfSeshPump, 1200);
+}
+async function msfJobs() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Loading jobs…</div>';
+  const d = await msfGet("/msf/jobs");
+  if (d && d.error) { b.innerHTML = '<div class="msf-note">' + esc(d.error_message || "error") + "</div>"; return; }
+  const ids = Object.keys(d || {});
+  if (!ids.length) { b.innerHTML = '<div class="msf-note">No running jobs. Background runs (handlers, scanners) appear here.</div>'; return; }
+  const rows = ids.map(id => ({ _id: id, name: String(d[id]) }));
+  b.innerHTML = '<div class="msf-actions" style="margin:0 0 10px"><button class="msf-btn ghost" id="msf-jobs-killall">Stop all</button></div><div id="msf-jobtable"></div>';
+  msfSortTable($("msf-jobtable"), [
+    { h: "ID", get: r => r._id, cls: "rc-key" },
+    { h: "Job", get: r => r.name },
+    { h: "", nosort: true, cell: r => '<button class="msf-cmd" data-stop="' + esc(r._id) + '">Stop</button>' },
+  ], rows, "jobs", { afterRender: (c) => c.querySelectorAll("[data-stop]").forEach(x => x.onclick = async () => { await msfPost("/msf/job/stop", { id: x.getAttribute("data-stop") }); msfJobs(); }) });
+  $("msf-jobs-killall").onclick = async () => { for (const id of ids) await msfPost("/msf/job/stop", { id }); msfJobs(); };
+}
+async function msfDB() {
+  const colls = ["hosts","services","vulns","loots","creds","notes"];
+  const b = msfPanelBody();
+  b.innerHTML = '<div class="msf-chips">' + colls.map(c => '<button class="msf-chip' + (c === msfDBColl ? " active" : "") + '" data-dbc="' + c + '">' + c + "</button>").join("") + '</div><div id="msf-dbres" class="msf-note">Loading…</div>';
+  b.querySelectorAll("[data-dbc]").forEach(x => x.onclick = () => { msfDBColl = x.getAttribute("data-dbc"); msfDB(); });
+  const d = await msfGet("/msf/db?coll=" + msfDBColl); const res = $("msf-dbres"); if (!res) return;
+  if (!d.db) { res.className = "msf-note"; res.innerHTML = "<b>Database not connected.</b> The console, modules, sessions and jobs all work without it. To enable hosts / services / vulns / loot / creds, provision a Metasploit database (PostgreSQL + <code>msfdb init</code>) and reconnect."; return; }
+  const data = d.data || {}; const arr = data[msfDBColl] || (Array.isArray(data) ? data : []);
+  if (!arr.length) { res.className = "msf-note"; res.innerHTML = "No " + msfDBColl + " in this workspace yet."; return; }
+  res.className = ""; res.innerHTML = '<div id="msf-dbtable"></div>';
+  const cols = Object.keys(arr[0]).map(k => ({ h: k, get: r => (r[k] == null ? "" : r[k]) }));
+  msfSortTable($("msf-dbtable"), cols, arr.slice(0, 500), "db-" + msfDBColl, {});
+}
+async function msfPayloads(prefill) {
+  if (!msfModNames.payload) { const d = await msfGet("/msf/modules?type=payload"); msfModNames.payload = d.modules || []; }
+  msfPanelBody().innerHTML =
+    '<div class="msf-form"><div class="msf-frow"><label>Payload<span class="req">*</span></label><div><input id="msf-v-payload" list="msf-v-plist" placeholder="e.g. linux/x64/meterpreter/reverse_tcp"><datalist id="msf-v-plist">' +
+    msfModNames.payload.slice(0, 2500).map(p => '<option value="' + esc(p) + '">').join("") + "</datalist></div></div>" +
+    '<div class="msf-frow"><label>Options</label><div><input id="msf-v-opts" placeholder="LHOST=10.0.0.1 LPORT=4444"></div></div>' +
+    '<div class="msf-frow"><label>Format</label><div><input id="msf-v-format" placeholder="elf, exe, raw, python, …"></div></div>' +
+    '<div class="msf-frow"><label>Encoder</label><div><input id="msf-v-encoder" placeholder="(optional)"></div></div>' +
+    '<div class="msf-frow"><label>Iterations</label><div><input id="msf-v-iter" type="number" placeholder="0"></div></div>' +
+    '<div class="msf-frow"><label>Arch · Platform</label><div><input id="msf-v-arch" placeholder="arch"> <input id="msf-v-platform" placeholder="platform"></div></div>' +
+    '<div class="msf-frow"><label>Bad chars</label><div><input id="msf-v-bad" placeholder="\\x00\\x0a"></div></div></div>' +
+    '<div class="msf-actions"><button class="msf-btn" id="msf-v-gen">Generate</button></div><div id="msf-v-out"></div>';
+  if (prefill) { if (prefill.payload) $("msf-v-payload").value = prefill.payload; if (prefill.options) $("msf-v-opts").value = prefill.options; }
+  $("msf-v-gen").onclick = async () => {
+    const out = $("msf-v-out"); out.innerHTML = '<div class="msf-note"><span class="msf-spinner"></span> Generating (loads the framework, ~10–20s)…</div>';
+    const r = await msfPost("/msf/venom", { payload: $("msf-v-payload").value, options: $("msf-v-opts").value, format: $("msf-v-format").value,
+      encoder: $("msf-v-encoder").value, iterations: $("msf-v-iter").value, arch: $("msf-v-arch").value, platform: $("msf-v-platform").value, badchars: $("msf-v-bad").value });
+    out.innerHTML = '<div class="msf-sec">' + (r.ok ? "Output" : "Error") + '</div><pre class="msf-out2">' + esc((r.output || "") + (r.error ? "\n" + r.error : "")) + "</pre>";
+  };
+}
+async function msfPlugins() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Loading plugins…</div>';
+  const d = await msfGet("/msf/plugins"); const pls = d.plugins || [];
+  b.innerHTML = '<div class="msf-note" style="padding:0 0 10px">' + pls.length + " plugins available — click to <code>load</code> (output shows in the console).</div><div>" +
+    pls.map(p => '<span class="msf-cmd" data-plug="' + esc(p) + '">' + esc(p) + "</span>").join("") + "</div>";
+  b.querySelectorAll("[data-plug]").forEach(x => x.onclick = async () => { await msfPost("/msf/plugin", { action: "load", name: x.getAttribute("data-plug") }); msfOpenPanel("console"); });
+}
+async function msfCommands() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Loading command catalog…</div>';
+  const d = await msfGet("/msf/commands"); const g = d.groups || {}; const keys = Object.keys(g);
+  if (!keys.length) { b.innerHTML = '<div class="msf-note">Could not read the command list.</div>'; return; }
+  b.innerHTML = '<div class="msf-note" style="padding:0 0 10px">Every msfconsole command, grouped. Click one to drop it into the console (add args, then Enter).</div>' +
+    keys.map(k => '<div class="msf-cmdgrp"><h4>' + esc(k) + ' Commands</h4><div class="msf-cmd-row">' + g[k].map(c => '<span class="msf-cmd" data-cmd="' + esc(c.cmd) + '" title="' + esc(c.desc) + '">' + esc(c.cmd) + "</span>").join("") + "</div></div>").join("");
+  b.querySelectorAll("[data-cmd]").forEach(x => x.onclick = () => { msfOpenPanel("console"); const inp = $("msf-in"); inp.value = x.getAttribute("data-cmd") + " "; inp.focus(); });
+}
+const MSF_GLOBALS = ["LHOST","LPORT","RHOSTS","RPORT","SRVHOST","SRVPORT","Proxies","SESSION","VERBOSE","ConsoleLogging","LogLevel"];
+async function msfDatastore() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Loading globals…</div>';
+  const cur = await msfGet("/msf/globals?" + MSF_GLOBALS.map(n => "name=" + encodeURIComponent(n)).join("&"));
+  b.innerHTML = '<div class="msf-note" style="padding:0 0 10px">Global datastore (<code>setg</code>) — applies to every module until unset.</div><div class="msf-form">' +
+    MSF_GLOBALS.map(n => '<div class="msf-frow"><label>' + n + '</label><div><input data-g="' + n + '" value="' + esc((cur && cur[n]) || "") + '"></div></div>').join("") +
+    '<div class="msf-frow"><label>Custom</label><div><input id="msf-g-name" placeholder="NAME"> <input id="msf-g-val" placeholder="value"></div></div></div>' +
+    '<div class="msf-actions"><button class="msf-btn" id="msf-g-save">Save globals</button></div><div id="msf-g-out"></div>';
+  $("msf-g-save").onclick = async () => {
+    for (const el of b.querySelectorAll("[data-g]")) if (el.value) await msfPost("/msf/globals", { name: el.getAttribute("data-g"), value: el.value });
+    const cn = $("msf-g-name").value, cv = $("msf-g-val").value; if (cn) await msfPost("/msf/globals", { name: cn, value: cv });
+    $("msf-g-out").innerHTML = '<div class="msf-sec">Saved.</div>';
+  };
+}
+// Import the recon-stage inventory (Network/nmap + Recon), deduped, into Metasploit.
+// Auto-builds on open; one click sets global RHOSTS (+ pushes to the DB when connected).
+async function msfImport() {
+  const b = msfPanelBody(); b.innerHTML = '<div class="msf-note">Building a deduplicated inventory from the recon stage…</div>';
+  const inv = await msfGet("/msf/import"); const hs = (inv && inv.hosts) || [];
+  if (!hs.length) { b.innerHTML = '<div class="msf-note">No host data from the recon stage yet. Run the <b>Network (nmap)</b> or <b>OSINT</b> modules first, then import.</div>'; return; }
+  const c = inv.counts || {};
+  b.innerHTML =
+    '<div class="msf-note" style="padding:0 0 10px">Deduplicated from Network (nmap) + Recon: <b>' + (c.hosts || 0) + '</b> hosts · <b>' + (c.services || 0) +
+      '</b> services · <b>' + (c.hostnames || 0) + '</b> hostnames. This list is always one click away via <b>Targets</b> in the status bar, and you can pop it out to a second monitor.</div>' +
+    '<div class="msf-actions" style="margin:0 0 12px"><button class="msf-btn" id="msf-import-go">Import ' + (c.hosts || 0) + ' hosts into Metasploit</button>' +
+      '<button class="msf-btn ghost" id="msf-import-pop">Open in new window</button></div>' +
+    '<div id="msf-import-out"></div><div id="msf-import-table"></div>';
+  msfSortTable($("msf-import-table"), [
+    { h: "IP", get: r => r.ip, cls: "rc-key" },
+    { h: "Hostnames", get: r => (r.hostnames || []).join(", ") },
+    { h: "OS", get: r => r.os || "" },
+    { h: "Ports / services", get: r => (r.ports || []).length, cell: r => esc((r.ports || []).map(p => p.port + "/" + p.proto + (p.service ? " " + p.service : "")).join(", ")) },
+    { h: "Source", get: r => (r.sources || []).join("+") },
+  ], hs, "import", {});
+  msfRefreshTargets(c.hosts || 0);
+  $("msf-import-pop").onclick = () =>
+    window.open("/msf/recon/popout?project=" + encodeURIComponent(activeProject), "beatrix-recon-" + activeProject, "width=900,height=820");
+  $("msf-import-go").onclick = async () => {
+    const out = $("msf-import-out"); out.innerHTML = '<div class="msf-note"><span class="msf-spinner"></span> Importing…</div>';
+    const r = await msfPost("/msf/import/apply", {});
+    if (!r.ok) { out.innerHTML = '<div class="msf-boot-err">' + esc(r.error || "import failed") + "</div>"; return; }
+    msfRefreshTargets(r.hosts);
+    out.innerHTML = '<div class="msf-sec">Imported — targets are live</div><div class="msf-note">' +
+      '<b>RHOSTS</b> is now set globally to these <b>' + r.hosts + '</b> hosts — <b>every module you <code>use</code> is already pre-targeted</b> (check <code>show options</code>; no need to retype them). ' +
+      (r.db ? "Also pushed " + r.db_hosts + " hosts + services into the msf database (browse under Database)." : "No database here, so this is the no-DB target mechanism — the list lives under <b>Targets</b> (status bar) and the pop-out window; connect a DB to also persist hosts/services.") +
+      "</div>";
+  };
+}
+// Keep the always-visible Targets counter (status bar) in sync; pass a known count or omit to refetch.
+async function msfRefreshTargets(n) {
+  if (n == null) { try { n = ((await msfGet("/msf/import")).counts || {}).hosts || 0; } catch (e) { n = 0; } }
+  const el = $("msf-tgt"); if (el) el.textContent = n;
+}
+
+// ── Nuclei module (manual, operator-controlled templated scanning) ──────────
+let nucInited = false, nucPollTimer = null, nucSince = 0, nucActiveRun = null,
+    nucRunning = false, nucSelRun = null, nucSelTemplates = [], nucLog = "", nucTplList = [];
+function initNuclei() {
+  if (nucInited) return; nucInited = true;
+  $("nuc-run").onclick = runNuclei;
+  $("nuc-stop").onclick = stopNuclei;
+  $("nuc-target").addEventListener("keydown", e => { if (e.key === "Enter") runNuclei(); });
+  $("nuc-tpl-search").onclick = nucTplSearch;
+  $("nuc-tpl-q").addEventListener("keydown", e => { if (e.key === "Enter") nucTplSearch(); });
+  $("nuc-custom-save").onclick = nucCustomSave;
+  $("nuc-tpl-browse").onclick = openNucExplorer;
+  $("nuc-exp-close").onclick = closeNucExplorer;
+  $("nuc-exp-search").onclick = nucExpSearch;
+  $("nuc-exp-folders").onclick = nucExpFolders;
+  $("nuc-exp-q").addEventListener("keydown", e => { if (e.key === "Enter") nucExpSearch(); });
+  $("nuc-explorer").onclick = e => { if (e.target === $("nuc-explorer")) closeNucExplorer(); };
+  document.querySelectorAll("#pane-nuclei .nuc-subtabs button").forEach(b =>
+    b.onclick = () => nucShowSubtab(b.getAttribute("data-nuc")));
+  document.querySelectorAll("#pane-nuclei .net-rtabs button").forEach(b =>
+    b.onclick = () => nucShowRtab(b.getAttribute("data-nr")));
+  renderNucSel();
+}
+function nucShowSubtab(name) {
+  document.querySelectorAll("#pane-nuclei .nuc-subtabs button").forEach(b => b.classList.toggle("active", b.getAttribute("data-nuc") === name));
+  document.querySelectorAll("#pane-nuclei .nuc-pane").forEach(p => p.classList.toggle("active", p.id === "nuc-" + name));
+}
+function nucShowRtab(name) {
+  document.querySelectorAll("#pane-nuclei .net-rtabs button").forEach(b => b.classList.toggle("active", b.getAttribute("data-nr") === name));
+  document.querySelectorAll("#pane-nuclei .net-rbody .nt-pane").forEach(p => p.classList.toggle("active", p.id === "nr-" + name));
+}
+async function loadNucleiFor(pid) {
+  if (pid === null) return;
+  initNuclei();
+  try {
+    const env = await (await fetch("/nuclei/env")).json();
+    if (pid !== activeProject) return;
+    if (!env.nuclei) $("nuc-status").innerHTML = '<span class="bad">nuclei binary not found on PATH</span>';
+    const st = await (await fetch("/nuclei/state?project=" + pid)).json();
+    if (pid !== activeProject) return;
+    renderNucHistory(st.runs || []);
+    const running = (st.runs || []).find(r => r.status === "running");
+    if (running && !nucRunning) { nucActiveRun = running.id; startNucPolling(); }
+    else if ((st.runs || []).length && nucSelRun === null) showNucRun(st.runs[0].id);
+  } catch (e) {}
+}
+function setNucRunning(on) {
+  nucRunning = on;
+  $("nuc-run").disabled = on; $("nuc-stop").disabled = !on;
+  $("nuc-status").innerHTML = on ? '<span class="dim">running…</span>' : '';
+}
+function appendNucLog(t) { nucLog += t + "\n"; const pre = $("nr-log"); pre.textContent = nucLog; pre.scrollTop = pre.scrollHeight; }
+async function runNuclei() {
+  const target = $("nuc-target").value.trim();
+  if (!target) { $("nuc-status").innerHTML = '<span class="bad">enter a target</span>'; return; }
+  const opts = {
+    tags: $("nuc-tags").value.trim(), severity: $("nuc-sev").value.trim(),
+    ids: $("nuc-ids").value.trim(), custom: $("nuc-custom").checked,
+    templates: nucSelTemplates.map(t => t.path),
+  };
+  nucLog = ""; $("nr-log").textContent = ""; nucSince = 0; nucShowRtab("log");
+  const d = await (await fetch("/nuclei/run", { method: "POST", body: JSON.stringify({ project: activeProject, target, opts }) })).json();
+  if (!d.ok) { $("nuc-status").innerHTML = '<span class="bad">' + esc(d.error || "run failed") + '</span>'; return; }
+  nucActiveRun = d.run_id; nucSelRun = d.run_id; startNucPolling(); loadNucState();
+}
+async function stopNuclei() { await fetch("/nuclei/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) }); }
+function startNucPolling() { setNucRunning(true); clearInterval(nucPollTimer); nucPollTimer = setInterval(pollNuclei, 700); pollNuclei(); }
+async function pollNuclei() {
+  let d; try { d = await (await fetch("/nuclei/events?since=" + nucSince + "&project=" + activeProject)).json(); } catch (e) { return; }
+  for (const ev of (d.events || [])) {
+    nucSince = Math.max(nucSince, ev.seq);
+    if (ev.type !== "done" && ev.type !== "finding") appendNucLog(ev.text);
+  }
+  if (d.done) {
+    clearInterval(nucPollTimer); nucPollTimer = null; setNucRunning(false);
+    await loadNucState();
+    if (nucActiveRun) showNucRun(nucActiveRun);
+  }
+}
+async function loadNucState() {
+  try { const st = await (await fetch("/nuclei/state?project=" + activeProject)).json(); renderNucHistory(st.runs || []); } catch (e) {}
+}
+function renderNucHistory(runs) {
+  const box = $("nuc-history");
+  if (!runs.length) { box.innerHTML = '<div class="net-empty">No runs yet.</div>'; return; }
+  box.innerHTML = runs.map(r =>
+    '<div class="net-histrow' + (r.id === nucSelRun ? ' active' : '') + '" data-id="' + r.id + '">' + esc(r.target || "?") +
+    ' <span class="meta">' + (r.status === "running" ? "running…" : (r.count + " finding" + (r.count === 1 ? "" : "s"))) +
+    (r.status === "stopped" ? " (stopped)" : (r.status === "error" ? " (error)" : "")) + '</span></div>').join("");
+  box.querySelectorAll(".net-histrow").forEach(row => row.onclick = () => showNucRun(parseInt(row.getAttribute("data-id"), 10)));
+}
+async function showNucRun(id) {
+  nucSelRun = id;
+  document.querySelectorAll("#nuc-history .net-histrow").forEach(r => r.classList.toggle("active", r.getAttribute("data-id") === String(id)));
+  let d; try { d = await (await fetch("/nuclei/result?run=" + id + "&project=" + activeProject)).json(); } catch (e) { return; }
+  renderNucFindings(d.findings || []); nucShowRtab("findings");
+}
+const NUC_SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4, unknown: 5 };
+function renderNucFindings(findings) {
+  const box = $("nr-findings");
+  if (!findings.length) { box.innerHTML = '<div class="net-empty">No findings for this run.</div>'; return; }
+  const sorted = findings.slice().sort((a, b) => (NUC_SEV_RANK[a.severity] ?? 6) - (NUC_SEV_RANK[b.severity] ?? 6));
+  const rows = sorted.map((f, i) =>
+    '<tr class="nuc-frow" data-i="' + i + '"><td>' + repSpan("nuc-sev-" + esc(f.severity), f.severity) + '</td>' +
+    '<td>' + esc((f.title || "").replace(/^\[Nuclei\]\s*/, "")) + '</td>' +
+    '<td class="nuc-tid">' + esc(f.template_id || "") + '</td>' +
+    '<td class="nuc-matched">' + esc(f.matched_at || f.url || "") + '</td></tr>').join("");
+  box.innerHTML = '<table class="net-ports rep-code nuc-ftable"><thead><tr><th>Sev</th><th>Name</th><th>Template</th><th>Matched</th></tr></thead><tbody>' +
+    rows + '</tbody></table><div id="nuc-detail" class="nuc-detail"></div>';
+  box.querySelectorAll(".nuc-frow").forEach(r => r.onclick = () => {
+    box.querySelectorAll(".nuc-frow").forEach(x => x.classList.remove("active")); r.classList.add("active");
+    renderNucDetail(sorted[parseInt(r.getAttribute("data-i"), 10)]);
+  });
+}
+function renderNucDetail(f) {
+  const box = $("nuc-detail"); if (!box || !f) return;
+  let h = '<h4>' + repSpan("nuc-sev-" + esc(f.severity), f.severity) + ' ' + esc((f.title || "").replace(/^\[Nuclei\]\s*/, "")) + '</h4>';
+  const meta = [];
+  if (f.template_id) meta.push('template <code>' + esc(f.template_id) + '</code>');
+  if (f.matcher) meta.push('matcher <code>' + esc(f.matcher) + '</code>');
+  if (f.confidence) meta.push('confidence ' + esc(f.confidence));
+  if (meta.length) h += '<div class="nuc-dmeta">' + meta.join(" · ") + '</div>';
+  if ((f.tags || []).length) h += '<div class="nuc-dmeta">' + f.tags.map(t => '<span class="nuc-tag">' + esc(t) + '</span>').join(" ") + '</div>';
+  if (f.matched_at) h += '<div class="nuc-drow"><span class="nuc-dlbl">Matched at</span><pre class="rep-code">' + esc(f.matched_at) + '</pre></div>';
+  if (f.description) h += '<div class="nuc-drow"><span class="nuc-dlbl">Description</span><pre class="rep-code">' + esc(f.description) + '</pre></div>';
+  if (f.evidence) h += '<div class="nuc-drow"><span class="nuc-dlbl">Evidence</span><pre class="rep-code">' + esc(f.evidence) + '</pre></div>';
+  if (f.curl) h += '<div class="nuc-drow"><span class="nuc-dlbl">cURL</span><pre class="rep-code">' + esc(f.curl) + '</pre></div>';
+  if ((f.references || []).length) h += '<div class="nuc-drow"><span class="nuc-dlbl">References</span><ul>' +
+    f.references.map(r => '<li>' + (/^https?:/.test(r) ? '<a href="' + esc(r) + '" target="_blank" rel="noopener">' + esc(r) + '</a>' : esc(r)) + '</li>').join("") + '</ul></div>';
+  h += '<div class="nuc-dact"><button class="btn" id="nuc-to-rep">⇥ Send to Repeater</button>' +
+    '<span class="dim"> · also saved to Issues</span></div>';
+  box.innerHTML = h;
+  $("nuc-to-rep").onclick = () => nucToRepeater(f);
+  box.oncontextmenu = (e) => {       // shared Send-to / Copy / Scope routing for this finding
+    e.preventDefault();
+    let req = (f.request || "").trim(); const url = f.matched_at || f.url || ""; let host = "";
+    try { host = new URL(url).host; } catch (e2) {}
+    if (!req) req = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: beatrix-nuclei\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+    showCtxMenu(e.clientX, e.clientY, routeReqMenu({ raw: req, url: url, response: f.response || "" }));
+  };
+}
+async function nucToRepeater(f) {
+  let req = (f.request || "").trim(), target = "", host = "";
+  try { const u = new URL(f.matched_at || f.url); target = u.origin; host = u.host; } catch (e) { target = f.matched_at || f.url || ""; }
+  if (!req) req = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: beatrix-nuclei\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+  await fetch("/repeater/new", { method: "POST", body: JSON.stringify({ project: activeProject, request: req, target }) });
+  document.querySelector('nav button[data-tab="repeater"]').click();
+}
+async function nucTplSearch() {
+  const q = $("nuc-tpl-q").value.trim(), sev = $("nuc-tpl-sev").value.trim();
+  $("nuc-tpl-status").innerHTML = '<span class="dim">searching…</span>';
+  let d; try { d = await (await fetch("/nuclei/catalog?q=" + encodeURIComponent(q) + "&severity=" + encodeURIComponent(sev))).json(); }
+  catch (e) { $("nuc-tpl-status").innerHTML = '<span class="bad">search failed</span>'; return; }
+  nucTplList = d.templates || [];
+  $("nuc-tpl-status").innerHTML = '<span class="dim">' + d.count + (d.capped ? "+ (capped)" : "") + ' templates</span>';
+  renderNucTplList();
+}
+function renderNucTplList() {
+  const box = $("nuc-tpl-list");
+  if (!nucTplList.length) { box.innerHTML = '<div class="net-empty">No matching templates.</div>'; return; }
+  box.innerHTML = nucTplList.map((t, i) =>
+    '<div class="nuc-tplrow" data-i="' + i + '"><div class="nuc-tplrow-top">' +
+    repSpan("nuc-sev-" + esc(t.severity || "unknown"), t.severity || "—") +
+    ' <span class="nuc-tplid">' + esc(t.id) + '</span> <span class="nuc-tplsrc">' + esc(t.source) + '</span>' +
+    '<button class="nuc-tpladd" data-i="' + i + '">＋ scan</button></div>' +
+    '<div class="nuc-tplname">' + esc(t.name || t.rel) + '</div>' +
+    ((t.tags || []).length ? '<div class="nuc-tpltags">' + t.tags.slice(0, 8).map(x => esc(x)).join(" · ") + '</div>' : '') + '</div>').join("");
+  box.querySelectorAll(".nuc-tplrow").forEach(row => row.onclick = (e) => {
+    if (e.target.classList.contains("nuc-tpladd")) return;
+    box.querySelectorAll(".nuc-tplrow").forEach(x => x.classList.remove("active")); row.classList.add("active");
+    showNucTpl(nucTplList[parseInt(row.getAttribute("data-i"), 10)]);
+  });
+  box.querySelectorAll(".nuc-tpladd").forEach(btn => btn.onclick = (e) => { e.stopPropagation(); nucAddTpl(nucTplList[parseInt(btn.getAttribute("data-i"), 10)]); });
+}
+async function showNucTpl(t) {
+  $("nuc-tpl-meta").innerHTML = '<span class="nuc-tplid">' + esc(t.id) + '</span> · ' + esc(t.rel) + ' · <span class="nuc-tplsrc">' + esc(t.source) + '</span>';
+  let d; try { d = await (await fetch("/nuclei/template?path=" + encodeURIComponent(t.path))).json(); } catch (e) { return; }
+  $("nuc-tpl-yaml").textContent = d.ok ? d.text : (d.error || "could not read template");
+}
+function nucAddTpl(t) {
+  if (!nucSelTemplates.some(x => x.path === t.path)) nucSelTemplates.push({ path: t.path, id: t.id });
+  renderNucSel();
+}
+function renderNucSel() {
+  const el = $("nuc-sel"); if (!el) return;
+  if (!nucSelTemplates.length) { el.innerHTML = ""; return; }
+  el.innerHTML = nucSelTemplates.length + ' template' + (nucSelTemplates.length === 1 ? "" : "s") + ' selected · <a href="#" id="nuc-sel-clear">clear</a>';
+  const c = $("nuc-sel-clear"); if (c) c.onclick = (e) => { e.preventDefault(); nucSelTemplates = []; renderNucSel(); };
+}
+async function nucCustomSave() {
+  const name = $("nuc-custom-name").value.trim(), text = $("nuc-custom-text").value;
+  if (!text.trim()) { $("nuc-custom-status").innerHTML = '<span class="bad">template is empty</span>'; return; }
+  const d = await (await fetch("/nuclei/custom/save", { method: "POST", body: JSON.stringify({ name, text }) })).json();
+  $("nuc-custom-status").innerHTML = d.ok ? '<span class="ok">saved ' + esc(d.rel) + '</span>' : '<span class="bad">' + esc(d.error || "save failed") + '</span>';
+}
+// Template explorer — a modal with a lazy folder tree (the repo's real structure
+// = exploit type/protocol) + curated category lenses, for someone who doesn't
+// know where to look. Everything feeds the same scan selection.
+const NUC_LENSES = [
+  { label: "Web app (HTTP)", q: "http/" }, { label: "Network / services", q: "network/" },
+  { label: "DNS", q: "dns/" }, { label: "TLS / SSL", q: "ssl/" },
+  { label: "Known CVEs", q: "cves/" }, { label: "Exposed panels", q: "exposed-panels" },
+  { label: "Default logins", q: "default-logins" }, { label: "Exposures / secrets", q: "exposures/" },
+  { label: "Misconfigurations", q: "misconfiguration" }, { label: "Subdomain takeovers", q: "takeovers" },
+  { label: "Auth / access", q: "auth" }, { label: "Payment / financial", q: "payment" },
+  { label: "Technologies / fingerprint", q: "technologies" }, { label: "Fuzzing / DAST", q: "fuzz" },
+];
+function openNucExplorer() { $("nuc-explorer").classList.add("open"); nucExpRenderLenses(); nucExpFolders(); nucExpUpdateSel(); }
+function closeNucExplorer() { $("nuc-explorer").classList.remove("open"); }
+function nucExpRenderLenses() {
+  const box = $("nuc-exp-lenses"); box.innerHTML = "";
+  NUC_LENSES.forEach(L => {
+    const b = document.createElement("button"); b.className = "nuc-lens"; b.textContent = L.label;
+    b.onclick = () => { $("nuc-exp-q").value = L.q; nucExpSearch(); };
+    box.appendChild(b);
+  });
+}
+async function nucExpSearch() {
+  const q = $("nuc-exp-q").value.trim();
+  $("nuc-exp-status").innerHTML = '<span class="dim">searching…</span>';
+  let d; try { d = await (await fetch("/nuclei/catalog?q=" + encodeURIComponent(q))).json(); }
+  catch (e) { $("nuc-exp-status").innerHTML = '<span class="bad">failed</span>'; return; }
+  $("nuc-exp-status").innerHTML = '<span class="dim">' + d.count + (d.capped ? "+ (capped)" : "") + '</span>';
+  const nav = $("nuc-exp-nav"); nav.innerHTML = "";
+  (d.templates || []).forEach(t => nav.appendChild(nucExpTplRow(t, 0)));
+  if (!(d.templates || []).length) nav.innerHTML = '<div class="net-empty">No matching templates.</div>';
+}
+async function nucExpFolders() {
+  $("nuc-exp-status").innerHTML = '<span class="dim">loading…</span>';
+  const nav = $("nuc-exp-nav"); nav.innerHTML = "";
+  let d; try { d = await (await fetch("/nuclei/tree?path=")).json(); } catch (e) { $("nuc-exp-status").innerHTML = '<span class="bad">failed</span>'; return; }
+  $("nuc-exp-status").innerHTML = "";
+  (d.dirs || []).forEach(dir => nav.appendChild(nucExpDirNode(dir, 0)));
+}
+function nucExpDirNode(dir, depth) {
+  const wrap = document.createElement("div"); wrap.className = "nuc-node";
+  const row = document.createElement("div"); row.className = "nuc-noderow"; row.style.paddingLeft = (8 + depth * 14) + "px";
+  row.innerHTML = '<span class="nuc-caret">▸</span><span class="nuc-folder">' + esc(dir.name) + '</span><span class="nuc-count">' + dir.count + '</span>';
+  const kids = document.createElement("div"); kids.className = "nuc-kids"; kids.style.display = "none";
+  let loaded = false;
+  row.onclick = async () => {
+    if (kids.style.display !== "none") { kids.style.display = "none"; row.querySelector(".nuc-caret").textContent = "▸"; return; }
+    kids.style.display = "block"; row.querySelector(".nuc-caret").textContent = "▾";
+    if (!loaded) {
+      loaded = true;
+      kids.innerHTML = '<div class="nuc-loading" style="padding-left:' + (8 + (depth + 1) * 14) + 'px">loading…</div>';
+      let d; try { d = await (await fetch("/nuclei/tree?path=" + encodeURIComponent(dir.path))).json(); } catch (e) { kids.innerHTML = ""; return; }
+      kids.innerHTML = "";
+      (d.dirs || []).forEach(sub => kids.appendChild(nucExpDirNode(sub, depth + 1)));
+      (d.templates || []).forEach(t => kids.appendChild(nucExpTplRow(t, depth + 1)));
+      if (!(d.dirs || []).length && !(d.templates || []).length) kids.innerHTML = '<div class="net-empty">empty</div>';
+    }
+  };
+  wrap.appendChild(row); wrap.appendChild(kids);
+  return wrap;
+}
+function nucExpTplRow(t, depth) {
+  const row = document.createElement("div"); row.className = "nuc-tnode"; row.style.paddingLeft = (8 + depth * 14) + "px";
+  row.innerHTML = '<span class="nuc-sev-' + esc(t.severity || "unknown") + '">' + esc(t.severity || "—") + '</span>' +
+    '<span class="nuc-tplid">' + esc(t.id) + '</span><span class="nuc-tnode-name">' + esc(t.name || t.rel || "") + '</span>' +
+    '<button class="nuc-tpladd" title="add to scan selection">＋</button>';
+  row.querySelector(".nuc-tpladd").onclick = (e) => { e.stopPropagation(); nucAddTpl(t); nucExpUpdateSel(); };
+  row.onclick = () => {
+    $("nuc-exp-nav").querySelectorAll(".nuc-tnode").forEach(x => x.classList.remove("active"));
+    row.classList.add("active"); nucExpPreview(t);
+  };
+  return row;
+}
+async function nucExpPreview(t) {
+  $("nuc-exp-meta").innerHTML = '<span class="nuc-tplid">' + esc(t.id) + '</span> · ' + esc(t.rel || "") + ' · <span class="nuc-tplsrc">' + esc(t.source || "") + '</span>';
+  let d; try { d = await (await fetch("/nuclei/template?path=" + encodeURIComponent(t.path))).json(); } catch (e) { return; }
+  $("nuc-exp-yaml").textContent = d.ok ? d.text : (d.error || "could not read template");
+}
+function nucExpUpdateSel() {
+  renderNucSel();
+  $("nuc-exp-sel").textContent = nucSelTemplates.length ? (nucSelTemplates.length + " selected for scan") : "";
+}
+function setReconRunning(on) {
+  rcRunning = on; $("rc-run").disabled = on; $("rc-stop").disabled = !on;
+  const sg = $("rc-sweep-go"); if (sg) sg.disabled = on;
+  $("rc-status").innerHTML = on ? '<span class="dim">running…</span>' : "";
+}
+async function runRecon() {
+  const name = $("rc-component").value, target = $("rc-target").value.trim();
+  if (!target) { $("rc-status").innerHTML = '<span class="bad">enter a target</span>'; return; }
+  const opts = {}, o = $("rc-component").selectedOptions[0];
+  if (o && o.dataset.opts.indexOf("words") >= 0 && $("rc-opts").value.trim()) opts.words = $("rc-opts").value.trim();
+  rcLog = ""; $("rc-log").textContent = ""; rcSince = 0;
+  const d = await (await fetch("/recon/run", { method: "POST", body: JSON.stringify({
+    project: activeProject, component: name, target, opts }) })).json();
+  if (!d.ok) { $("rc-status").innerHTML = '<span class="bad">' + esc(d.error || "failed") + '</span>'; return; }
+  setReconRunning(true); startReconPolling();
+}
+function startReconPolling() { clearInterval(rcPollTimer); rcPollTimer = setInterval(pollRecon, 600); pollRecon(); }
+async function pollRecon() {
+  let d;
+  try { d = await (await fetch("/recon/events?since=" + rcSince + "&project=" + activeProject)).json(); }
+  catch (e) { return; }
+  for (const ev of (d.events || [])) {
+    rcSince = Math.max(rcSince, ev.seq);
+    if (ev.type !== "done") rcLog += ev.text + "\n";
+    const m = /Stage (\d+)\/(\d+): (.+?) ──/.exec(ev.text || "");   // sweep progress chip
+    if (m) $("rc-status").innerHTML = '<span class="dim">OSINT sweep · stage ' + m[1] + '/' + m[2] +
+      ' · ' + esc(m[3].split(" · ")[0]) + '</span>';
+  }
+  const pre = $("rc-log"); pre.textContent = rcLog; pre.scrollTop = pre.scrollHeight;
+  if (d.done) {
+    clearInterval(rcPollTimer); rcPollTimer = null; setReconRunning(false); loadReconWorkspace();
+    try { renderReconSweep(await (await fetch("/recon/sweep/state?project=" + activeProject)).json()); } catch (e) {}
+  }
+}
+async function importNmapIPs() {
+  const d = await (await fetch("/recon/import_nmap", { method: "POST", body: JSON.stringify({ project: activeProject }) })).json();
+  $("rc-status").innerHTML = '<span class="dim">imported ' + (d.added || 0) + ' from nmap</span>';
+  loadReconWorkspace();
+}
+// ── OSINT full sweep (resumable, maximum-coverage keyless OSINT) ──
+// Mirrors the nmap Full Sweep: every practical component, one at a time, fanned out
+// over discovered entities. Shares the recon broker/Stop/polling, so /activity glows,
+// the existing Stop stops it, and the view re-attaches on load.
+async function reconSweepGo() {
+  const target = $("rc-target").value.trim();
+  if (!target) { $("rc-status").innerHTML = '<span class="bad">enter a target domain</span>'; return; }
+  const mode = $("rc-sweep-mode").value;
+  if (mode === "aggressive" && !confirm(
+      "Aggressive sweep actively brute-forces subdomains, attempts DNS zone transfers, and reverse-sweeps " +
+      "discovered netblocks — it is noisier and touches the target's own infrastructure. Only run it against " +
+      "assets you are authorized to test.\n\nContinue?")) return;
+  rcLog = ""; $("rc-log").textContent = ""; rcSince = 0;
+  const d = await (await fetch("/recon/sweep/start", { method: "POST", body: JSON.stringify({
+    project: activeProject, target, mode }) })).json();
+  if (!d.ok) { $("rc-status").innerHTML = '<span class="bad">' + esc(d.error || "sweep failed to start") + '</span>'; return; }
+  $("rc-resume").style.display = "none";
+  rcLog += "$ OSINT full sweep (" + d.mode + ") — " + target + " · " + d.total + " stages\n";
+  $("rc-log").textContent = rcLog;
+  setReconRunning(true); startReconPolling();
+}
+async function resumeReconSweep() {
+  $("rc-resume").style.display = "none"; rcSince = 0;
+  const d = await (await fetch("/recon/sweep/resume", { method: "POST", body: JSON.stringify({
+    project: activeProject }) })).json();
+  if (!d.ok) { $("rc-status").innerHTML = '<span class="bad">' + esc(d.error || "resume failed") + '</span>'; return; }
+  setReconRunning(true); startReconPolling();
+}
+async function reconSweepFresh() {
+  await fetch("/recon/sweep/clear", { method: "POST", body: JSON.stringify({ project: activeProject }) });
+  $("rc-resume").style.display = "none";
+}
+function renderReconSweep(sw) {
+  const box = $("rc-resume"); if (!box) return;
+  if (!sw || !sw.exists) { box.style.display = "none"; return; }
+  if (sw.running) {                       // a sweep is live → re-attach polling + show progress
+    box.style.display = "none";
+    if (!rcPollTimer) { setReconRunning(true); startReconPolling(); }
+    $("rc-status").innerHTML = '<span class="dim">OSINT sweep · stage ' + sw.step + '/' + sw.total +
+      (sw.step_label ? ' · ' + esc(sw.step_label) : '') + '</span>';
+    return;
+  }
+  if (sw.resumable) {
+    box.style.display = "";
+    box.innerHTML = '<b>OSINT sweep interrupted</b> — ' + (sw.completed_ops || 0) + ' operation(s) done (' +
+      esc(sw.mode || '') + (sw.target ? ' · ' + esc(sw.target) : '') + '). ' +
+      'Resume continues with the remaining sources and any newly-discovered hosts. ' +
+      '<button class="primary" id="rc-resume-go">Resume</button> ' +
+      '<button id="rc-resume-fresh">Start fresh</button>';
+    $("rc-resume-go").onclick = resumeReconSweep;
+    $("rc-resume-fresh").onclick = reconSweepFresh;
+  } else {
+    box.style.display = "none";
+  }
+}
+
 let sessionActive = false, fsCurrentPath = null;
 
 async function initSession() {
+  showSplash();   // the opening title card — first thing on every launch, above everything else
   let s;
   try { s = await (await fetch("/session")).json(); } catch (e) { s = { active: false }; }
   sessionActive = !!s.active;
@@ -4235,7 +12754,8 @@ function loadDashboard() {
   loadProjects().then(() => {
     loadGhostViewFor(activeProject); loadHuntViewFor(activeProject);
     loadScopeFor(activeProject); loadIssuesFor(activeProject); loadRepeaterFor(activeProject);
-    loadAutoRepeaterFor(activeProject);
+    loadAutoRepeaterFor(activeProject); loadNetworkFor(activeProject);
+    startActivityPolling();   // cross-project scanning glow
   });  // restore any run in progress + the active project's scope/issues
 }
 function setSessionLabel(s) {
@@ -4257,20 +12777,34 @@ appMenu.querySelectorAll(".menu-item").forEach(b => {
   };
 });
 
+// Text size (global UI scale): A−/A+ nudge the user factor, the value resets to 100%.
+// These aren't .menu-item and inner clicks don't close the menu, so the size can be
+// tuned live with the menu open. BeatrixUI persists the choice and re-applies the zoom.
+(function () {
+  const dn = $("scale-dn"), up = $("scale-up"), val = $("scale-val"), STEP = 0.1;
+  if (!dn || !up || !val || !window.BeatrixUI) return;
+  const refresh = () => { val.textContent = Math.round(BeatrixUI.getTextScale() * 100) + "%"; };
+  dn.onclick = () => { BeatrixUI.setTextScale(BeatrixUI.getTextScale() - STEP); refresh(); };
+  up.onclick = () => { BeatrixUI.setTextScale(BeatrixUI.getTextScale() + STEP); refresh(); };
+  val.onclick = () => { BeatrixUI.setTextScale(1); refresh(); };
+  refresh();
+})();
+
 // ── Matrix rain: subtle phosphor drizzle behind the UI (toggle in the menu) ──
 const MRAIN_CHARS = "アカサタナハマヤラワ0123456789<>[]{}=+*/#$%BEATRIX".split("");
 let mrainOn = true, mrainRAF = 0, mrainDrops = [], mrainCtx = null;
 const MRAIN_FONT = 14;
 function mrainResize() {
   const c = $("mrain"); if (!c) return;
-  mrainCtx = c.getContext("2d");
+  try { mrainCtx = c.getContext("2d"); } catch (e) { mrainCtx = null; }
+  if (!mrainCtx) { mrainOn = false; return; }   // canvas blocked/unavailable → skip the rain, never throw
   c.width = innerWidth; c.height = innerHeight;
   mrainDrops = new Array(Math.ceil(innerWidth / MRAIN_FONT)).fill(0)
     .map(() => Math.floor(Math.random() * -60));
   mrainCtx.font = MRAIN_FONT + "px ui-monospace, monospace";
 }
 function mrainStep() {
-  if (!mrainOn || !mrainCtx) return;
+  if (!mrainOn || !mrainCtx || document.hidden) return;   // don't burn frames when the tab is hidden
   mrainCtx.fillStyle = "rgba(10,15,12,0.09)";                 // fade → trails, matches --bg
   mrainCtx.fillRect(0, 0, innerWidth, innerHeight);
   for (let i = 0; i < mrainDrops.length; i++) {
@@ -4285,15 +12819,28 @@ function mrainStep() {
 function setMatrixRain(on) {
   mrainOn = on;
   $("mrain").classList.toggle("off", !on);
-  const label = $("menu-rain"); if (label) label.textContent = "Matrix rain: " + (on ? "on" : "off");
+  const sl = $("scanlines"); if (sl) sl.classList.toggle("off", !on);   // one switch for all screen texture
+  const label = $("menu-rain"); if (label) label.textContent = "Screen FX: " + (on ? "on" : "off");
   try { localStorage.setItem("beatrix.mrain", on ? "1" : "0"); } catch (e) {}
   cancelAnimationFrame(mrainRAF);
   if (on) { mrainResize(); mrainRAF = requestAnimationFrame(mrainStep); }
 }
 addEventListener("resize", () => { if (mrainOn) mrainResize(); });
+// Pause the animation loop while the tab is hidden; resume (if enabled) on return.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { cancelAnimationFrame(mrainRAF); }
+  else if (mrainOn && mrainCtx) { mrainResize(); mrainRAF = requestAnimationFrame(mrainStep); }
+});
 (function () {
-  let v = "1"; try { const s = localStorage.getItem("beatrix.mrain"); if (s !== null) v = s; } catch (e) {}
-  setMatrixRain(v === "1");
+  // Decorative only — must NEVER throw, or it would abort the rest of this
+  // script (including initSession() below) and leave the app un-initialised:
+  // dead project rail, null activeProject, empty Issues. Belt-and-suspenders
+  // around the per-call guards (e.g. a hardened browser that blocks <canvas>).
+  try {
+    let stored = null; try { stored = localStorage.getItem("beatrix.mrain"); } catch (e) {}
+    let reduce = false; try { reduce = matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) {}
+    setMatrixRain(stored !== null ? (stored === "1") : !reduce);
+  } catch (e) {}
 })();
 
 function openSessionModal(tab) {
@@ -4582,8 +13129,8 @@ def _read_body(f, headers: List[list], status: int, method: str, cap: int):
 
 
 def _decompress_body(headers: List[list], body: bytes) -> bytes:
-    """Decode Content-Encoding for display (gzip / deflate / br). Best-effort:
-    if decoding fails, the raw bytes are shown as-is."""
+    """Decode Content-Encoding for display (gzip / deflate / br / zstd).
+    Best-effort: if decoding fails, the raw bytes are shown as-is."""
     enc = ""
     for k, v in headers:
         if k.lower() == "content-encoding":
@@ -4600,6 +13147,11 @@ def _decompress_body(headers: List[list], body: bytes) -> bytes:
         if "br" in enc:
             import brotli  # optional dependency
             return brotli.decompress(body)
+        if "zstd" in enc:
+            import zstandard  # optional dependency
+            # decompressobj() streams, so it handles frames that don't carry an
+            # embedded content size (common from CDNs like Cloudflare).
+            return zstandard.ZstdDecompressor().decompressobj().decompress(body)
     except Exception:  # noqa: BLE001 — show the raw bytes rather than fail the send
         pass
     return body
@@ -4850,6 +13402,770 @@ class _RepeaterStore:
             data["active"] = tab["id"]
             self._write(pid, data)
             return dict(tab)
+
+
+# ── Network (Zenmap-style) store ──────────────────────────────────────────────
+# Per-project nmap scan history, persisted to ``<project>/nmap.json``. Same
+# on-disk discipline as :class:`_RepeaterStore`: no long-lived cache, one lock
+# per op. Each scan keeps its parsed result + raw XML so the GUI can show the
+# ports/topology tabs, the raw output, and diff any two scans (Zenmap's history).
+_NMAP_MAX_SCANS = 100           # per project; oldest dropped beyond this
+
+
+class _NmapStore:
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "nmap.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+            d.setdefault("scans", [])
+            d.setdefault("next_id", 1)
+            d.setdefault("hosts", {})      # merged, deduped-by-IP inventory
+            return d
+        except Exception:
+            return {"scans": [], "next_id": 1, "hosts": {}}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, indent=2, default=str))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _summary(s: Dict[str, Any]) -> Dict[str, Any]:
+        """Light row for the history list — no raw XML or full host detail."""
+        res = s.get("result") or {}
+        hosts = res.get("hosts") or []
+        open_ports = sum(1 for h in hosts for p in h.get("ports", []) if p.get("state") == "open")
+        return {"id": s["id"], "target": s.get("target", ""), "profile": s.get("profile", ""),
+                "command": s.get("command", ""), "status": s.get("status", ""),
+                "started": s.get("started"), "elapsed": res.get("elapsed", 0.0),
+                "summary": res.get("summary", "") or s.get("error", ""),
+                "hosts": len(hosts), "open_ports": open_ports}
+
+    def new_scan(self, pid: Any, meta: Dict[str, Any]) -> int:
+        with self._lock:
+            data = self._read(pid)
+            sid = data["next_id"]
+            data["next_id"] = sid + 1
+            data["scans"].append({
+                "id": sid, "target": meta.get("target", ""), "profile": meta.get("profile", ""),
+                "command": meta.get("command", ""), "args": meta.get("args", ""),
+                "ports": meta.get("ports", ""), "status": "running",
+                "started": time.time(), "result": None, "error": None, "raw_xml": "",
+            })
+            if len(data["scans"]) > _NMAP_MAX_SCANS:
+                data["scans"] = data["scans"][-_NMAP_MAX_SCANS:]
+            self._write(pid, data)
+            return sid
+
+    @staticmethod
+    def _merge_host(cur: Optional[Dict[str, Any]], new: Dict[str, Any], sid: int) -> Dict[str, Any]:
+        """Fold one scan's host into the persistent inventory entry for that IP.
+
+        A rescan refines, it doesn't replace: ports merge by (proto,port) with the
+        newer scan winning for a port it re-observed, while ports found by earlier
+        scans but not re-scanned are kept; OS matches union (best accuracy kept);
+        host scripts merge; a fresh traceroute replaces the old one; the hostname
+        fills in if it was missing. So each host exists once and improves over time.
+        """
+        if cur is None:
+            cur = {"ip": new.get("ip"), "hostname": new.get("hostname", ""),
+                   "state": new.get("state", "unknown"), "os": [], "ports": [],
+                   "scripts": {}, "trace": [], "scans": [], "updated": 0}
+        if new.get("hostname") and not cur.get("hostname"):
+            cur["hostname"] = new["hostname"]
+        if new.get("state") == "up" or not cur.get("state"):
+            cur["state"] = new.get("state", cur.get("state"))
+        pmap = {(p.get("protocol"), p.get("port")): p for p in cur.get("ports", [])}
+        for p in new.get("ports", []):
+            pmap[(p.get("protocol"), p.get("port"))] = p
+        cur["ports"] = [pmap[k] for k in sorted(
+            pmap, key=lambda k: (str(k[0]), k[1] if isinstance(k[1], int) else 0))]
+        osmap = {o.get("name"): o for o in cur.get("os", [])}
+        for o in new.get("os", []):
+            if o.get("name") not in osmap or (o.get("accuracy", 0) > osmap[o["name"]].get("accuracy", 0)):
+                osmap[o["name"]] = o
+        cur["os"] = sorted(osmap.values(), key=lambda o: -(o.get("accuracy") or 0))
+        scripts = dict(cur.get("scripts", {}))
+        scripts.update(new.get("scripts", {}))
+        cur["scripts"] = scripts
+        if new.get("trace"):
+            cur["trace"] = new["trace"]
+        if sid not in cur.get("scans", []):
+            cur.setdefault("scans", []).append(sid)
+        cur["updated"] = time.time()
+        return cur
+
+    def complete_scan(self, pid: Any, sid: int, res: Dict[str, Any]) -> None:
+        with self._lock:
+            data = self._read(pid)
+            for s in data["scans"]:
+                if s["id"] == sid:
+                    s["status"] = "error" if res.get("error") else "done"
+                    s["error"] = res.get("error")
+                    s["command"] = res.get("command", s.get("command", ""))
+                    s["raw_xml"] = res.get("raw_xml", "")
+                    s["result"] = {k: res.get(k) for k in
+                                   ("hosts", "elapsed", "summary", "start", "argline")}
+                    break
+            # Merge this scan's hosts into the persistent, deduped inventory.
+            if not res.get("error"):
+                for h in (res.get("hosts") or []):
+                    ip = h.get("ip")
+                    if ip:
+                        data["hosts"][ip] = self._merge_host(data["hosts"].get(ip), h, sid)
+            self._write(pid, data)
+
+    def state(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            return {"scans": [self._summary(s) for s in reversed(data["scans"])]}
+
+    def get(self, pid: Any, sid: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            data = self._read(pid)
+            for s in data["scans"]:
+                if str(s["id"]) == str(sid):
+                    return dict(s)
+            return None
+
+    @staticmethod
+    def _ip_key(ip: str):
+        try:
+            import ipaddress
+            return (0, int(ipaddress.ip_address(ip)))
+        except Exception:
+            return (1, ip)
+
+    def hosts(self, pid: Any) -> Dict[str, Any]:
+        """The merged, deduped-by-IP host inventory for the project."""
+        with self._lock:
+            data = self._read(pid)
+            rows = list(data["hosts"].values())
+            rows.sort(key=lambda h: self._ip_key(h.get("ip", "")))
+            return {"hosts": rows}
+
+    def delete_host(self, pid: Any, ip: str) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            data["hosts"].pop(ip, None)
+            self._write(pid, data)
+            return {"ok": True}
+
+    def delete(self, pid: Any, sid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            data["scans"] = [s for s in data["scans"] if str(s["id"]) != str(sid)]
+            self._write(pid, data)
+            return {"ok": True}
+
+
+# ── Saved nmap scan profiles ──────────────────────────────────────────────────
+# Per-project custom scan profiles (a name → nmap-args string), in
+# ``<project>/nmap-profiles.json``. These extend the built-in NMAP_PROFILES so an
+# operator can save a tuned command and pick it again from the dropdown.
+class _NmapProfileStore:
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "nmap-profiles.json"
+
+    def _read(self, pid: Any) -> Dict[str, str]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+            return d if isinstance(d, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _write(self, pid: Any, data: Dict[str, str]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, indent=2))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def state(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            return {"profiles": self._read(pid)}
+
+    def save(self, pid: Any, name: str, args: str) -> Dict[str, Any]:
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "error": "a profile name is required"}
+        if name in nmap_runner.NMAP_PROFILES:
+            return {"ok": False, "error": "that name is a built-in profile — pick another"}
+        with self._lock:
+            d = self._read(pid)
+            d[name] = args or ""
+            self._write(pid, d)
+            return {"ok": True, "profiles": d}
+
+    def delete(self, pid: Any, name: str) -> Dict[str, Any]:
+        with self._lock:
+            d = self._read(pid)
+            d.pop(name, None)
+            self._write(pid, d)
+            return {"ok": True, "profiles": d}
+
+
+# ── HTTP history store (browser-captured traffic) ─────────────────────────────
+# Per-project ring of browser transactions in ``<project>/http-history.json`` —
+# the organized home for everything the native-capture browser sees (Burp's
+# Proxy→HTTP history + Target→Site map). Each entry is a full request/response;
+# `list` returns light rows, `get` the full record, `sitemap` the host/path tree.
+_HTTP_MAX = 5000
+
+
+class _HttpHistoryStore(_UndoableStore):
+    _ROW_KEYS = ("id", "method", "url", "host", "path", "status", "mime",
+                 "length", "ts", "in_scope", "resource_type")
+
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "http-history.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+            d.setdefault("tx", [])
+            d.setdefault("next_id", 1)
+            return d
+        except Exception:  # noqa: BLE001
+            return {"tx": [], "next_id": 1}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, default=str))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @classmethod
+    def _row(cls, tx: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: tx.get(k) for k in cls._ROW_KEYS}
+
+    def append(self, pid: Any, tx: Dict[str, Any]) -> int:
+        with self._lock:
+            d = self._read(pid)
+            tx = dict(tx)
+            tx["id"] = d["next_id"]
+            d["next_id"] += 1
+            d["tx"].append(tx)
+            if len(d["tx"]) > _HTTP_MAX:
+                d["tx"] = d["tx"][-_HTTP_MAX:]
+            self._write(pid, d)
+            return tx["id"]
+
+    def list(self, pid: Any, host: Optional[str] = None, scope_only: bool = False,
+             q: Optional[str] = None, limit: int = 2000) -> Dict[str, Any]:
+        with self._lock:
+            txs = self._read(pid)["tx"]
+        ql = (q or "").lower()
+        rows = []
+        for tx in txs:
+            if host and tx.get("host") != host:
+                continue
+            if scope_only and not tx.get("in_scope"):
+                continue
+            if ql and ql not in (tx.get("url", "").lower()):
+                continue
+            rows.append(self._row(tx))
+        return {"rows": rows[-limit:], "total": len(rows)}
+
+    def get(self, pid: Any, txid: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            for tx in self._read(pid)["tx"]:
+                if str(tx.get("id")) == str(txid):
+                    return tx
+        return None
+
+    @staticmethod
+    def _sig_rank(status: Any) -> int:
+        """Rank a status by how much it wants a tester's attention (higher = more).
+        Drives the site map's color coding: 5xx > auth walls > other 4xx > 3xx > 2xx."""
+        try:
+            st = int(status)
+        except (TypeError, ValueError):
+            return 0
+        if st >= 500:
+            return 5
+        if st in (401, 403):
+            return 4
+        if st >= 400:
+            return 3
+        if st >= 300:
+            return 2
+        if st >= 200:
+            return 1
+        return 0
+
+    @staticmethod
+    def _kind_of(tx: Dict[str, Any]) -> str:
+        """Bucket a transaction into one coarse resource kind for the node glyph."""
+        rt = (tx.get("resource_type") or "").lower()
+        mime = (tx.get("mime") or "").lower()
+        if rt in ("document", "iframe", "main_frame", "sub_frame") or "html" in mime:
+            return "doc"
+        if rt in ("xhr", "fetch") or "json" in mime or ("xml" in mime and "html" not in mime):
+            return "api"
+        if rt == "script" or "javascript" in mime or "ecmascript" in mime:
+            return "script"
+        if rt == "stylesheet" or "css" in mime:
+            return "style"
+        if rt == "image" or mime.startswith("image/"):
+            return "image"
+        if rt == "font" or "font" in mime:
+            return "font"
+        return "other"
+
+    def sitemap(self, pid: Any, scope_only: bool = False) -> Dict[str, Any]:
+        """Host→path tree of captured traffic, enriched per node with the signal the
+        UI color-codes by: most-significant status under it, methods/kind at the
+        endpoint, and whether it's a real endpoint, carries params, or is in scope."""
+        with self._lock:
+            txs = self._read(pid)["tx"]
+
+        def _new(label_key: str, label_val: str) -> Dict[str, Any]:
+            return {label_key: label_val, "count": 0, "children": {}, "_rank": 0,
+                    "status": None, "_orank": 0, "_ostatus": None,
+                    "_methods": set(), "_kinds": {}, "_mimes": {},
+                    "leaf": False, "params": False, "in_scope": False,
+                    "bytes": 0, "last_ts": 0.0}
+
+        tree: Dict[str, Any] = {}
+        for tx in txs:
+            if scope_only and not tx.get("in_scope"):
+                continue
+            rank = self._sig_rank(tx.get("status"))
+            in_scope = bool(tx.get("in_scope"))
+            try:
+                ts = float(tx.get("ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            try:
+                ln = int(tx.get("length") or 0)
+            except (TypeError, ValueError):
+                ln = 0
+            host = tx.get("host") or "?"
+            node = tree.get(host)
+            if node is None:
+                node = tree[host] = _new("host", host)
+            cur = node
+            parts = [p for p in (tx.get("path") or "/").split("/") if p]
+            # Walk host → every path segment; each node on the way aggregates the
+            # traffic under it (count + worst status), so a folder reflects its subtree.
+            for step in (None, *parts):
+                if step is not None:
+                    child = cur["children"].get(step)
+                    if child is None:
+                        child = cur["children"][step] = _new("name", step)
+                    cur = child
+                cur["count"] += 1
+                if in_scope:
+                    cur["in_scope"] = True
+                if rank > cur["_rank"]:
+                    cur["_rank"], cur["status"] = rank, tx.get("status")
+                if ts > cur["last_ts"]:        # bubble recency up the whole path
+                    cur["last_ts"] = ts
+            # `cur` is where this request terminates — a real endpoint. Track its OWN
+            # status separately from the bubbled worst-under, so status filtering/faceting
+            # keys on the endpoint's own response, not its subtree's worst.
+            cur["leaf"] = True
+            if rank > cur["_orank"]:
+                cur["_orank"], cur["_ostatus"] = rank, tx.get("status")
+            cur["_methods"].add((tx.get("method") or "GET").upper())
+            if "?" in (tx.get("url") or ""):
+                cur["params"] = True
+            k = self._kind_of(tx)
+            cur["_kinds"][k] = cur["_kinds"].get(k, 0) + 1
+            if ln > cur["bytes"]:
+                cur["bytes"] = ln
+            m = (tx.get("mime") or "").split(";")[0].strip().lower()
+            if m:
+                cur["_mimes"][m] = cur["_mimes"].get(m, 0) + 1
+
+        def _norm(n: Dict[str, Any]) -> Dict[str, Any]:
+            kids = [_norm(c) for c in n.get("children", {}).values()]
+            kinds, methods, mimes = n.get("_kinds", {}), n.get("_methods", set()), n.get("_mimes", {})
+            out = {k: v for k, v in n.items()
+                   if k not in ("children", "_kinds", "_methods", "_mimes",
+                                "_rank", "_orank", "_ostatus", "status")}
+            is_leaf = bool(n.get("leaf"))
+            # Endpoints report their own status; pure folders report the worst beneath them
+            # (so a collapsed folder still flags danger). `dsig` always carries worst-under.
+            out["sig"] = n.get("_orank", 0) if is_leaf else n.get("_rank", 0)
+            out["status"] = n.get("_ostatus") if is_leaf else n.get("status")
+            out["dsig"] = n.get("_rank", 0)
+            out["methods"] = sorted(methods)
+            out["kind"] = max(kinds, key=kinds.get) if kinds else ""
+            out["mime"] = max(mimes, key=mimes.get) if mimes else ""
+            # Folders (nodes with children) first, then leaf endpoints; each alphabetical.
+            out["children"] = sorted(
+                kids, key=lambda x: (0 if x.get("children") else 1,
+                                     (x.get("name") or x.get("host") or "").lower()))
+            return out
+
+        return {"hosts": [_norm(h) for h in
+                          sorted(tree.values(), key=lambda x: x["host"].lower())]}
+
+    def clear(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            self._snapshot_undo(pid)
+            self._write(pid, {"tx": [], "next_id": 1})
+        return {"ok": True}
+
+    def search(self, pid: Any, q: str, limit: int = 4000) -> Dict[str, Any]:
+        """Return ids of transactions whose URL / headers / request or response BODY contain q
+        (case-insensitive) — powers the HTTP history "search bodies" toggle."""
+        ql = (q or "").lower().strip()
+        if not ql:
+            return {"ids": []}
+        out: List[Any] = []
+        with self._lock:
+            for tx in self._read(pid)["tx"]:
+                hay = " ".join([
+                    str(tx.get("url", "")), json.dumps(tx.get("req_headers", {})),
+                    str(tx.get("req_body") or ""), json.dumps(tx.get("resp_headers", {})),
+                    str(tx.get("resp_body") or ""),
+                ]).lower()
+                if ql in hay:
+                    out.append(tx.get("id"))
+        return {"ids": out[-limit:]}
+
+    def delete_items(self, pid: Any, ids: Any) -> Dict[str, Any]:
+        """Remove specific transactions by id (browser-history selective delete). Undoable."""
+        want = set(str(i) for i in (ids or []))
+        if not want:
+            return {"ok": True, "deleted": 0}
+        with self._lock:
+            self._snapshot_undo(pid)
+            d = self._read(pid)
+            before = len(d.get("tx", []))
+            d["tx"] = [t for t in d.get("tx", []) if str(t.get("id")) not in want]
+            self._write(pid, d)
+            return {"ok": True, "deleted": before - len(d["tx"])}
+
+
+# ── Packet capture store ──────────────────────────────────────────────────────
+# Per-project pcap files under ``<project>/captures/`` + a metadata index in
+# ``<project>/captures/index.json``. Captures come from an upload, a live sniff,
+# a scan's linked capture, or crafted/sent packets.
+class _CaptureStore:
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _dir(self, pid: Any) -> Path:
+        d = self._projects.workspace_dir(pid) / "captures"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _index(self, pid: Any) -> Path:
+        return self._dir(pid) / "index.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._index(pid).read_text())
+            d.setdefault("captures", [])
+            d.setdefault("next_id", 1)
+            return d
+        except Exception:
+            return {"captures": [], "next_id": 1}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._index(pid).write_text(json.dumps(data, indent=2, default=str))
+        except Exception:
+            pass
+
+    def path_for(self, pid: Any, cid: int) -> Path:
+        return self._dir(pid) / f"cap-{cid}.pcap"
+
+    def new_capture(self, pid: Any, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Register a capture and return its record (with the on-disk path)."""
+        with self._lock:
+            data = self._read(pid)
+            cid = data["next_id"]
+            data["next_id"] = cid + 1
+            rec = {"id": cid, "name": meta.get("name", f"capture {cid}"),
+                   "source": meta.get("source", "live"), "when": time.time(),
+                   "packets": meta.get("packets", 0), "iface": meta.get("iface", ""),
+                   "filter": meta.get("filter", ""), "scan_id": meta.get("scan_id")}
+            data["captures"].append(rec)
+            self._write(pid, data)
+            return dict(rec, path=str(self.path_for(pid, cid)))
+
+    def update_capture(self, pid: Any, cid: int, **fields: Any) -> None:
+        with self._lock:
+            data = self._read(pid)
+            for c in data["captures"]:
+                if c["id"] == cid:
+                    c.update(fields)
+                    break
+            self._write(pid, data)
+
+    def state(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            return {"captures": list(reversed(data["captures"]))}
+
+    def get(self, pid: Any, cid: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            data = self._read(pid)
+            for c in data["captures"]:
+                if str(c["id"]) == str(cid):
+                    return dict(c, path=str(self.path_for(pid, c["id"])))
+            return None
+
+    def delete(self, pid: Any, cid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            keep = [c for c in data["captures"] if str(c["id"]) != str(cid)]
+            data["captures"] = keep
+            self._write(pid, data)
+        try:
+            self.path_for(pid, int(cid)).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"ok": True}
+
+
+# ── Recon workspace store ─────────────────────────────────────────────────────
+# Per-project recon workspace at ``<project>/recon.json``: deduped entity tables
+# (domain/subdomain/ip/netblock/contact/origin) that every component feeds, plus
+# a run history. Components enrich existing rows across runs (an ip gains
+# asn/org/cdn/origin flags over time). Same on-disk discipline as the other
+# stores: no cache, one lock per op.
+_RECON_KINDS = ("domain", "subdomain", "ip", "netblock", "contact", "origin")
+_RECON_LIST_FIELDS = ("ips", "evidence", "sources", "ports", "vulns", "cpes")
+_RECON_MAX_RUNS = 200
+
+
+class _ReconStore(_UndoableStore):
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "recon.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+        except Exception:
+            d = {}
+        d.setdefault("entities", {})
+        for k in _RECON_KINDS:
+            d["entities"].setdefault(k, {})
+        d.setdefault("runs", [])
+        return d
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, indent=2, default=str))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _merge_one(table: Dict[str, Any], ent: Dict[str, Any]) -> None:
+        key = ent.get("key")
+        if not key:
+            return
+        src = ent.pop("source", None)
+        cur = table.get(key)
+        if cur is None:
+            cur = {k: v for k, v in ent.items() if k not in ("kind", "key")}
+            cur["sources"] = []
+        else:
+            for k, v in ent.items():
+                if k in ("kind", "key"):
+                    continue
+                if k in _RECON_LIST_FIELDS:
+                    merged = list(dict.fromkeys((cur.get(k) or []) + (v if isinstance(v, list) else [v])))
+                    cur[k] = merged
+                elif k == "verified":
+                    cur[k] = bool(cur.get(k)) or bool(v)
+                elif k == "score":
+                    cur[k] = max(cur.get(k) or 0, v or 0)
+                elif not cur.get(k) and v:
+                    cur[k] = v
+        if src:
+            cur["sources"] = list(dict.fromkeys((cur.get("sources") or []) + [src]))
+        table[key] = cur
+
+    def merge(self, pid: Any, entities: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Merge a batch of entities; return how many of each kind are new."""
+        with self._lock:
+            data = self._read(pid)
+            before = {k: len(data["entities"][k]) for k in _RECON_KINDS}
+            for ent in entities:
+                kind = ent.get("kind")
+                if kind in _RECON_KINDS:
+                    self._merge_one(data["entities"][kind], dict(ent))
+            self._write(pid, data)
+            return {k: len(data["entities"][k]) - before[k] for k in _RECON_KINDS}
+
+    def add_run(self, pid: Any, run: Dict[str, Any]) -> None:
+        with self._lock:
+            data = self._read(pid)
+            data["runs"].append(run)
+            if len(data["runs"]) > _RECON_MAX_RUNS:
+                data["runs"] = data["runs"][-_RECON_MAX_RUNS:]
+            self._write(pid, data)
+
+    def values_of(self, pid: Any, kind: str) -> List[str]:
+        """Every entity key of one kind — the fan-out source for the OSINT sweep
+        (e.g. all discovered subdomains to resolve, all IPs to enrich)."""
+        with self._lock:
+            data = self._read(pid)
+            return list((data["entities"].get(kind) or {}).keys())
+
+    def workspace(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            tables = {}
+            for k in _RECON_KINDS:
+                rows = [dict(v, key=key) for key, v in data["entities"][k].items()]
+                rows.sort(key=lambda r: str(r.get("key")))
+                tables[k] = rows
+            return {"tables": tables,
+                    "counts": {k: len(data["entities"][k]) for k in _RECON_KINDS},
+                    "runs": list(reversed(data["runs"]))[:50]}
+
+    def delete(self, pid: Any, kind: str, key: str) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            if kind in data["entities"]:
+                data["entities"][kind].pop(key, None)
+                self._write(pid, data)
+            return {"ok": True}
+
+    def clear(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            self._snapshot_undo(pid)
+            self._write(pid, {"entities": {k: {} for k in _RECON_KINDS}, "runs": []})
+            return {"ok": True}
+
+
+# ── Privileged scapy worker handle ────────────────────────────────────────────
+# Wraps the per-project ``sudo -n <venv-python> -m beatrix.core.scapy_worker``
+# subprocess: writes JSON commands to its stdin, and a reader thread routes its
+# JSON events — streamed packets/sniff-done to the project capture broker, and
+# command acks (sent/result/replay_done/ready) to a queue the request() call
+# blocks on. One in-flight synchronous command at a time (``_cmd_lock``).
+class _ScapyWorker:
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+        self.broker: Optional[_Broker] = None
+        self._results: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._cmd_lock = threading.Lock()
+        self._alive = False
+
+    def alive(self) -> bool:
+        return self._alive and self.proc is not None and self.proc.poll() is None
+
+    def start(self) -> Dict[str, Any]:
+        try:
+            self.proc = subprocess.Popen(
+                ["sudo", "-n", sys.executable, "-m", "beatrix.core.scapy_worker"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        except Exception as e:  # noqa: BLE001
+            return {"ev": "error", "error": f"could not launch worker: {e}"}
+        self._alive = True
+        threading.Thread(target=self._reader, daemon=True).start()
+        return self._await({"ready", "fatal"}, timeout=12)
+
+    def _reader(self) -> None:
+        try:
+            assert self.proc and self.proc.stdout
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                t = ev.get("ev")
+                if t == "packet":
+                    if self.broker:
+                        self.broker.emit({"type": "packet", "detail": ev.get("row")})
+                elif t == "sniff_done":
+                    if self.broker:
+                        self.broker.emit({"type": "sniff_done", "text": str(ev.get("packets", 0))})
+                        self.broker.finish()
+                else:
+                    self._results.put(ev)
+        finally:
+            self._alive = False
+
+    def _write(self, obj: Dict[str, Any]) -> None:
+        assert self.proc and self.proc.stdin
+        self.proc.stdin.write(json.dumps(obj, default=str) + "\n")
+        self.proc.stdin.flush()
+
+    def _await(self, evs: set, timeout: float) -> Dict[str, Any]:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                ev = self._results.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if ev.get("ev") in evs:
+                return ev
+        return {"ev": "error", "error": "worker timed out"}
+
+    def send_async(self, obj: Dict[str, Any]) -> None:
+        """Fire a command without waiting (e.g. sniff_stop, whose sniff_done
+        streams back via the broker)."""
+        if self.alive():
+            try:
+                self._write(obj)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def request(self, obj: Dict[str, Any], wait: set, timeout: float = 12) -> Dict[str, Any]:
+        if not self.alive():
+            return {"ev": "error", "error": "worker is not running"}
+        with self._cmd_lock:
+            while not self._results.empty():        # drop any stale acks
+                try:
+                    self._results.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._write(obj)
+            except Exception as e:  # noqa: BLE001
+                return {"ev": "error", "error": f"worker write failed: {e}"}
+            return self._await(wait | {"error", "fatal"}, timeout)
+
+    def stop(self) -> None:
+        self._alive = False
+        p = self.proc
+        self.proc = None
+        if p is None:
+            return
+        try:
+            p.stdin and p.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ── Sessions ─────────────────────────────────────────────────────────────────
@@ -5282,11 +14598,580 @@ def _needs_session(path: str) -> bool:
     / filesystem route work without one."""
     if path in ("/", "/index.html", "/auth", "/hunt/catalog"):
         return False
-    if path.startswith("/session") or path.startswith("/fs/"):
+    if path.startswith("/session") or path.startswith("/fs/") or path.startswith("/assets/"):
         return False
     if path in _AUTH_GET or path in _AUTH_POST:
         return False
     return True
+
+
+def _nuclei_finding_dict(finding: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a (Finding, raw-nuclei-json) pair into the plain dict the Nuclei
+    module's results view renders — carrying the template id, matched-at, the
+    request/response (for 'send to Repeater'), and the curl reproducer."""
+    info = (raw or {}).get("info", {}) if isinstance(raw, dict) else {}
+    tags = info.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    ev = getattr(finding, "evidence", "") or ""
+    return {
+        "title": getattr(finding, "title", "") or "",
+        "severity": getattr(getattr(finding, "severity", None), "value", None) or "info",
+        "confidence": getattr(getattr(finding, "confidence", None), "value", None) or "tentative",
+        "url": getattr(finding, "url", "") or "",
+        "template_id": (raw.get("template-id") or raw.get("templateID") or "") if isinstance(raw, dict) else "",
+        "matcher": (raw.get("matcher-name") or raw.get("matcher_name") or "") if isinstance(raw, dict) else "",
+        "matched_at": (raw.get("matched-at") or raw.get("matched") or "") if isinstance(raw, dict) else "",
+        "tags": tags if isinstance(tags, list) else [],
+        "description": getattr(finding, "description", "") or "",
+        "evidence": ev if isinstance(ev, str) else str(ev),
+        "references": list(getattr(finding, "references", []) or []),
+        "curl": (raw.get("curl-command") or raw.get("curl_command") or "") if isinstance(raw, dict) else "",
+        "request": (raw.get("request") or "") if isinstance(raw, dict) else "",
+        "response": (raw.get("response") or "") if isinstance(raw, dict) else "",
+    }
+
+
+class _NucleiStore:
+    """Per-project manual-nuclei run history, persisted to ``<project>/nuclei.json``.
+
+    Each run records its target, options, status and the findings it produced
+    (serialized for the results view). Findings ALSO flow into the shared Issues
+    store via the Suite (deduped there); this store is the module's own
+    run-and-results log — the Network tab's scan history is the analogue."""
+
+    _MAX_RUNS = 50
+    _MAX_FINDINGS = 2000
+
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "nuclei.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+            d.setdefault("runs", [])
+            d.setdefault("next_id", 1)
+            return d
+        except Exception:  # noqa: BLE001
+            return {"runs": [], "next_id": 1}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, indent=2, default=str))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def start_run(self, pid: Any, meta: Dict[str, Any]) -> int:
+        with self._lock:
+            data = self._read(pid)
+            rid = data["next_id"]
+            data["next_id"] = rid + 1
+            data["runs"].insert(0, {
+                "id": rid, "target": meta.get("target", ""), "opts": meta.get("opts", {}),
+                "when": time.time(), "status": "running", "count": 0, "command": "",
+                "findings": [],
+            })
+            data["runs"] = data["runs"][:self._MAX_RUNS]
+            self._write(pid, data)
+            return rid
+
+    def add_finding(self, pid: Any, run_id: int, finding: Dict[str, Any]) -> None:
+        with self._lock:
+            data = self._read(pid)
+            for r in data["runs"]:
+                if r["id"] == run_id:
+                    if len(r["findings"]) < self._MAX_FINDINGS:
+                        r["findings"].append(finding)
+                    r["count"] = len(r["findings"])
+                    break
+            self._write(pid, data)
+
+    def complete_run(self, pid: Any, run_id: int, status: str, count: int, command: str) -> None:
+        with self._lock:
+            data = self._read(pid)
+            for r in data["runs"]:
+                if r["id"] == run_id:
+                    r["status"] = status
+                    r["count"] = count
+                    r["command"] = command
+                    break
+            self._write(pid, data)
+
+    def state(self, pid: Any) -> Dict[str, Any]:
+        """Run history WITHOUT findings (the left-column list)."""
+        with self._lock:
+            data = self._read(pid)
+        return {"runs": [{k: r.get(k) for k in ("id", "target", "when", "status", "count", "command")}
+                         for r in data["runs"]]}
+
+    def run_findings(self, pid: Any, run_id: int) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+        for r in data["runs"]:
+            if r["id"] == run_id:
+                return {"run": {k: r.get(k) for k in ("id", "target", "when", "status", "count", "command")},
+                        "findings": r.get("findings", [])}
+        return {"run": None, "findings": []}
+
+
+def _msf_recon_popout_page(proj: Any) -> str:
+    """Standalone reference window for the deduped recon targets — open on a second
+    monitor while you work in the main Metasploit window. Polls /msf/import, read-only."""
+    pid = json.dumps(str(proj))
+    return r"""<!doctype html><html><head><meta charset="utf-8"><title>Beatrix · Recon Targets</title>
+<style>
+ html,body{margin:0;height:100%;background:#0a0f0c;color:#d3ddd2;font:13px ui-monospace,Menlo,Consolas,monospace;}
+ .bar{display:flex;gap:12px;align-items:baseline;padding:9px 12px;background:#111a13;border-bottom:1px solid #1e2b22;position:sticky;top:0;z-index:2;}
+ .bar b{color:#35d07e;letter-spacing:.14em;font-weight:800;}
+ .bar .c{color:#6f8175;} .bar .c b{color:#35d07e;font-weight:700;}
+ .bar input{margin-left:auto;background:#0a0f0c;color:#d3ddd2;border:1px solid #1e2b22;border-radius:6px;padding:6px 9px;font:inherit;min-width:220px;}
+ table{width:100%;border-collapse:collapse;font-size:12.5px;}
+ th,td{text-align:left;padding:5px 10px;border-bottom:1px solid #1e2b22;vertical-align:top;}
+ th{position:sticky;top:41px;background:#0a0f0c;color:#6f8175;font-size:11px;text-transform:uppercase;letter-spacing:.04em;z-index:1;}
+ td.ip{color:#5aa9ff;} .empty{padding:20px;color:#6f8175;line-height:1.6;}
+ /* spreadsheet columns: auto-fit width + drag-to-resize + dynamic wrap (matches the main suite) */
+ table.rtab{table-layout:fixed;}
+ table.rtab th,table.rtab td{white-space:normal !important;overflow-wrap:anywhere;word-break:break-word;}
+ table.rtab.meas{table-layout:auto !important;width:auto !important;}
+ table.rtab.meas th,table.rtab.meas td{white-space:nowrap !important;width:auto !important;max-width:none !important;min-width:0 !important;}
+ .grip{position:absolute;top:0;right:0;width:9px;height:100%;cursor:col-resize;z-index:3;touch-action:none;user-select:none;}
+ .grip::after{content:"";position:absolute;right:0;top:0;width:1px;height:100%;background:transparent;}
+ .grip:hover::after,.grip.drag::after{background:#35d07e;width:2px;}
+</style></head><body>
+ <div class="bar"><b>RECON TARGETS</b><span class="c" id="cnt"></span><input id="f" placeholder="filter…" spellcheck="false"></div>
+ <div id="t"></div>
+<script>
+const PID=__PID__; let ROWS=[];
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function render(){
+ const q=document.getElementById('f').value.trim().toLowerCase();
+ let rows=ROWS; if(q) rows=ROWS.filter(h=>JSON.stringify(h).toLowerCase().indexOf(q)>=0);
+ if(!rows.length){document.getElementById('t').innerHTML='<div class="empty">No recon hosts'+(q?' match the filter.':' yet — run the Network/Recon modules in Beatrix.')+'</div>';return;}
+ document.getElementById('t').innerHTML='<table><thead><tr><th>IP</th><th>Hostnames</th><th>OS</th><th>Ports / services</th><th>Source</th></tr></thead><tbody>'+
+  rows.map(h=>'<tr><td class="ip">'+esc(h.ip)+'</td><td>'+esc((h.hostnames||[]).join(', '))+'</td><td>'+esc(h.os||'')+'</td><td>'+
+   esc((h.ports||[]).map(p=>p.port+'/'+p.proto+(p.service?' '+p.service:'')).join(', '))+'</td><td>'+esc((h.sources||[]).join('+'))+'</td></tr>').join('')+'</tbody></table>';
+ rtab(document.querySelector('#t table'));
+}
+// Compact spreadsheet-column enhancer (same behaviour as the main suite; no global zoom here).
+const RMIN=48,RMAX=460,RDMIN=36,rmem={};
+function hcells(t){return t.tHead&&t.tHead.rows.length?Array.prototype.slice.call(t.tHead.rows[0].cells):(t.rows[0]?Array.prototype.slice.call(t.rows[0].cells):[]);}
+function rkey(t){return hcells(t).map(c=>{const x=c.cloneNode(true);x.querySelectorAll('.grip').forEach(e=>e.remove());return (x.textContent||'').trim().slice(0,28);}).join('|');}
+function rman(k){try{return JSON.parse(localStorage.getItem('beatrix.rtabpop.'+k)||'{}')||{};}catch(e){return {};}}
+function rmeas(t){const cs=hcells(t);if(!cs.length)return null;const pw=cs.map(c=>c.style.width),ptl=t.style.tableLayout,ptw=t.style.width;cs.forEach(c=>c.style.width='');t.style.width='';t.style.tableLayout='auto';t.classList.add('meas');const o=cs.map(c=>Math.max(RMIN,Math.min(RMAX,Math.ceil(c.getBoundingClientRect().width)+1)));t.classList.remove('meas');t.style.tableLayout=ptl;t.style.width=ptw;cs.forEach((c,i)=>c.style.width=pw[i]);return o;}
+// Fill the container; the last column flexes to the right wall (which is therefore not draggable).
+function rapply(t,w){const cs=hcells(t),last=cs.length-1;t.style.tableLayout='fixed';t.style.width='100%';cs.forEach((c,i)=>{c.style.width=(i===last)?'':Math.round(w[i])+'px';});}
+function rtab(t){
+ if(!t)return; const cs=hcells(t); if(!cs.length)return; const last=cs.length-1;
+ t.classList.add('rtab'); const k=rkey(t); let w=rmem[k];
+ if(!w||w.length!==cs.length){w=rmeas(t);const man=rman(k);for(const i in man){if(+i<w.length)w[+i]=man[i];}rmem[k]=w;}
+ rapply(t,w);
+ cs.forEach((th,i)=>{
+  if(i===last)return;                       // far-right wall not draggable
+  if(getComputedStyle(th).position==='static')th.style.position='relative';
+  if(th.querySelector('.grip'))return;
+  const g=document.createElement('div');g.className='grip';g.title='Drag to resize · double-click to auto-fit';th.appendChild(g);
+  g.addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();const sx=e.clientX,sw=th.getBoundingClientRect().width;let raf=0,lx=sx;try{g.setPointerCapture(e.pointerId);}catch(_){}g.classList.add('drag');document.body.style.cursor='col-resize';document.body.style.userSelect='none';
+   const fl=()=>{raf=0;const nw=Math.round(Math.max(RDMIN,sw+(lx-sx)));th.style.width=nw+'px';rmem[k][i]=nw;};   // one apply per frame; last column absorbs it
+   const mv=ev=>{lx=ev.clientX;if(!raf)raf=requestAnimationFrame(fl);};
+   const up=ev=>{if(raf){cancelAnimationFrame(raf);raf=0;}fl();g.removeEventListener('pointermove',mv);g.removeEventListener('pointerup',up);g.removeEventListener('pointercancel',up);try{g.releasePointerCapture(ev.pointerId);}catch(_){}g.classList.remove('drag');document.body.style.cursor='';document.body.style.userSelect='';const px=Math.round(parseFloat(th.style.width)||sw);rmem[k][i]=px;const man=rman(k);man[i]=px;try{localStorage.setItem('beatrix.rtabpop.'+k,JSON.stringify(man));}catch(e){}};
+   g.addEventListener('pointermove',mv);g.addEventListener('pointerup',up);g.addEventListener('pointercancel',up);});
+  g.addEventListener('dblclick',e=>{e.preventDefault();e.stopPropagation();const a=rmeas(t);if(!a)return;rmem[k][i]=a[i];th.style.width=Math.round(a[i])+'px';const man=rman(k);delete man[i];try{localStorage.setItem('beatrix.rtabpop.'+k,JSON.stringify(man));}catch(e){}});
+ });
+}
+window.addEventListener('resize',()=>{const t=document.querySelector('#t table');if(!t||!t.classList.contains('rtab'))return;const k=rkey(t),man=rman(k),a=rmeas(t);if(!a)return;for(let i=0;i<a.length;i++)if(!(i in man))rmem[k][i]=a[i];rapply(t,rmem[k]);});
+async function poll(){
+ try{const d=await (await fetch('/msf/import?project='+encodeURIComponent(PID))).json();
+  ROWS=d.hosts||[];const c=d.counts||{};
+  document.getElementById('cnt').innerHTML='<b>'+(c.hosts||0)+'</b> hosts &middot; <b>'+(c.services||0)+'</b> services &middot; <b>'+(c.hostnames||0)+'</b> hostnames';
+  render();
+ }catch(e){}
+ setTimeout(poll,5000);
+}
+document.getElementById('f').addEventListener('input',render); poll();
+</script></body></html>""".replace("__PID__", pid)
+
+
+def _browser_popout_page(proj: Any) -> str:
+    """A standalone page that shows the capture browser's MJPEG stream and forwards
+    input — opened in its own OS window so the operator can browse here while the
+    main dashboard shows the HTTP traffic. Same-origin, so it drives the same
+    `/browser/*` routes."""
+    pid = json.dumps(str(proj))
+    return """<!doctype html><html><head><meta charset="utf-8"><title>Beatrix Browser</title>
+<style>
+ html,body{margin:0;height:100%;background:#0b0f14;color:#cdd6e4;font:13px ui-monospace,Menlo,monospace;}
+ .bar{display:flex;gap:6px;align-items:center;padding:6px 8px;background:#121821;border-bottom:1px solid #223;}
+ .bar button{background:#1b2430;color:#cdd6e4;border:1px solid #2b3647;border-radius:5px;padding:5px 9px;cursor:pointer;}
+ .bar input{flex:1;background:#0b0f14;color:#cdd6e4;border:1px solid #2b3647;border-radius:5px;padding:6px 8px;font:inherit;}
+ .wrap{position:absolute;top:41px;left:0;right:0;bottom:0;overflow:auto;outline:none;display:flex;justify-content:center;align-items:flex-start;}
+ canvas,img{max-width:100%;height:auto;display:block;background:#fff;}
+</style></head><body>
+ <div class="bar">
+  <button id="b" title="Back">&lsaquo;</button><button id="f" title="Forward">&rsaquo;</button><button id="r" title="Reload">&#10227;</button>
+  <input id="u" placeholder="https://…" spellcheck="false"><button id="g">Go</button>
+ </div>
+ <div class="wrap" id="w" tabindex="0"><canvas id="s" width="1280" height="800"></canvas><img id="s2" alt="browser" hidden></div>
+<script>
+const PID=__PID__; let VP={width:1280,height:800}; let ws=null, transport=null, got=false, fb=null;
+const q=(p)=>p+(p.includes('?')?'&':'?')+'project='+encodeURIComponent(PID);
+const c=document.getElementById('s'), im=document.getElementById('s2'), w=document.getElementById('w');
+function render(buf){createImageBitmap(new Blob([buf],{type:'image/jpeg'})).then(b=>{if(c.width!==b.width||c.height!==b.height){c.width=b.width;c.height=b.height;}c.getContext('2d').drawImage(b,0,0);if(b.close)b.close();}).catch(()=>{});}
+function useMjpeg(){transport='mjpeg';if(ws){try{ws.onclose=null;ws.close();}catch(e){}ws=null;}if(fb){clearTimeout(fb);fb=null;}c.hidden=true;im.hidden=false;im.onerror=()=>{if(transport==='mjpeg')setTimeout(()=>{if(transport==='mjpeg')im.src=q('/browser/stream')+'&t='+Date.now();},800);};im.src=q('/browser/stream')+'&t='+Date.now();}
+function connect(){transport='ws';got=false;c.hidden=false;im.hidden=true;const sch=location.protocol==='https:'?'wss:':'ws:';try{ws=new WebSocket(sch+'//'+location.host+'/browser/ws?project='+encodeURIComponent(PID));}catch(e){useMjpeg();return;}ws.binaryType='arraybuffer';ws.onmessage=(e)=>{if(typeof e.data==='string'||transport!=='ws')return;got=true;if(fb){clearTimeout(fb);fb=null;}render(e.data);};ws.onerror=()=>{try{ws.close();}catch(e){}};ws.onclose=()=>{ws=null;if(transport!=='ws')return;if(!got){useMjpeg();return;}setTimeout(()=>{if(transport==='ws'&&!ws)connect();},700);};fb=setTimeout(()=>{if(!got)useMjpeg();},2500);}
+connect();
+fetch(q('/browser/state')).then(r=>r.json()).then(s=>{if(s.viewport)VP=s.viewport;}).catch(()=>{});
+function post(p,b){return fetch(p,{method:'POST',body:JSON.stringify(Object.assign({project:PID},b))}).catch(()=>{});}
+function coords(e){const el=e.currentTarget,r=el.getBoundingClientRect();return{x:Math.max(0,(e.clientX-r.left)*(VP.width/(r.width||1))),y:Math.max(0,(e.clientY-r.top)*(VP.height/(r.height||1)))};}
+function send(ev){if(transport==='ws'&&ws&&ws.readyState===1){try{ws.send(JSON.stringify(ev));return;}catch(e){}}post('/browser/input',{ev:ev});}
+let lm=0;
+[c,im].forEach(el=>{
+el.addEventListener('mousemove',e=>{const n=Date.now();if(n-lm<60)return;lm=n;const p=coords(e);send({t:'move',x:p.x,y:p.y});});
+el.addEventListener('mousedown',e=>{e.preventDefault();w.focus();const p=coords(e);send({t:'down',x:p.x,y:p.y,button:e.button===2?'right':'left'});});
+el.addEventListener('mouseup',e=>{e.preventDefault();const p=coords(e);send({t:'up',x:p.x,y:p.y,button:e.button===2?'right':'left'});});
+el.addEventListener('contextmenu',e=>e.preventDefault());
+el.addEventListener('wheel',e=>{e.preventDefault();const p=coords(e);send({t:'wheel',x:p.x,y:p.y,dx:e.deltaX,dy:e.deltaY});},{passive:false});
+});
+w.addEventListener('keydown',e=>{const sp={Enter:1,Backspace:1,Tab:1,Delete:1,ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Escape:1,Home:1,End:1,PageUp:1,PageDown:1};if(sp[e.key]){e.preventDefault();send({t:'press',key:e.key});}else if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){e.preventDefault();send({t:'type',text:e.key});}});
+function go(){const u=document.getElementById('u').value.trim();if(u)post('/browser/navigate',{url:u});}
+document.getElementById('g').onclick=go;
+document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+document.getElementById('b').onclick=()=>post('/browser/nav',{action:'back'});
+document.getElementById('f').onclick=()=>post('/browser/nav',{action:'forward'});
+document.getElementById('r').onclick=()=>post('/browser/nav',{action:'reload'});
+</script></body></html>""".replace("__PID__", pid)
+
+
+# ── Metasploit Framework bridge ───────────────────────────────────────────────
+# Drives a single, lazily-started ``msfrpcd`` (msgpack-RPC over a localhost HTTP
+# socket) — the same interface Armitage and the official MSF web UI use. One
+# framework instance serves the whole suite; the interactive console is bridged
+# through console.create/read/write and surfaced to the browser with the same
+# poll-with-cursor pattern as ghost/hunt events. Bound to 127.0.0.1 with a random
+# password, like the rest of the suite. No extra dependency — ``msgpack`` ships
+# with the venv; the tiny RPC client below is all that's needed.
+class _MsfManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._clock = threading.Lock()
+        self.proc: Optional[subprocess.Popen] = None
+        self.port = 0
+        self.user = "beatrix"
+        self.password = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        self.token: Optional[str] = None
+        self.booting = False
+        self.boot_error = ""
+        self.console_id: Optional[str] = None
+        self._cbuf = ""            # accumulated console output (drained from msf on each read)
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None and self.token is not None
+
+    @staticmethod
+    def _free_port() -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    @staticmethod
+    def _decode(o: Any) -> Any:
+        # MSF packs strings as msgpack *bin*, so responses come back with bytes keys
+        # and values regardless of the unpacker's raw flag — decode them to str.
+        if isinstance(o, bytes):
+            return o.decode("utf-8", "replace")
+        if isinstance(o, dict):
+            return {_MsfManager._decode(k): _MsfManager._decode(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_MsfManager._decode(x) for x in o]
+        return o
+
+    # ── lifecycle ──
+    def start(self) -> Dict[str, Any]:
+        with self._lock:
+            if self.alive():
+                return {"ok": True, "running": True}
+            if self.booting:
+                return {"ok": True, "booting": True}
+            exe = shutil.which("msfrpcd")
+            if not exe:
+                return {"ok": False, "error": "msfrpcd not found — install Metasploit (install.sh step 6)."}
+            self.booting = True
+            self.boot_error = ""
+            self.token = None
+            self.console_id = None
+            self._cbuf = ""
+            self.port = self._free_port()
+        try:
+            args = [exe, "-f", "-a", "127.0.0.1", "-p", str(self.port),
+                    "-U", self.user, "-P", self.password, "-S"]
+            if shutil.which("psql") is None:   # no local DB → skip the DB-connect attempt at boot
+                args.append("-n")
+            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:  # noqa: BLE001
+            with self._lock:
+                self.booting = False
+                self.boot_error = f"could not launch msfrpcd: {e}"
+            return {"ok": False, "error": self.boot_error}
+        threading.Thread(target=self._await_ready, daemon=True).start()
+        return {"ok": True, "booting": True}
+
+    def _await_ready(self) -> None:
+        deadline = time.time() + 180      # a first run performs MSF initial setup → slow
+        while time.time() < deadline:
+            if self.proc is None or self.proc.poll() is not None:
+                with self._lock:
+                    self.booting = False
+                    self.boot_error = "msfrpcd exited during startup"
+                return
+            try:
+                tok = self._login()
+                if tok:
+                    with self._lock:
+                        self.token = tok
+                        self.booting = False
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+        with self._lock:
+            self.booting = False
+            if not self.token:
+                self.boot_error = "msfrpcd did not become ready in time"
+
+    def _login(self) -> Optional[str]:
+        res = self._call("auth.login", self.user, self.password, auth=False, timeout=8)
+        if isinstance(res, dict) and res.get("result") == "success":
+            return res.get("token")
+        return None
+
+    # ── msgpack-RPC client ──
+    def _call(self, method: str, *args: Any, auth: bool = True, timeout: float = 30) -> Any:
+        import msgpack, urllib.request
+        if auth:
+            if not self.token:
+                raise RuntimeError("not authenticated")
+            payload = [method, self.token, *args]
+        else:
+            payload = [method, *args]
+        body = msgpack.packb(payload, use_bin_type=False)
+        req = urllib.request.Request("http://127.0.0.1:%d/api/" % self.port, data=body,
+                                     headers={"Content-Type": "binary/message-pack"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+        out = _MsfManager._decode(msgpack.unpackb(raw, raw=True, strict_map_key=False))
+        if isinstance(out, dict) and out.get("error"):
+            raise RuntimeError(str(out.get("error_message") or out.get("error_string") or "RPC error"))
+        return out
+
+    def call(self, method: str, *args: Any) -> Any:
+        return self._call(method, *args, auth=True)
+
+    # ── status for the HUD ──
+    def status(self) -> Dict[str, Any]:
+        if self.booting:
+            return {"running": False, "booting": True}
+        if not self.alive():
+            return {"running": False, "booting": False, "error": self.boot_error}
+        st: Dict[str, Any] = {"running": True, "booting": False}
+        try:
+            v = self._call("core.version")
+            st["version"] = v.get("version")
+            st["ruby"] = v.get("ruby")
+            st["api"] = v.get("api")
+        except Exception as e:  # noqa: BLE001
+            return {"running": False, "booting": False, "error": str(e)}
+        try:
+            st["sessions"] = len(self._call("session.list") or {})
+        except Exception:  # noqa: BLE001
+            st["sessions"] = 0
+        try:
+            st["jobs"] = len(self._call("job.list") or {})
+        except Exception:  # noqa: BLE001
+            st["jobs"] = 0
+        try:
+            self._call("db.workspaces")
+            st["db"] = True
+        except Exception:  # noqa: BLE001
+            st["db"] = False
+        return st
+
+    # ── console bridge ──
+    def _ensure_console(self) -> str:
+        if self.console_id is not None:
+            return self.console_id
+        res = self._call("console.create")
+        self.console_id = str(res.get("id"))
+        return self.console_id
+
+    def console_read(self, since: int) -> Dict[str, Any]:
+        with self._clock:
+            try:
+                cid = self._ensure_console()
+                r = self._call("console.read", cid)
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e), "cursor": since}
+            if r.get("data"):
+                self._cbuf += r.get("data")
+            if len(self._cbuf) > 400000:          # cap so a long session can't grow unbounded
+                self._cbuf = self._cbuf[-300000:]
+            tail = self._cbuf[since:] if 0 <= since <= len(self._cbuf) else self._cbuf
+            return {"ok": True, "data": tail, "cursor": len(self._cbuf),
+                    "prompt": r.get("prompt") or "", "busy": bool(r.get("busy"))}
+
+    def console_write(self, data: str) -> Dict[str, Any]:
+        with self._clock:
+            try:
+                cid = self._ensure_console()
+                self._call("console.write", cid, data if data.endswith("\n") else data + "\n")
+                return {"ok": True}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e)}
+
+    def console_tabs(self, line: str) -> Dict[str, Any]:
+        try:
+            cid = self._ensure_console()
+            r = self._call("console.tabs", cid, line)
+            return {"ok": True, "tabs": r.get("tabs") or []}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e), "tabs": []}
+
+    # ── GUI helpers (reflective, so coverage is complete by construction) ──
+    def try_call(self, method: str, *args: Any) -> Any:
+        try:
+            return self.call(method, *args)
+        except Exception as e:  # noqa: BLE001
+            return {"error": True, "error_message": str(e)}
+
+    # The RPC method per module type is NOT a uniform pluralization (verified via
+    # introspection: module.auxiliary/post/evasion have no trailing "s").
+    MODULE_METHODS = {"exploit": "module.exploits", "auxiliary": "module.auxiliary",
+                      "post": "module.post", "payload": "module.payloads",
+                      "encoder": "module.encoders", "nop": "module.nops", "evasion": "module.evasion"}
+
+    def module_list(self, mtype: str) -> List[str]:
+        method = self.MODULE_METHODS.get(mtype)
+        if not method:
+            return []
+        r = self.try_call(method)
+        if isinstance(r, dict):
+            return r.get("modules") or []
+        return r or []
+
+    def _session_meta(self, sid: Any) -> Dict[str, Any]:
+        try:
+            lst = self.call("session.list") or {}
+            return lst.get(str(sid)) or lst.get(int(sid), {}) if str(sid).isdigit() else lst.get(str(sid), {})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def session_read(self, sid: Any) -> Dict[str, Any]:
+        typ = (self._session_meta(sid) or {}).get("type", "shell")
+        try:
+            r = self.call("session.meterpreter_read" if typ == "meterpreter" else "session.shell_read", sid)
+            return {"ok": True, "type": typ, "data": (r or {}).get("data", "")}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def session_write(self, sid: Any, data: str) -> Dict[str, Any]:
+        typ = (self._session_meta(sid) or {}).get("type", "shell")
+        if not data.endswith("\n"):
+            data += "\n"
+        try:
+            self.call("session.meterpreter_write" if typ == "meterpreter" else "session.shell_write", sid, data)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def db_get(self, coll: str) -> Dict[str, Any]:
+        method = {"hosts": "db.hosts", "services": "db.services", "vulns": "db.vulns",
+                  "notes": "db.notes", "loots": "db.loots", "creds": "db.creds",
+                  "workspaces": "db.workspaces"}.get(coll)
+        if not method:
+            return {"ok": False, "error": "unknown collection"}
+        try:
+            return {"ok": True, "db": True, "data": self.call(method, {})}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": True, "db": False, "note": str(e)[:140]}   # no DB → graceful
+
+    def plugin_list(self) -> List[str]:
+        out: List[str] = []
+        for t in self.console_tabs("load ").get("tabs", []):
+            name = t[5:] if t.startswith("load ") else t
+            if name and "." not in name and name not in out:
+                out.append(name)
+        return sorted(out)
+
+    def command_catalog(self) -> Dict[str, Any]:
+        # Reflective: parse `help` from a throwaway console into {group: [{cmd, desc}]}.
+        try:
+            cid = str(self.call("console.create").get("id"))
+        except Exception:  # noqa: BLE001
+            return {}
+        buf = ""
+        try:
+            self.call("console.write", cid, "help\n")
+            for _ in range(25):
+                r = self.call("console.read", cid)
+                buf += r.get("data") or ""
+                if not r.get("busy") and buf:
+                    break
+                time.sleep(0.2)
+        finally:
+            try:
+                self.call("console.destroy", cid)
+            except Exception:  # noqa: BLE001
+                pass
+        groups: Dict[str, List[Dict[str, str]]] = {}
+        cur = None
+        lines = buf.splitlines()
+        for i, ln in enumerate(lines):
+            mh = re.match(r"^(\S.*?) Commands\s*$", ln)
+            if mh and i + 1 < len(lines) and set(lines[i + 1].strip()) == {"="}:
+                cur = mh.group(1).strip()
+                groups[cur] = []
+                continue
+            if cur:
+                mr = re.match(r"^\s{2,}(\S+)\s{2,}(.*\S)?\s*$", ln)
+                if mr and mr.group(1) not in ("Command", "-------"):
+                    groups[cur].append({"cmd": mr.group(1), "desc": (mr.group(2) or "").strip()})
+        return {g: v for g, v in groups.items() if v}
+
+    def venom(self, opts: Dict[str, Any]) -> Dict[str, Any]:
+        exe = shutil.which("msfvenom")
+        if not exe:
+            return {"ok": False, "error": "msfvenom not found"}
+        args = [exe]
+        if opts.get("payload"):
+            args += ["-p", str(opts["payload"])]
+        for kv in str(opts.get("options") or "").split():
+            args.append(kv)                       # LHOST=1.2.3.4 LPORT=4444 … (argv, not shell)
+        for flag, key in (("-f", "format"), ("-e", "encoder"), ("-i", "iterations"),
+                          ("-a", "arch"), ("--platform", "platform"), ("-b", "badchars")):
+            if opts.get(key):
+                args += [flag, str(opts[key])]
+        try:
+            p = subprocess.run(args, capture_output=True, timeout=180)   # bytes: payload output may be binary
+            return {"ok": p.returncode == 0, "output": p.stdout.decode("utf-8", "replace"),
+                    "error": p.stderr.decode("utf-8", "replace"), "bytes": len(p.stdout), "cmd": " ".join(args)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e), "cmd": " ".join(args)}
+
+    def stop(self) -> None:
+        with self._lock:
+            p, self.proc = self.proc, None
+            self.token = None
+            self.console_id = None
+            self.booting = False
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class SuiteServer:
@@ -5318,6 +15203,29 @@ class SuiteServer:
         self.hunt_tasks: Dict[str, Any] = {}
         # AutoRepeater (Intruder-style) attack per project, keyed str(project id).
         self.ar_attacks: Dict[str, _AutoAttack] = {}
+        # Network (nmap) scan broker + stop-event per project.
+        self.nmap_brokers: Dict[str, _Broker] = {}
+        self.nmap_stops: Dict[str, threading.Event] = {}
+        # Packet-capture broker + live scapy worker handle per project.
+        self.capture_brokers: Dict[str, _Broker] = {}
+        self.scapy_workers: Dict[str, Any] = {}
+        # Native-capture browser controller + transaction broker per project.
+        self.browser_controllers: Dict[str, Any] = {}
+        self.browser_brokers: Dict[str, _Broker] = {}
+        # Recon component broker + stop-event per project.
+        self.recon_brokers: Dict[str, _Broker] = {}
+        self.recon_stops: Dict[str, threading.Event] = {}
+        # Passive site-map scan broker + stop-event per project.
+        self.passive_brokers: Dict[str, _Broker] = {}
+        self.passive_stops: Dict[str, threading.Event] = {}
+        # Manual-nuclei run broker + stop-event per project.
+        self.nuclei_brokers: Dict[str, _Broker] = {}
+        self.nuclei_stops: Dict[str, threading.Event] = {}
+        # Metasploit Framework bridge — one lazily-started msfrpcd PER PROJECT, so each
+        # project tab is a fully isolated framework instance (its own console, sessions,
+        # jobs, datastore and DB workspace). Keyed by str(project id); `self.msf` resolves
+        # to the ACTIVE project's manager, so the /msf/* routes stay project-agnostic.
+        self.msf_mgrs: Dict[str, _MsfManager] = {}
         self._lock = threading.Lock()
         registry = Path(sessions_registry) if sessions_registry \
             else DEFAULT_STATE_DIR.parent / "sessions.json"
@@ -5325,6 +15233,95 @@ class SuiteServer:
                                         legacy_dir=DEFAULT_STATE_DIR)
         if state_dir is not None:
             self.mount_session(state_dir, register=False)
+
+    @property
+    def msf(self) -> "_MsfManager":
+        """The Metasploit manager for the ACTIVE project — lets routes stay project-agnostic."""
+        pid = self.projects.state().get("active") if self.projects else None
+        return self.msf_for(pid)
+
+    def msf_for(self, pid: Any) -> "_MsfManager":
+        """The per-project Metasploit manager (created lazily; booted on demand)."""
+        key = str(pid)
+        m = self.msf_mgrs.get(key)
+        if m is None:
+            m = _MsfManager()
+            self.msf_mgrs[key] = m
+        return m
+
+    def _stop_all_msf(self) -> None:
+        for m in list(self.msf_mgrs.values()):
+            try:
+                m.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.msf_mgrs.clear()
+
+    def _close_project(self, project_id: Any) -> None:
+        """Release every per-project resource/port when a project is torn down
+        (deleted). Stops the project's scans/captures and closes its msfrpcd RPC
+        port, capture-browser (Chromium/CDP) and scapy worker, so nothing keeps a
+        listener or subprocess open for a project that no longer exists. Each step
+        is idempotent and no-ops when that tool was never used."""
+        key = str(project_id)
+        for stopper in (self.stop_hunt_run, self.stop_ghost_run, self.stop_nmap_scan,
+                        self.stop_nuclei, self.stop_recon, self.stop_passive,
+                        self.stop_capture, self.stop_autorepeater_run, self.browser_stop):
+            try:
+                stopper(project_id)
+            except Exception:  # noqa: BLE001
+                pass
+        m = self.msf_mgrs.pop(key, None)
+        if m is not None:
+            try:
+                m.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        w = self.scapy_workers.pop(key, None)
+        if w is not None:
+            try:
+                w.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        for st in (self.http_history_store, self.recon, self.issues):   # drop undo backups
+            try:
+                st.drop_undo(project_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self.browser_controllers.pop(key, None)
+        self.browser_brokers.pop(key, None)
+
+    def activity(self) -> Dict[str, Any]:
+        """Which modules have a live run, per project — powers the scanning
+        indicators. Cheap: just reads each broker's ``done`` flag (and the
+        AutoRepeater attack's ``running``), the same liveness test ``start_*`` uses."""
+        def live(brokers: Dict[str, Any], key: str) -> bool:
+            b = brokers.get(key)
+            try:
+                return b is not None and not b.since(10 ** 9)["done"]
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            st = self.projects.state() if self.projects else {}
+        except Exception:  # noqa: BLE001
+            st = {}
+        out: Dict[str, List[str]] = {}
+        for p in st.get("projects", []):
+            key = str(p.get("id"))
+            mods: List[str] = []
+            if live(self.hunt_brokers, key): mods.append("scan")
+            if live(self.passive_brokers, key): mods.append("passive")
+            if live(self.nmap_brokers, key): mods.append("network")
+            if live(self.nuclei_brokers, key): mods.append("nuclei")
+            if live(self.recon_brokers, key): mods.append("recon")
+            if live(self.ghost_brokers, key): mods.append("ghost")
+            if live(self.capture_brokers, key): mods.append("packets")
+            a = self.ar_attacks.get(key)
+            if a is not None and getattr(a, "running", False):
+                mods.append("autorepeater")
+            if mods:
+                out[key] = mods
+        return {"active": st.get("active"), "projects": out}
 
     # ── Session lifecycle ────────────────────────────────────────────────
     def mount_session(self, session_dir: Any, register: bool = True) -> Dict[str, Any]:
@@ -5338,11 +15335,44 @@ class SuiteServer:
             self.issues = _IssueStore(self.projects)
             self.scan_checkpoints = _ScanCheckpoint(self.projects)
             self.repeater = _RepeaterStore(self.projects)
+            self.nmap = _NmapStore(self.projects)
+            self.nmap_profiles_store = _NmapProfileStore(self.projects)
+            self.nmap_sweeps = _NmapSweep(self.projects)
+            self.captures = _CaptureStore(self.projects)
+            self.http_history_store = _HttpHistoryStore(self.projects)
+            self.recon = _ReconStore(self.projects)
+            self.recon_sweeps = _ReconSweep(self.projects)
+            self.nuclei = _NucleiStore(self.projects)
             self.ghost_brokers.clear()
             self.hunt_brokers.clear()
             self.ghost_tasks.clear()
             self.hunt_tasks.clear()
             self.ar_attacks.clear()
+            # Tear down any live scapy workers before dropping their handles.
+            for w in list(self.scapy_workers.values()):
+                try:
+                    w.stop()
+                except Exception:
+                    pass
+            # Close any live browser windows before dropping their handles.
+            for bc in list(self.browser_controllers.values()):
+                try:
+                    bc.stop()
+                except Exception:
+                    pass
+            self.nmap_brokers.clear()
+            self.nmap_stops.clear()
+            self.capture_brokers.clear()
+            self.scapy_workers.clear()
+            self._stop_all_msf()                 # a new session = new projects → drop old msf instances
+            self.browser_controllers.clear()
+            self.browser_brokers.clear()
+            self.recon_brokers.clear()
+            self.recon_stops.clear()
+            self.passive_brokers.clear()
+            self.passive_stops.clear()
+            self.nuclei_brokers.clear()
+            self.nuclei_stops.clear()
         if register:
             self.sessions.register(str(d), d.name)
         return self.session_info()
@@ -5366,6 +15396,1151 @@ class SuiteServer:
         tab = self.repeater.record_send(project_id, tab_id, request or "",
                                         target or "", resp)
         return {"ok": True, "response": resp, "tab": tab}
+
+    # ── Network (nmap) scan lifecycle ─────────────────────────────────────
+    def start_nmap_scan(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Launch one nmap scan on a thread, streaming stdout to the project's
+        broker and persisting the parsed result to the _NmapStore on completion.
+        Mirrors the Ghost/AutoRepeater per-project background pattern."""
+        key = str(project_id)
+        b = self.nmap_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A scan is already running for this project."}
+        if not nmap_runner.nmap_available():
+            return {"ok": False, "error": "nmap is not installed on this host."}
+        target = (payload.get("target") or "").strip()
+        if not target:
+            return {"ok": False, "error": "Enter a target (host, CIDR, or range)."}
+        profile = payload.get("profile") or ""
+        args = payload.get("args")
+        if args is None:
+            args = nmap_runner.NMAP_PROFILES.get(profile, "")
+        ports = payload.get("ports") or ""
+        display = nmap_runner.display_command(target, args, ports)
+        scan_id = self.nmap.new_scan(project_id, {"target": target, "profile": profile,
+                                                  "command": display, "args": args, "ports": ports})
+        broker = _Broker(meta={"target": target, "scan_id": scan_id})
+        stop = threading.Event()
+        self.nmap_brokers[key] = broker
+        self.nmap_stops[key] = stop
+        threading.Thread(target=self._run_nmap,
+                         args=(project_id, scan_id, target, args, ports, broker, stop),
+                         daemon=True).start()
+        return {"ok": True, "scan_id": scan_id, "command": display,
+                "privileged": nmap_runner.needs_root(args)}
+
+    def _run_nmap(self, project_id: Any, scan_id: int, target: str, args: str,
+                  ports: str, broker: "_Broker", stop: threading.Event) -> None:
+        try:
+            xmlp = str(self.projects.workspace_dir(project_id) / f"nmap-{scan_id}.xml")
+        except Exception:  # noqa: BLE001
+            xmlp = f"/tmp/beatrix-nmap-{scan_id}.xml"
+        priv = nmap_runner.needs_root(args)
+        broker.emit({"type": "log", "text": "Scanning %s%s …" % (
+            target, " (root via sudo)" if priv else "")})
+        res = nmap_runner.run_scan(
+            target, args, ports, xmlp,
+            on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
+            on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
+            stop_event=stop)
+        self.nmap.complete_scan(project_id, scan_id, res)
+        if res.get("error"):
+            broker.emit({"type": "error", "text": res["error"]})
+        broker.emit({"type": "done", "text": res.get("summary") or "scan complete",
+                     "detail": str(scan_id)})
+        broker.finish()
+
+    def nmap_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.nmap_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def stop_nmap_scan(self, project_id: Any) -> Dict[str, Any]:
+        s = self.nmap_stops.get(str(project_id))
+        if s is not None:
+            s.set()
+        return {"ok": True}
+
+    # ── Full-sweep sequence (resumable, one-button maximum-coverage recon) ──
+    def start_nmap_sweep(self, project_id: Any, payload: Dict[str, Any],
+                         resume: bool = False) -> Dict[str, Any]:
+        """Start (or resume) a Full Sweep: an ordered list of nmap steps run one at a
+        time on a single shared broker, each folded into the deduped inventory. Mirrors
+        the Hunt scanner's resumable pattern — completed steps are skipped and a step
+        stopped mid-run continues via ``nmap --resume``. Shares nmap_brokers/nmap_stops
+        with single scans, so /activity glows, Stop stops it, _close_project stops it,
+        and the Network view re-attaches on load."""
+        key = str(project_id)
+        b = self.nmap_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A scan or sweep is already running for this project."}
+        if not nmap_runner.nmap_available():
+            return {"ok": False, "error": "nmap is not installed on this host."}
+        interrupted = None
+        if resume:
+            cp = self.nmap_sweeps.resume(project_id)
+            if not cp:
+                return {"ok": False, "error": "No interrupted sweep to resume for this project."}
+            target = cp.get("target") or ""
+            mode = cp.get("mode") or "passive"
+            steps = cp.get("steps") or nmap_runner.sweep_steps(mode)
+            completed = list(cp.get("completed") or [])
+            interrupted = cp.get("interrupted_step") or None
+        else:
+            target = (payload.get("target") or "").strip()
+            if not target:
+                return {"ok": False, "error": "Enter a target (host, CIDR, or range)."}
+            mode = "active" if (payload.get("mode") == "active") else "passive"
+            steps = nmap_runner.sweep_steps(mode)
+            completed = []
+            self.nmap_sweeps.start(project_id, target, mode, steps)
+        broker = _Broker(meta={"target": target, "sweep": mode})
+        stop = threading.Event()
+        self.nmap_brokers[key] = broker
+        self.nmap_stops[key] = stop
+        threading.Thread(
+            target=self._run_nmap_sweep,
+            args=(project_id, target, mode, steps, completed, interrupted, broker, stop),
+            daemon=True).start()
+        remaining = [st for st in steps if st.get("key") not in completed]
+        return {"ok": True, "mode": mode, "target": target, "total": len(steps),
+                "completed": len(completed), "remaining": len(remaining)}
+
+    def _run_nmap_sweep(self, project_id: Any, target: str, mode: str,
+                        steps: List[Dict[str, Any]], completed: List[str],
+                        interrupted: Optional[Dict[str, Any]], broker: "_Broker",
+                        stop: threading.Event) -> None:
+        total = len(steps)
+        done = set(completed or [])
+        resuming = bool(completed or interrupted)
+        broker.emit({"type": "phase", "text": (
+            ("── Resumed sweep ── " if resuming else "── Full sweep ── ")
+            + target + "  (" + mode + ", " + str(total) + " steps)")})
+        if resuming:
+            broker.emit({"type": "log", "text": "Resuming — %d of %d step(s) already complete."
+                         % (len(done), total)})
+        try:
+            for idx, step in enumerate(steps, 1):
+                skey = step.get("key")
+                if skey in done:
+                    continue
+                if stop.is_set():
+                    break
+                label = step.get("label") or skey
+                broker.emit({"type": "phase", "text": "── Step %d/%d: %s ──" % (idx, total, label)})
+                args, ports = step.get("args", ""), step.get("ports", "")
+                display = nmap_runner.display_command(target, args, ports)
+                scan_id = self.nmap.new_scan(project_id, {
+                    "target": target, "profile": "Full sweep \u00b7 " + label,
+                    "command": display, "args": args, "ports": ports})
+                try:
+                    base = str(self.projects.workspace_dir(project_id) / ("nmap-sweep-%d" % scan_id))
+                except Exception:  # noqa: BLE001
+                    base = "/tmp/beatrix-nmap-sweep-%d" % scan_id
+                resume_base = None
+                if interrupted and interrupted.get("key") == skey and interrupted.get("resume_base"):
+                    resume_base = interrupted.get("resume_base")
+                    broker.emit({"type": "log", "text": "Resuming this step from %s \u2026" % resume_base})
+                res = nmap_runner.run_scan(
+                    target, args, ports, base + ".xml",
+                    on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
+                    on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
+                    stop_event=stop, oa_base=(None if resume_base else base),
+                    resume_base=resume_base)
+                # A resume that can't continue (single host / nothing left) → run fresh.
+                if resume_base and res.get("error") and not stop.is_set():
+                    broker.emit({"type": "log", "text": "Resume not applicable — re-running this step from the start."})
+                    res = nmap_runner.run_scan(
+                        target, args, ports, base + ".xml",
+                        on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
+                        on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
+                        stop_event=stop, oa_base=base)
+                self.nmap.complete_scan(project_id, scan_id, res)
+                interrupted = None
+                if stop.is_set():
+                    self.nmap_sweeps.set_interrupted(project_id, skey, base)
+                    broker.emit({"type": "error",
+                                 "text": "Sweep stopped — step '%s' can be resumed." % label})
+                    break
+                self.nmap_sweeps.mark_step_done(project_id, skey)
+                done.add(skey)
+            else:
+                self.nmap_sweeps.set_status(project_id, "done")
+                broker.emit({"type": "done", "text": "Full sweep complete (%d steps)." % total})
+                broker.finish()
+                return
+        except Exception as e:  # noqa: BLE001
+            broker.emit({"type": "error", "text": "sweep error: %s" % e})
+        # Break (stopped) or exception: mark interrupted so the UI offers Resume.
+        self.nmap_sweeps.set_status(project_id, "interrupted")
+        broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
+        broker.finish()
+
+    def nmap_sweep_state(self, project_id: Any) -> Dict[str, Any]:
+        cp = self.nmap_sweeps.get(project_id)
+        b = self.nmap_brokers.get(str(project_id))
+        running = bool(b is not None and not b.since(10 ** 9)["done"])
+        if not cp:
+            return {"exists": False, "running": running}
+        steps = cp.get("steps") or []
+        completed = cp.get("completed") or []
+        status = cp.get("status") or ""
+        cur, cur_label = len(steps), ""
+        for i, st in enumerate(steps, 1):
+            if st.get("key") not in completed:
+                cur, cur_label = i, (st.get("label") or st.get("key") or ""); break
+        return {"exists": True, "running": running, "mode": cp.get("mode"),
+                "target": cp.get("target"), "status": status,
+                "total": len(steps), "completed": len(completed),
+                "step": cur, "step_label": cur_label,
+                "resumable": bool(status in ("running", "interrupted") and not running
+                                  and len(completed) < len(steps))}
+
+    def nmap_diff(self, project_id: Any, a: Any, b: Any) -> Dict[str, Any]:
+        sa = self.nmap.get(project_id, a)
+        sb = self.nmap.get(project_id, b)
+        if not sa or not sb:
+            return {"ok": False, "error": "scan not found"}
+        return {"ok": True,
+                "diff": nmap_runner.diff_scans(sa.get("result") or {}, sb.get("result") or {}),
+                "a": _NmapStore._summary(sa), "b": _NmapStore._summary(sb)}
+
+    def nmap_profiles(self, project_id: Any) -> Dict[str, Any]:
+        return self.nmap_profiles_store.state(project_id)
+
+    def nmap_profile_save(self, project_id: Any, name: str, args: str) -> Dict[str, Any]:
+        return self.nmap_profiles_store.save(project_id, name, args)
+
+    def nmap_profile_delete(self, project_id: Any, name: str) -> Dict[str, Any]:
+        return self.nmap_profiles_store.delete(project_id, name)
+
+    def nmap_export(self, project_id: Any, sid: Any, fmt: str) -> Dict[str, Any]:
+        """Export one stored scan as raw XML, CSV, or greppable (.gnmap) text."""
+        s = self.nmap.get(project_id, sid)
+        if not s:
+            return {"ok": False, "error": "scan not found"}
+        fmt = (fmt or "xml").lower()
+        target = (s.get("target") or "scan").replace("/", "_").replace(" ", "_")
+        base = f"nmap-{target}-{sid}"
+        if fmt == "xml":
+            return {"ok": True, "filename": base + ".xml", "text": s.get("raw_xml") or ""}
+        res = s.get("result") or {}
+        if fmt == "csv":
+            return {"ok": True, "filename": base + ".csv", "text": nmap_runner.to_csv(res)}
+        if fmt in ("gnmap", "grep"):
+            return {"ok": True, "filename": base + ".gnmap", "text": nmap_runner.to_gnmap(res)}
+        return {"ok": False, "error": "unknown format: " + fmt}
+
+    # ── Native-capture browser + HTTP history ─────────────────────────────
+    def _in_scope(self, project_id: Any, host: str) -> bool:
+        allowed = self.projects.get_scope(project_id)
+        denied = self.projects.get_scope_exclude(project_id)
+        return _scope_allows(host, allowed, denied)
+
+    def _browser_for(self, project_id: Any) -> Any:
+        """The project's BrowserController, created (with its transaction sink
+        wired to the HTTP-history store + broker) on first use."""
+        key = str(project_id)
+        broker = self.browser_brokers.get(key)
+        if broker is None:
+            broker = _Broker(meta={"browser": True})
+            self.browser_brokers[key] = broker
+        bc = self.browser_controllers.get(key)
+        if bc is not None and bc.running:
+            return bc
+        if bc is not None:
+            try:            # a stopped/crashed controller — tear it down, don't reuse
+                bc.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if True:
+            def sink(ev: Dict[str, Any], _pid: Any = project_id, _broker: "_Broker" = broker) -> None:
+                if ev.get("type") == "transaction":
+                    tx = ev["detail"]
+                    txid = self.http_history_store.append(_pid, tx)
+                    _broker.emit({"type": "transaction",
+                                  "detail": _HttpHistoryStore._row(dict(tx, id=txid))})
+                elif ev.get("type") == "held":
+                    _broker.emit({"type": "held", "detail": ev["detail"]})
+            # Headless + screencast: the page renders offscreen and streams JPEG
+            # frames into the dashboard (the embedded viewer), so no display is
+            # needed on the host — works the same locally and in a Codespace.
+            bc = browser_driver.BrowserController(
+                sink, scope_check=lambda host, _pid=project_id: self._in_scope(_pid, host),
+                headless=True)
+            self.browser_controllers[key] = bc
+        return bc
+
+    def browser_launch(self, project_id: Any) -> Dict[str, Any]:
+        return self._browser_for(project_id).launch()
+
+    def browser_stop(self, project_id: Any) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.stop() if bc else {"ok": True}
+
+    def browser_navigate(self, project_id: Any, url: str) -> Dict[str, Any]:
+        return self._browser_for(project_id).navigate(url or "")
+
+    def browser_state(self, project_id: Any) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        if bc is None:
+            return {"running": False, "intercept": False, "held": 0,
+                    "available": browser_driver.PLAYWRIGHT_AVAILABLE}
+        return bc.state()
+
+    def browser_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.browser_brokers.get(str(project_id))
+        return b.since(int(since)) if b else {"events": [], "done": True}
+
+    def browser_intercept_set(self, project_id: Any, on: bool) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.set_intercept(on) if bc else {"ok": False, "error": "browser not running"}
+
+    def browser_intercept_list(self, project_id: Any) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return {"held": bc.held() if bc else []}
+
+    def browser_intercept_forward(self, project_id: Any, hid: Any,
+                                  overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.forward(hid, overrides) if bc else {"ok": False, "error": "browser not running"}
+
+    def browser_intercept_drop(self, project_id: Any, hid: Any) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.drop(hid) if bc else {"ok": False, "error": "browser not running"}
+
+    def browser_frame(self, project_id: Any, since: Any) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        if bc is None or not bc.running:
+            return {"frame": None, "running": False, "viewport": {"width": 1280, "height": 800}}
+        f = bc.get_frame(int(since or 0))
+        return {"frame": f, "running": True, "viewport": bc.viewport()}
+
+    def browser_input(self, project_id: Any, ev: Dict[str, Any]) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.input_event(ev or {}) if bc else {"ok": False, "error": "browser not running"}
+
+    def browser_nav(self, project_id: Any, action: str) -> Dict[str, Any]:
+        bc = self.browser_controllers.get(str(project_id))
+        return bc.nav(action) if bc else {"ok": False, "error": "browser not running"}
+
+    def http_history(self, project_id: Any, host: Optional[str], scope_only: bool,
+                     q: Optional[str]) -> Dict[str, Any]:
+        return self.http_history_store.list(project_id, host or None, scope_only, q or None)
+
+    def http_detail(self, project_id: Any, txid: Any) -> Dict[str, Any]:
+        return {"tx": self.http_history_store.get(project_id, txid)}
+
+    def http_sitemap(self, project_id: Any, scope_only: bool) -> Dict[str, Any]:
+        return self.http_history_store.sitemap(project_id, scope_only)
+
+    def http_clear(self, project_id: Any) -> Dict[str, Any]:
+        return self.http_history_store.clear(project_id)
+
+    def http_search(self, project_id: Any, q: str) -> Dict[str, Any]:
+        return self.http_history_store.search(project_id, q)
+
+    # ── Generic data management (browser-history-style delete + undo) ─────
+    def _undo_store(self, name: str):
+        """Map a store name to its _UndoableStore instance (one place to add more)."""
+        return {"http": self.http_history_store, "recon": self.recon,
+                "issues": self.issues}.get(name)
+
+    def data_delete(self, name: str, project_id: Any, ids: Any) -> Dict[str, Any]:
+        st = self._undo_store(name)
+        if st is None or not hasattr(st, "delete_items"):
+            return {"ok": False, "error": "selective delete not supported for '%s'" % name}
+        return st.delete_items(project_id, ids)
+
+    def data_clear(self, name: str, project_id: Any) -> Dict[str, Any]:
+        st = self._undo_store(name)
+        if st is None:
+            return {"ok": False, "error": "unknown store '%s'" % name}
+        return st.clear(project_id)
+
+    def data_undo(self, name: str, project_id: Any) -> Dict[str, Any]:
+        st = self._undo_store(name)
+        if st is None:
+            return {"ok": False, "error": "unknown store '%s'" % name}
+        return st.restore(project_id)
+
+    def data_undo_state(self, name: str, project_id: Any) -> Dict[str, Any]:
+        st = self._undo_store(name)
+        return {"available": bool(st is not None and st.has_undo(project_id))}
+
+    # ── Packets + scapy lifecycle ─────────────────────────────────────────
+    @staticmethod
+    def _interfaces() -> List[str]:
+        try:
+            return [n for _, n in socket.if_nameindex()]
+        except Exception:  # noqa: BLE001
+            return ["lo"]
+
+    def packet_env(self, project_id: Any) -> Dict[str, Any]:
+        """What the Packets pane needs to configure itself: interfaces, whether
+        live capture is possible here, and the stored captures for this project."""
+        return {"interfaces": self._interfaces(),
+                "can_capture": nmap_runner.sudo_available(),
+                "tshark": shutil.which("tshark") is not None,
+                "captures": self.captures.state(project_id).get("captures", [])}
+
+    def _worker_for(self, project_id: Any, broker: Optional["_Broker"] = None) -> "_ScapyWorker":
+        key = str(project_id)
+        w = self.scapy_workers.get(key)
+        if w is None or not w.alive():
+            w = _ScapyWorker()
+            r = w.start()
+            if r.get("ev") == "ready":
+                self.scapy_workers[key] = w
+        if broker is not None:
+            w.broker = broker
+        return w
+
+    def start_capture(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(project_id)
+        iface = (payload.get("iface") or "").strip()
+        flt = (payload.get("filter") or "").strip()
+        rec = self.captures.new_capture(project_id, {
+            "source": payload.get("source", "live"), "iface": iface, "filter": flt,
+            "name": payload.get("name") or ("Live " + (iface or "capture")),
+            "scan_id": payload.get("scan_id")})
+        broker = _Broker(meta={"iface": iface, "capture_id": rec["id"]})
+        self.capture_brokers[key] = broker
+        w = self._worker_for(project_id, broker)
+        if not w.alive():
+            return {"ok": False, "error": "could not start the capture worker "
+                    "(live capture needs passwordless sudo)."}
+        r = w.request({"cmd": "sniff_start", "iface": iface or None,
+                       "filter": flt or None, "out": rec["path"]}, {"sniff_started"}, timeout=10)
+        if r.get("ev") != "sniff_started":
+            return {"ok": False, "error": r.get("error", "failed to start capture")}
+        return {"ok": True, "capture_id": rec["id"]}
+
+    def stop_capture(self, project_id: Any) -> Dict[str, Any]:
+        w = self.scapy_workers.get(str(project_id))
+        if w is not None and w.alive():
+            w.send_async({"cmd": "sniff_stop"})
+        return {"ok": True}
+
+    def capture_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.capture_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def packets_list(self, project_id: Any, cid: Any, flt: str, offset: int) -> Dict[str, Any]:
+        c = self.captures.get(project_id, cid)
+        if not c:
+            return {"error": "capture not found", "packets": [], "total": 0}
+        return packet_engine.read_capture(c["path"], flt or "", int(offset or 0), 200)
+
+    def packet_detail_at(self, project_id: Any, cid: Any, n: Any) -> Dict[str, Any]:
+        c = self.captures.get(project_id, cid)
+        if not c:
+            return {"detail": None}
+        return {"detail": packet_engine.packet_detail(c["path"], int(n))}
+
+    def packets_stream(self, project_id: Any, cid: Any, n: Any) -> Dict[str, Any]:
+        """Follow the TCP/UDP stream that packet ``n`` belongs to."""
+        c = self.captures.get(project_id, cid)
+        if not c:
+            return {"error": "capture not found"}
+        return packet_engine.follow_stream(c["path"], int(n))
+
+    def packets_stats(self, project_id: Any, cid: Any) -> Dict[str, Any]:
+        """Protocol / conversation / endpoint statistics for a capture."""
+        c = self.captures.get(project_id, cid)
+        if not c:
+            return {"error": "capture not found"}
+        return packet_engine.statistics(c["path"])
+
+    def packets_export(self, project_id: Any, cid: Any, flt: str) -> Dict[str, Any]:
+        """Write the filtered subset to a temp pcap and return it base64-encoded
+        for a client-side download (empty filter → the whole capture)."""
+        import tempfile
+        c = self.captures.get(project_id, cid)
+        if not c:
+            return {"ok": False, "error": "capture not found"}
+        fd, tmp = tempfile.mkstemp(suffix=".pcap")
+        os.close(fd)
+        try:
+            res = packet_engine.export_subset(c["path"], flt or "", tmp)
+            if res.get("error"):
+                return {"ok": False, "error": res["error"]}
+            with open(tmp, "rb") as fh:
+                data = fh.read()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        base = (c.get("name") or f"capture-{cid}").rsplit(".", 1)[0]
+        fname = f"{base}-filtered.pcap" if (flt or "").strip() else f"{base}.pcap"
+        return {"ok": True, "filename": fname,
+                "b64": base64.b64encode(data).decode("ascii"),
+                "written": res["written"], "total": res["total"]}
+
+    def packets_upload(self, project_id: Any, name: str, data_b64: str) -> Dict[str, Any]:
+        try:
+            raw = base64.b64decode(data_b64 or "")
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "bad file data"}
+        if not raw:
+            return {"ok": False, "error": "empty file"}
+        rec = self.captures.new_capture(project_id, {"source": "uploaded",
+                                                     "name": name or "uploaded.pcap"})
+        try:
+            with open(rec["path"], "wb") as fh:
+                fh.write(raw)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+        info = packet_engine.read_capture(rec["path"], "", 0, 1)
+        if info.get("error"):
+            return {"ok": False, "error": "not a valid pcap/pcapng: " + info["error"]}
+        self.captures.update_capture(project_id, rec["id"], packets=info.get("total", 0))
+        return {"ok": True, "capture_id": rec["id"], "packets": info.get("total", 0)}
+
+    def scapy_send(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        w = self._worker_for(project_id)
+        if not w.alive():
+            return {"ok": False, "error": "scapy worker unavailable (send needs passwordless sudo)"}
+        cmd: Dict[str, Any] = {"cmd": "send", "mode": payload.get("mode", "send"),
+                               "iface": (payload.get("iface") or None),
+                               "timeout": int(payload.get("timeout") or 3)}
+        if payload.get("spec"):
+            cmd["spec"] = payload["spec"]
+        elif payload.get("expr"):
+            cmd["expr"] = payload["expr"]
+        else:
+            return {"ok": False, "error": "provide a packet spec or a scapy expression"}
+        if payload.get("fragsize"):
+            cmd["fragsize"] = int(payload["fragsize"])
+        c = self.captures.get(project_id, payload.get("capture_id")) if payload.get("capture_id") else None
+        if c:
+            cmd["out"] = c["path"]
+        r = w.request(cmd, {"sent"}, timeout=max(6, int(payload.get("timeout") or 3) + 4))
+        if r.get("ev") != "sent":
+            return {"ok": False, "error": r.get("error", "send failed")}
+        return {"ok": True, "sent": r.get("sent"), "reply": r.get("reply"),
+                "fragments": r.get("fragments")}
+
+    def scapy_tls(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """TLS probe — unprivileged (plain socket + ssl), so it needs no worker."""
+        target = (payload.get("target") or "").strip()
+        if not target:
+            return {"ok": False, "error": "enter a target host"}
+        res = packet_engine.tls_probe(target, int(payload.get("port") or 443),
+                                      float(payload.get("timeout") or 5))
+        return {"ok": not res.get("error"), "result": res, "error": res.get("error")}
+
+    def scapy_replay(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        w = self._worker_for(project_id)
+        if not w.alive():
+            return {"ok": False, "error": "scapy worker unavailable (replay needs passwordless sudo)"}
+        c = self.captures.get(project_id, payload.get("capture_id"))
+        if not c:
+            return {"ok": False, "error": "capture not found"}
+        r = w.request({"cmd": "replay", "path": c["path"], "iface": payload.get("iface") or None},
+                      {"replay_done"}, timeout=30)
+        if r.get("ev") != "replay_done":
+            return {"ok": False, "error": r.get("error", "replay failed")}
+        return {"ok": True, "packets": r.get("packets")}
+
+    def scapy_console(self, project_id: Any, code: str) -> Dict[str, Any]:
+        w = self._worker_for(project_id)
+        if not w.alive():
+            return {"ok": False, "error": "scapy console unavailable (needs passwordless sudo)"}
+        r = w.request({"cmd": "eval", "code": code or ""}, {"result"}, timeout=30)
+        if r.get("ev") != "result":
+            return {"ok": False, "error": r.get("error", "eval failed")}
+        return {"ok": True, "out": r.get("out", "")}
+
+    def scapy_resend(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Replay editor: re-send packet #index of a stored capture with per-layer
+        field overrides (the capture is addressed by its id, never a raw path)."""
+        w = self._worker_for(project_id)
+        if not w.alive():
+            return {"ok": False, "error": "scapy worker unavailable (resend needs passwordless sudo)"}
+        c = self.captures.get(project_id, payload.get("capture_id"))
+        if not c:
+            return {"ok": False, "error": "capture not found"}
+        mode = payload.get("mode", "send")
+        timeout = int(payload.get("timeout") or 3)
+        cmd: Dict[str, Any] = {"cmd": "resend", "path": c["path"],
+                               "index": int(payload.get("index") or 0),
+                               "overrides": payload.get("overrides") or {},
+                               "mode": mode, "iface": (payload.get("iface") or None),
+                               "timeout": timeout}
+        out = self.captures.get(project_id, payload.get("out_capture_id")) if payload.get("out_capture_id") else None
+        if out:
+            cmd["out"] = out["path"]
+        r = w.request(cmd, {"sent"}, timeout=max(6, timeout + 4))
+        if r.get("ev") != "sent":
+            return {"ok": False, "error": r.get("error", "resend failed")}
+        return {"ok": True, "sent": r.get("sent"), "reply": r.get("reply")}
+
+    def scapy_traceroute(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        w = self._worker_for(project_id)
+        if not w.alive():
+            return {"ok": False, "error": "scapy worker unavailable (traceroute needs passwordless sudo)"}
+        host = (payload.get("host") or "").strip()
+        if not host:
+            return {"ok": False, "error": "enter a host to trace"}
+        per = float(payload.get("timeout") or 1.0)
+        maxttl = max(1, min(int(payload.get("maxttl") or 20), 30))
+        cmd = {"cmd": "traceroute", "host": host,
+               "proto": payload.get("proto") or "tcp",
+               "dport": int(payload.get("dport") or 80),
+               "maxttl": maxttl, "timeout": per}
+        # Worst case one probe per TTL at `per` seconds each; give generous slack.
+        r = w.request(cmd, {"traceroute_done"}, timeout=int(maxttl * per) + 10)
+        if r.get("ev") != "traceroute_done":
+            return {"ok": False, "error": r.get("error", "traceroute failed")}
+        return {"ok": True, "target": r.get("target"), "target_ip": r.get("target_ip"),
+                "hops": r.get("hops") or []}
+
+    # ── Recon component lifecycle ─────────────────────────────────────────
+    def start_recon_component(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(project_id)
+        b = self.recon_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A recon component is already running for this project."}
+        name = payload.get("component")
+        target = (payload.get("target") or "").strip()
+        if name not in recon_engine.COMPONENTS:
+            return {"ok": False, "error": "unknown component"}
+        if not target:
+            return {"ok": False, "error": "Enter a target."}
+        broker = _Broker(meta={"component": name, "target": target})
+        stop = threading.Event()
+        self.recon_brokers[key] = broker
+        self.recon_stops[key] = stop
+        threading.Thread(target=self._run_recon,
+                         args=(project_id, name, target, payload.get("opts") or {}, broker, stop),
+                         daemon=True).start()
+        return {"ok": True}
+
+    def _run_recon(self, project_id: Any, name: str, target: str, opts: Dict[str, Any],
+                   broker: "_Broker", stop: threading.Event) -> None:
+        label = recon_engine.COMPONENTS[name]["label"]
+        broker.emit({"type": "log", "text": "▶ %s — %s" % (label, target)})
+        res = recon_engine.run_component(
+            name, target, opts,
+            on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}))
+        added = self.recon.merge(project_id, res.get("entities") or [])
+        self.recon.add_run(project_id, {"component": name, "label": label, "target": target,
+                                        "when": time.time(), "added": sum(added.values())})
+        for m in res.get("log") or []:
+            broker.emit({"type": "log", "text": m})
+        if res.get("error"):
+            broker.emit({"type": "error", "text": res["error"]})
+        summary = ", ".join("+%d %s" % (n, k) for k, n in added.items() if n) or "no new entities"
+        broker.emit({"type": "done", "text": summary})
+        broker.finish()
+
+    def recon_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.recon_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def stop_recon(self, project_id: Any) -> Dict[str, Any]:
+        s = self.recon_stops.get(str(project_id))
+        if s is not None:
+            s.set()
+        return {"ok": True}
+
+    def start_recon_sweep(self, project_id: Any, payload: Dict[str, Any],
+                          resume: bool = False) -> Dict[str, Any]:
+        """Start (or resume) an OSINT Full Sweep: every practical keyless component run
+        one at a time, each fanned out over the entities discovered so far, on the shared
+        recon broker/stop (so /activity glows, the recon Stop stops it, _close_project
+        stops it, and the OSINT view re-attaches). Sequential by design — the third-party
+        sources are rate-limited. Completed component/target operations are skipped on
+        resume, and entities discovered since are picked up."""
+        key = str(project_id)
+        b = self.recon_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A recon component or sweep is already running for this project."}
+        if resume:
+            cp = self.recon_sweeps.resume(project_id)
+            if not cp:
+                return {"ok": False, "error": "No interrupted sweep to resume for this project."}
+            target = cp.get("target") or ""
+            mode = cp.get("mode") or "standard"
+            stages = cp.get("stages") or recon_sweep_stages(mode)
+            completed = list(cp.get("completed") or [])
+        else:
+            target = (payload.get("target") or "").strip()
+            if not target:
+                return {"ok": False, "error": "Enter a target domain."}
+            mode = "aggressive" if (payload.get("mode") == "aggressive") else "standard"
+            stages = recon_sweep_stages(mode)
+            completed = []
+            self.recon_sweeps.start(project_id, target, mode, stages)
+        broker = _Broker(meta={"target": target, "sweep": mode})
+        stop = threading.Event()
+        self.recon_brokers[key] = broker
+        self.recon_stops[key] = stop
+        threading.Thread(
+            target=self._run_recon_sweep,
+            args=(project_id, target, mode, stages, completed, broker, stop),
+            daemon=True).start()
+        return {"ok": True, "mode": mode, "target": target, "total": len(stages),
+                "completed_ops": len(completed)}
+
+    def _recon_sweep_targets(self, project_id: Any, scope: str, target: str) -> List[str]:
+        """The fan-out targets for a stage's scope, from the current store state
+        (de-duped, insertion-ordered). domain → target + domain entities; host → target +
+        subdomains; ip → IPs + origin candidates; cidr → netblocks."""
+        out: List[str] = []
+        seen: set = set()
+
+        def add(v: str) -> None:
+            v = (v or "").strip()
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+
+        if scope == "domain":
+            add(target)
+            for d in self.recon.values_of(project_id, "domain"):
+                add(d)
+        elif scope == "host":
+            add(target)
+            for s in self.recon.values_of(project_id, "subdomain"):
+                add(s)
+        elif scope == "ip":
+            for ip in self.recon.values_of(project_id, "ip"):
+                add(ip)
+            for ip in self.recon.values_of(project_id, "origin"):
+                add(ip)
+        elif scope == "cidr":
+            for c in self.recon.values_of(project_id, "netblock"):
+                add(c)
+        return out
+
+    def _run_recon_sweep(self, project_id: Any, target: str, mode: str,
+                         stages: List[Dict[str, Any]], completed: List[str],
+                         broker: "_Broker", stop: threading.Event) -> None:
+        total = len(stages)
+        done = set(completed or [])
+        resuming = bool(completed)
+        broker.emit({"type": "phase", "text": (
+            ("── Resumed OSINT sweep ── " if resuming else "── OSINT full sweep ── ")
+            + target + "  (" + mode + ", " + str(total) + " stages)")})
+        if resuming:
+            broker.emit({"type": "log", "text": "Resuming — %d operation(s) already complete." % len(done)})
+        try:
+            for idx, stage in enumerate(stages, 1):
+                if stop.is_set():
+                    break
+                comp, scope = stage["component"], stage["scope"]
+                label = stage.get("label") or comp
+                self.recon_sweeps.set_stage(project_id, idx, label)
+                tgts = self._recon_sweep_targets(project_id, scope, target)
+                capped = tgts[:_RECON_SWEEP_FANOUT_CAP]
+                extra = ("" if len(tgts) <= _RECON_SWEEP_FANOUT_CAP
+                         else "  (capped %d of %d)" % (_RECON_SWEEP_FANOUT_CAP, len(tgts)))
+                if not capped:
+                    broker.emit({"type": "phase", "text":
+                                 "── Stage %d/%d: %s — no %s targets yet ──" % (idx, total, label, scope)})
+                    continue
+                for t in capped:
+                    if stop.is_set():
+                        break
+                    op_key = comp + "\x00" + t
+                    if op_key in done:
+                        continue
+                    broker.emit({"type": "phase", "text":
+                                 "── Stage %d/%d: %s · %s ──%s" % (idx, total, label, t, extra)})
+                    res = recon_engine.run_component(
+                        comp, t, {},
+                        on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}))
+                    added = self.recon.merge(project_id, res.get("entities") or [])
+                    self.recon.add_run(project_id, {
+                        "component": comp, "label": label, "target": t,
+                        "when": time.time(), "added": sum(added.values()), "sweep": True})
+                    for m in res.get("log") or []:
+                        broker.emit({"type": "log", "text": m})
+                    if res.get("error"):
+                        broker.emit({"type": "log", "text": "  (%s: %s)" % (comp, res["error"])})
+                    self.recon_sweeps.mark_op_done(project_id, op_key)
+                    done.add(op_key)
+                if stop.is_set():
+                    break
+            else:
+                self.recon_sweeps.set_status(project_id, "done")
+                broker.emit({"type": "done", "text": "OSINT full sweep complete (%d stages)." % total})
+                broker.finish()
+                return
+        except Exception as e:  # noqa: BLE001
+            broker.emit({"type": "error", "text": "sweep error: %s" % e})
+        self.recon_sweeps.set_status(project_id, "interrupted")
+        broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
+        broker.finish()
+
+    def recon_sweep_state(self, project_id: Any) -> Dict[str, Any]:
+        cp = self.recon_sweeps.get(project_id)
+        b = self.recon_brokers.get(str(project_id))
+        running = bool(b is not None and not b.since(10 ** 9)["done"])
+        if not cp:
+            return {"exists": False, "running": running}
+        stages = cp.get("stages") or []
+        status = cp.get("status") or ""
+        return {"exists": True, "running": running, "mode": cp.get("mode"),
+                "target": cp.get("target"), "status": status,
+                "total": len(stages), "step": int(cp.get("stage") or 0),
+                "step_label": cp.get("stage_label") or "",
+                "completed_ops": len(cp.get("completed") or []),
+                "resumable": bool(status in ("running", "interrupted") and not running)}
+
+    # ── Passive site-map scan lifecycle ──────────────────────────────────
+    # Builds the Site map from passive sources (robots/sitemap/links/JS +
+    # zero-touch OSINT) and writes each discovery into the HTTP-history store,
+    # so an active scan can later seed from it instead of re-crawling.
+    PASSIVE_SOURCES = [
+        {"id": "robots", "label": "robots.txt", "zero_touch": False,
+         "desc": "Disallow/Allow paths + any sitemaps declared in robots.txt."},
+        {"id": "sitemap", "label": "sitemap.xml", "zero_touch": False,
+         "desc": "Declared + common sitemap files (handles index + .gz) → URL list."},
+        {"id": "links", "label": "Homepage links", "zero_touch": False,
+         "desc": "Links and HTML-comment URLs from the homepage only (no deep crawl)."},
+        {"id": "js", "label": "JS endpoint mining", "zero_touch": False,
+         "desc": "Find the page's JS files and mine fetch()/axios/url() endpoints from them."},
+        {"id": "common", "label": "Common paths", "zero_touch": False,
+         "desc": "Seed well-known admin/api/debug/backup paths worth having in the map."},
+        {"id": "wayback", "label": "Wayback Machine", "zero_touch": True,
+         "desc": "Historical URLs from web.archive.org — sent the domain, never the target."},
+        {"id": "crtsh", "label": "crt.sh hosts", "zero_touch": True,
+         "desc": "Subdomains from certificate-transparency logs (adds host roots)."},
+    ]
+    PASSIVE_PRESETS = [
+        {"id": "recommended", "label": "Recommended",
+         "sources": ["robots", "sitemap", "links", "js", "wayback"], "probe": True},
+        {"id": "target", "label": "Target-only (no OSINT)",
+         "sources": ["robots", "sitemap", "links", "js", "common"], "probe": True},
+        {"id": "zerotouch", "label": "Zero-touch OSINT",
+         "sources": ["wayback", "crtsh"], "probe": False},
+        {"id": "everything", "label": "Everything",
+         "sources": ["robots", "sitemap", "links", "js", "common", "wayback", "crtsh"], "probe": True},
+    ]
+
+    def passive_catalog(self) -> Dict[str, Any]:
+        return {"sources": self.PASSIVE_SOURCES, "presets": self.PASSIVE_PRESETS}
+
+    def start_passive_scan(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(project_id)
+        b = self.passive_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A passive scan is already running for this project."}
+        target = (payload.get("target") or "").strip()
+        if not target:
+            return {"ok": False, "error": "Enter a target (URL or host)."}
+        valid = {s["id"] for s in self.PASSIVE_SOURCES}
+        sources = [s for s in (payload.get("sources") or []) if s in valid]
+        if not sources:
+            return {"ok": False, "error": "Enable at least one source."}
+        opts = payload.get("opts") or {}
+        broker = _Broker(meta={"target": target, "sources": sources})
+        stop = threading.Event()
+        self.passive_brokers[key] = broker
+        self.passive_stops[key] = stop
+        threading.Thread(target=self._run_passive,
+                         args=(project_id, target, sources, opts, broker, stop),
+                         daemon=True).start()
+        return {"ok": True}
+
+    def _run_passive(self, project_id: Any, target: str, sources: List[str],
+                     opts: Dict[str, Any], broker: "_Broker", stop: threading.Event) -> None:
+        import asyncio
+        from beatrix.recon.passive_mapper import PassiveMapper
+        count = [0]
+
+        def emit(kind: str, **kw) -> None:
+            if stop.is_set() and kind not in ("phase",):
+                return
+            t = {"phase": "phase", "scanner_error": "error"}.get(kind, "log")
+            broker.emit({"type": t, "text": kw.get("text", "")})
+
+        def on_endpoint(rec: Dict[str, Any]) -> None:
+            try:
+                rec = dict(rec)
+                rec["in_scope"] = self._in_scope(project_id, rec.get("host") or "")
+                self.http_history_store.append(project_id, rec)
+                count[0] += 1
+            except Exception:  # noqa: BLE001
+                pass
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            pm = PassiveMapper(
+                target, sources=sources,
+                probe=bool(opts.get("probe", True)),
+                scope_only=bool(opts.get("scope_only", False)),
+                same_host_only=bool(opts.get("same_host_only", False)),
+                max_urls=int(opts.get("max_urls", 3000) or 3000),
+                concurrency=int(opts.get("concurrency", 12) or 12),
+                emit=emit, on_endpoint=on_endpoint,
+                should_stop=stop.is_set,
+                scope_check=lambda host: self._in_scope(project_id, host))
+            summary = loop.run_until_complete(pm.run())
+            by = summary.get("by_source") or {}
+            detail = ", ".join("+%d %s" % (n, s) for s, n in by.items() if n) or "nothing new"
+            broker.emit({"type": "done",
+                         "text": "%d endpoint(s) → Site map  (%s)" % (count[0], detail)})
+        except Exception as e:  # noqa: BLE001
+            broker.emit({"type": "error", "text": "passive scan failed: %s" % e})
+            broker.emit({"type": "done", "text": "stopped"})
+        finally:
+            broker.finish()
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    def passive_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.passive_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def stop_passive(self, project_id: Any) -> Dict[str, Any]:
+        s = self.passive_stops.get(str(project_id))
+        if s is not None:
+            s.set()
+        return {"ok": True}
+
+    def _sitemap_seed_urls(self, project_id: Any, target: str,
+                           scope_hosts: List[str]) -> List[str]:
+        """Distinct in-scope URLs from the project's Site map (HTTP history), to seed
+        an active scan's crawl so it reuses prior passive recon instead of re-crawling."""
+        try:
+            rows = self.http_history_store.list(project_id, scope_only=False,
+                                                limit=100000).get("rows", [])
+        except Exception:  # noqa: BLE001
+            return []
+        def _bare(hh: str) -> str:
+            # Compare on hostname only — the Site map stores host WITH port
+            # (netloc), but urlparse().hostname strips it, so normalise both.
+            hh = (hh or "").strip().lower()
+            if hh.startswith("["):          # IPv6 literal — leave intact
+                return hh
+            return hh.split(":", 1)[0]
+        try:
+            th = _bare(urlparse(target if "://" in target else "https://" + target).hostname or "")
+        except Exception:  # noqa: BLE001
+            th = ""
+        denied = self.projects.get_scope_exclude(project_id)
+        seen: set = set()
+        out: List[str] = []
+        for r in rows:
+            u = r.get("url")
+            if not u or u in seen:
+                continue
+            rh = _bare(r.get("host") or "")
+            if denied and _host_in_scope(rh, denied):   # strict out-of-scope wins
+                continue
+            if scope_hosts:
+                if not _host_in_scope(rh, scope_hosts):
+                    continue
+            elif th and rh and not (rh == th or rh.endswith("." + th) or th.endswith("." + rh)):
+                continue
+            seen.add(u)
+            out.append(u)
+        return out
+
+    # ── Manual nuclei lifecycle ──────────────────────────────────────────
+    def start_nuclei_run(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(project_id)
+        b = self.nuclei_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A nuclei run is already in progress for this project."}
+        target = (payload.get("target") or "").strip()
+        if not target:
+            return {"ok": False, "error": "Enter a target (URL or host)."}
+        if not nuclei_runner.available().get("nuclei"):
+            return {"ok": False, "error": "nuclei binary not found on PATH."}
+        opts = payload.get("opts") or {}
+        run_id = self.nuclei.start_run(project_id, {"target": target, "opts": opts})
+        broker = _Broker(meta={"target": target, "run_id": run_id})
+        stop = threading.Event()
+        self.nuclei_brokers[key] = broker
+        self.nuclei_stops[key] = stop
+        threading.Thread(target=self._run_nuclei,
+                         args=(project_id, run_id, target, opts, broker, stop),
+                         daemon=True).start()
+        return {"ok": True, "run_id": run_id}
+
+    def _run_nuclei(self, project_id: Any, run_id: int, target: str, opts: Dict[str, Any],
+                    broker: "_Broker", stop: threading.Event) -> None:
+        broker.emit({"type": "log", "text": "▶ nuclei — %s" % target})
+
+        def on_line(s: str) -> None:
+            if not stop.is_set():
+                broker.emit({"type": "log", "text": s})
+
+        def on_finding(finding: Any, raw: Dict[str, Any]) -> None:
+            d = _nuclei_finding_dict(finding, raw)
+            self.nuclei.add_finding(project_id, run_id, d)
+            try:                                   # also land it in the shared Issues store (deduped)
+                self.issues.add_finding(project_id, finding, "nuclei", "manual")
+            except Exception:  # noqa: BLE001
+                pass
+            broker.emit({"type": "finding", "detail": d})
+
+        res = nuclei_runner.run(target, opts, on_line=on_line, on_finding=on_finding, stop_event=stop)
+        status = "stopped" if stop.is_set() else ("done" if res.get("ok") else "error")
+        self.nuclei.complete_run(project_id, run_id, status, int(res.get("count") or 0),
+                                 res.get("command", ""))
+        if res.get("error"):
+            broker.emit({"type": "error", "text": res["error"]})
+        broker.emit({"type": "done", "text": "%s — %d finding(s)" % (status, int(res.get("count") or 0))})
+        broker.finish()
+
+    def nuclei_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.nuclei_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def stop_nuclei(self, project_id: Any) -> Dict[str, Any]:
+        s = self.nuclei_stops.get(str(project_id))
+        if s is not None:
+            s.set()
+        return {"ok": True}
+
+    def recon_import_nmap(self, project_id: Any) -> Dict[str, Any]:
+        """Pull IPs/hosts the Network module discovered into the recon workspace."""
+        ents: List[Dict[str, Any]] = []
+        for s in self.nmap.state(project_id).get("scans", []):
+            full = self.nmap.get(project_id, s["id"])
+            if not full or not full.get("result"):
+                continue
+            for h in full["result"].get("hosts", []):
+                if h.get("ip"):
+                    ents.append({"kind": "ip", "key": h["ip"], "source": "nmap",
+                                 "ptr": h.get("hostname") or None})
+                if h.get("hostname"):
+                    ents.append({"kind": "subdomain", "key": h["hostname"],
+                                 "ips": [h["ip"]] if h.get("ip") else [], "source": "nmap"})
+        added = self.recon.merge(project_id, ents)
+        return {"ok": True, "added": sum(added.values())}
+
+    def msf_import_inventory(self, pid: Any) -> Dict[str, Any]:
+        """Organized, deduplicated host/service inventory from the recon-stage modules
+        (Network/nmap + Recon) for Metasploit. Site map (web URLs) and raw packet captures
+        are not host inventories, so they are intentionally excluded."""
+        hosts: Dict[str, Dict[str, Any]] = {}
+
+        def host(ip):
+            h = hosts.get(ip)
+            if h is None:
+                h = {"ip": ip, "hostnames": [], "os": "", "ports": [],
+                     "netblock": "", "org": "", "asn": "", "sources": []}
+                hosts[ip] = h
+            return h
+
+        def add_hn(h, n):
+            n = (n or "").strip().rstrip(".")
+            if n and n not in h["hostnames"]:
+                h["hostnames"].append(n)
+
+        def add_src(h, s):
+            if s not in h["sources"]:
+                h["sources"].append(s)
+
+        if pid is not None:
+            # Network (nmap): aggregated per-IP inventory — hostname, OS, open ports/services.
+            try:
+                nm = self.nmap.hosts(pid).get("hosts") or []   # merged, deduped-by-IP inventory
+                items = nm.items() if isinstance(nm, dict) else [((x or {}).get("ip"), x) for x in nm]
+                for ip, hd in items:
+                    if not ip or not isinstance(hd, dict):
+                        continue
+                    h = host(ip); add_src(h, "nmap")
+                    add_hn(h, hd.get("hostname"))
+                    oss = hd.get("os") or []
+                    if oss and not h["os"]:
+                        h["os"] = oss[0].get("name") if isinstance(oss[0], dict) else str(oss[0])
+                    for p in (hd.get("ports") or []):
+                        proto = p.get("protocol") or p.get("proto") or "tcp"
+                        if any(x["port"] == p.get("port") and x["proto"] == proto for x in h["ports"]):
+                            continue
+                        h["ports"].append({"port": p.get("port"), "proto": proto, "state": p.get("state") or "",
+                                           "service": p.get("service") or "", "product": p.get("product") or "",
+                                           "version": p.get("version") or ""})
+            except Exception:  # noqa: BLE001
+                pass
+            # Recon: IP metadata (PTR / netblock / org / ASN) + subdomain→IP hostnames.
+            try:
+                tables = self.recon.workspace(pid).get("tables", {})
+                for row in tables.get("ip", []):
+                    ip = row.get("key")
+                    if not ip:
+                        continue
+                    h = host(ip); add_src(h, "recon")
+                    add_hn(h, row.get("ptr"))
+                    for k in ("netblock", "org", "asn"):
+                        if row.get(k) and not h[k]:
+                            h[k] = str(row[k])
+                for row in tables.get("subdomain", []):
+                    for ip in (row.get("ips") or []):
+                        if ip:
+                            h = host(ip); add_src(h, "recon"); add_hn(h, row.get("key"))
+            except Exception:  # noqa: BLE001
+                pass
+
+        def ipkey(h):
+            parts = h["ip"].split(".")
+            return tuple(int(x) for x in parts) if len(parts) == 4 and all(x.isdigit() for x in parts) else (9999, 9999, 9999, 9999)
+
+        host_list = sorted(hosts.values(), key=ipkey)
+        services = sum(len(h["ports"]) for h in host_list)
+        hns = sum(len(h["hostnames"]) for h in host_list)
+        db = False
+        try:
+            self.msf_for(pid).call("db.workspaces"); db = True
+        except Exception:  # noqa: BLE001
+            db = False
+        return {"hosts": host_list, "counts": {"hosts": len(host_list), "services": services, "hostnames": hns}, "db": db}
+
+    def msf_import_apply(self, pid: Any) -> Dict[str, Any]:
+        """Apply the recon inventory to Metasploit: always set global RHOSTS to the deduped
+        IPs, and push hosts/services into the msf database when one is connected."""
+        inv = self.msf_import_inventory(pid)
+        ips = [h["ip"] for h in inv["hosts"] if h.get("ip")]
+        out = {"ok": True, "hosts": len(ips), "services": inv["counts"]["services"], "rhosts": False, "db": False, "db_hosts": 0}
+        if not ips:
+            return {"ok": False, "error": "No recon hosts to import — run the Network (nmap) or Recon modules first."}
+        try:
+            path = self.projects.workspace_dir(pid) / "msf-rhosts.txt"
+            path.write_text("\n".join(ips) + "\n")
+            self.msf_for(pid).console_write("setg RHOSTS file:%s" % path)
+            out["rhosts"] = True
+        except Exception as e:  # noqa: BLE001
+            out["rhosts_error"] = str(e)
+        if inv["db"]:
+            n = 0
+            for h in inv["hosts"]:
+                try:
+                    opts = {"host": h["ip"]}
+                    if h["hostnames"]:
+                        opts["name"] = h["hostnames"][0]
+                    if h["os"]:
+                        opts["os_name"] = h["os"]
+                    self.msf_for(pid).call("db.report_host", opts)
+                    for p in h["ports"]:
+                        self.msf_for(pid).call("db.report_service", {"host": h["ip"], "port": p["port"], "proto": p["proto"],
+                            "name": p.get("service") or "", "info": (str(p.get("product") or "") + " " + str(p.get("version") or "")).strip()})
+                    n += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            out["db"] = True
+            out["db_hosts"] = n
+        return out
 
     # ── Ghost run lifecycle ──────────────────────────────────────────────
     def start_ghost_run(self, target: str, objective: str, project_id: Any) -> Dict[str, Any]:
@@ -5407,6 +16582,7 @@ class SuiteServer:
 
         objective = (objective or "").strip() or "Find and validate security vulnerabilities."
         allowed_hosts = self.projects.get_scope(project_id)
+        denied_hosts = self.projects.get_scope_exclude(project_id)
         broker = _Broker(meta={"target": target, "model": cfg.model,
                                "objective": objective, "auth": "none",
                                "scope": allowed_hosts})
@@ -5428,7 +16604,7 @@ class SuiteServer:
             asyncio.set_event_loop(loop)
             task = loop.create_task(run_investigation(
                 target, cfg=cfg, objective=objective,
-                allowed_hosts=allowed_hosts,
+                allowed_hosts=allowed_hosts, denied_hosts=denied_hosts,
                 on_event=broker.emit, on_finding=_capture, persist=True,
             ))
             with self._lock:
@@ -5509,7 +16685,8 @@ class SuiteServer:
     # ── Hunt run lifecycle ───────────────────────────────────────────────
     def start_hunt_run(self, target: str, modules: List[str], preset_label: str,
                         ai: bool, project_id: Any, resume: bool = False,
-                        debug: bool = False) -> Dict[str, Any]:
+                        debug: bool = False, seed_from_sitemap: bool = False,
+                        seed_mode: str = "confirm") -> Dict[str, Any]:
         """Launch a deterministic Hunt scan in a background thread, scoped to
         ``project_id`` exactly like Ghost — its own broker, its own
         concurrent-run guard, and its scan output rooted in the project's own
@@ -5556,6 +16733,7 @@ class SuiteServer:
         # Empty scope == unrestricted (same convention as everywhere else in
         # the suite): scan/report on whatever the target and its crawl turn up.
         scope_hosts = self.projects.get_scope(project_id)
+        scope_exclude = self.projects.get_scope_exclude(project_id)
 
         # Fresh runs reset the checkpoint; a resumed run keeps its completed set
         # (scan_checkpoints.resume already flipped its status back to running).
@@ -5590,14 +16768,29 @@ class SuiteServer:
         with self._lock:
             self.hunt_brokers[key] = broker
 
+        # Site-map reuse: pull known URLs for the target/scope so the crawl phase
+        # seeds from them (engine.hunt → kill_chain) instead of re-crawling.
+        seed_urls: List[str] = []
+        if seed_from_sitemap and not resume:
+            seed_urls = self._sitemap_seed_urls(project_id, target, scope_hosts)
+            if seed_urls:
+                broker.emit({"type": "info",
+                             "text": "Site map reuse: seeding %d known URL(s) (%s)" % (
+                                 len(seed_urls),
+                                 "fast / skip crawl" if seed_mode == "skip" else "seed & confirm")})
+            else:
+                broker.emit({"type": "info",
+                             "text": "Site map reuse requested, but no Site-map URLs exist for this "
+                                     "target yet — run a Passive Scan first. Doing a normal crawl."})
+
         def _on_event(event: str, data: dict) -> None:
             # Scope backstop #1: never even show an out-of-scope finding in
             # the live terminal, regardless of whether the scanner that found
             # it consulted the crawler's scope patterns.
-            if event == "finding" and scope_hosts:
+            if event == "finding" and (scope_hosts or scope_exclude):
                 f = data.get("finding")
                 url = (getattr(f, "url", "") if f else "") or target
-                if not _host_in_scope(url, scope_hosts):
+                if not _scope_allows(url, scope_hosts, scope_exclude):
                     host = urlparse(url).hostname or url
                     broker.emit({"type": "info", "text": f"Skipped out-of-scope finding on {host}"})
                     return
@@ -5638,6 +16831,7 @@ class SuiteServer:
             engine = BeatrixEngine(config=EngineConfig(), on_event=_on_event,
                                    output_manager=output_mgr)
             crawler_scope = _expand_for_crawler(scope_hosts) if scope_hosts else None
+            crawler_deny = _expand_for_crawler(scope_exclude) if scope_exclude else None
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -5648,8 +16842,10 @@ class SuiteServer:
             # per-scanner filter above).
             task = loop.create_task(engine.hunt(target=target, preset="full", ai=ai,
                                                 modules=modules, scope=crawler_scope,
+                                                scope_deny=crawler_deny,
                                                 completed_modules=completed_modules,
-                                                debug=debug))
+                                                debug=debug, seed_urls=seed_urls,
+                                                seed_mode=seed_mode))
             with self._lock:
                 self.hunt_tasks[key] = (loop, task)
 
@@ -5660,9 +16856,9 @@ class SuiteServer:
                 # against the final, deduplicated findings list — covers
                 # anything a scanner recorded through a path that bypassed the
                 # live per-event stream, before it's counted or persisted.
-                if scope_hosts:
+                if scope_hosts or scope_exclude:
                     kept = [f for f in engine.findings
-                            if _host_in_scope((getattr(f, "url", "") or target), scope_hosts)]
+                            if _scope_allows((getattr(f, "url", "") or target), scope_hosts, scope_exclude)]
                     dropped = len(engine.findings) - len(kept)
                     engine.findings = kept
                     if dropped:
@@ -5944,6 +17140,139 @@ class SuiteServer:
             def _json(self, obj: Any):
                 self._send(200, json.dumps(obj).encode("utf-8"), "application/json")
 
+            # ── minimal WebSocket (RFC 6455) over the existing socket ──────────
+            # One bidirectional channel per viewer: JPEG frames pushed down (binary),
+            # input events sent up (text JSON). Far lower latency than MJPEG + per-
+            # event HTTP POSTs, and it rides the Codespace port-forward cleanly.
+            _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+            def _ws_handshake(self) -> bool:
+                key = self.headers.get("Sec-WebSocket-Key")
+                if not key:
+                    self._send(400, b"expected a websocket upgrade", "text/plain")
+                    return False
+                import hashlib
+                accept = base64.b64encode(
+                    hashlib.sha1((key + self._WS_GUID).encode()).digest()).decode("ascii")
+                # Write the 101 raw as HTTP/1.1 — RFC 6455 requires it, and real
+                # browsers reject a 1.0 upgrade (send_response would use the server's
+                # default 1.0 and add Date/Server headers we don't want here).
+                self.wfile.write(
+                    ("HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: " + accept + "\r\n\r\n").encode("ascii"))
+                self.wfile.flush()
+                return True
+
+            def _ws_send(self, data: bytes, opcode: int = 0x2) -> None:
+                hdr = bytearray([0x80 | opcode])
+                n = len(data)
+                if n < 126:
+                    hdr.append(n)
+                elif n < 65536:
+                    hdr.append(126)
+                    hdr += n.to_bytes(2, "big")
+                else:
+                    hdr.append(127)
+                    hdr += n.to_bytes(8, "big")
+                self.wfile.write(bytes(hdr) + data)
+                self.wfile.flush()
+
+            def _ws_read(self):
+                head = self.rfile.read(2)
+                if len(head) < 2:
+                    return None
+                opcode = head[0] & 0x0F
+                masked = head[1] & 0x80
+                ln = head[1] & 0x7F
+                if ln == 126:
+                    ln = int.from_bytes(self.rfile.read(2), "big")
+                elif ln == 127:
+                    ln = int.from_bytes(self.rfile.read(8), "big")
+                mask = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(ln) if ln else b""
+                if masked:
+                    payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+                return opcode, payload
+
+            def _ws(self, bc: Any, proj: Any):
+                if not self._ws_handshake():
+                    return
+                if bc is None:
+                    return          # nothing to stream yet; client retries after launch
+                stop = threading.Event()
+
+                def reader():      # client → server: input events (and control frames)
+                    try:
+                        while not stop.is_set():
+                            fr = self._ws_read()
+                            if fr is None:
+                                break
+                            op, payload = fr
+                            if op == 0x8:                    # close
+                                break
+                            if op == 0x9:                    # ping → pong
+                                try:
+                                    self._ws_send(payload, 0xA)
+                                except Exception:  # noqa: BLE001
+                                    break
+                            elif op == 0x1 and payload:      # text = input JSON
+                                try:
+                                    ev = json.loads(payload.decode("utf-8"))
+                                    if bc.running:
+                                        bc.input_event(ev)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                    finally:
+                        stop.set()
+
+                threading.Thread(target=reader, daemon=True).start()
+                last = 0
+                try:
+                    while not stop.is_set() and bc.running:
+                        fr = bc.wait_frame(last, timeout=5)
+                        if fr is None:
+                            continue                         # idle; keep the socket open
+                        last = fr["seq"]
+                        self._ws_send(fr["bytes"], 0x2)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    stop.set()
+
+            def _mjpeg(self, bc: Any):
+                """MJPEG fallback for transports that don't carry a WebSocket (e.g.
+                GitHub Codespaces port-forwarding): a plain multipart/x-mixed-replace
+                <img> stream. Slower than the WS, but it rides any HTTP proxy."""
+                if bc is None or not getattr(bc, "running", False):
+                    self._send(503, b"browser not running", "text/plain")
+                    return
+                boundary = "beatrixframe"
+                try:
+                    self.wfile.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; "
+                         "boundary=" + boundary + "\r\nCache-Control: no-store\r\n\r\n").encode("ascii"))
+                    self.wfile.flush()
+                    last = 0
+                    while bc.running:
+                        fr = bc.wait_frame(last, timeout=5)
+                        if fr is None:
+                            continue
+                        last = fr["seq"]
+                        data = fr["bytes"]
+                        self.wfile.write(("--" + boundary + "\r\nContent-Type: image/jpeg\r\n"
+                                          "Content-Length: " + str(len(data)) + "\r\n\r\n").encode("ascii"))
+                        self.wfile.write(data)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+
             def do_GET(self):
                 path = urlparse(self.path).path
                 if suite.session_dir is None and _needs_session(path):
@@ -5951,6 +17280,14 @@ class SuiteServer:
                     return
                 if path in ("/", "/index.html"):
                     self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                elif path == "/assets/beatrix-banner.png":
+                    # Packaged brand asset for the opening splash. 404s gracefully if the
+                    # file isn't shipped, so the splash still renders (just without the logo).
+                    try:
+                        data = (Path(__file__).parent / "assets" / "beatrix-banner.png").read_bytes()
+                        self._send(200, data, "image/png")
+                    except Exception:
+                        self._send(404, b"not found", "text/plain")
                 elif path == "/session":
                     self._json(suite.session_info())
                 elif path == "/sessions":
@@ -5966,6 +17303,8 @@ class SuiteServer:
                     self._send(200, _AUTH_PAGE.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/projects":
                     self._json(suite.projects.state())
+                elif path == "/activity":
+                    self._json(suite.activity())
                 elif path in _AUTH_GET:
                     try:
                         result = _AUTH_GET[path]()
@@ -5985,6 +17324,56 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.ghost_state(proj))
+                elif path == "/msf/status":
+                    self._json(suite.msf.status())
+                elif path == "/msf/console/read":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    self._json(suite.msf.console_read(since))
+                elif path == "/msf/modules":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json({"modules": suite.msf.module_list((q.get("type") or ["exploit"])[0])})
+                elif path == "/msf/module/info":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(suite.msf.try_call("module.info", (q.get("type") or [""])[0], (q.get("name") or [""])[0]))
+                elif path == "/msf/module/options":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(suite.msf.try_call("module.options", (q.get("type") or [""])[0], (q.get("name") or [""])[0]))
+                elif path == "/msf/module/payloads":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(suite.msf.try_call("module.compatible_payloads", (q.get("name") or [""])[0]))
+                elif path == "/msf/sessions":
+                    self._json(suite.msf.try_call("session.list"))
+                elif path == "/msf/session/compatible":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(suite.msf.try_call("session.compatible_modules", (q.get("id") or [""])[0]))
+                elif path == "/msf/jobs":
+                    self._json(suite.msf.try_call("job.list"))
+                elif path == "/msf/db":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(suite.msf.db_get((q.get("coll") or ["hosts"])[0]))
+                elif path == "/msf/plugins":
+                    self._json({"plugins": suite.msf.plugin_list()})
+                elif path == "/msf/commands":
+                    self._json({"groups": suite.msf.command_catalog()})
+                elif path == "/msf/stats":
+                    self._json(suite.msf.try_call("core.module_stats"))
+                elif path == "/msf/import":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0] or suite.projects.state().get("active")
+                    self._json(suite.msf_import_inventory(proj))
+                elif path == "/msf/recon/popout":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0] or suite.projects.state().get("active")
+                    self._send(200, _msf_recon_popout_page(proj).encode("utf-8"), "text/html; charset=utf-8")
+                elif path == "/msf/globals":
+                    q = parse_qs(urlparse(self.path).query)
+                    out = {}
+                    for nm in (q.get("name") or []):
+                        r = suite.msf.try_call("core.getg", nm)
+                        if isinstance(r, dict) and not r.get("error"):
+                            out[nm] = r.get(nm, "")
+                    self._json(out)
                 elif path == "/hunt/catalog":
                     self._json(_build_hunt_catalog())
                 elif path == "/hunt/events":
@@ -6011,7 +17400,8 @@ class SuiteServer:
                     proj = (q.get("project") or [None])[0]
                     if proj is None:
                         proj = suite.projects.state().get("active")
-                    self._json({"scope": suite.projects.get_scope(proj)})
+                    self._json({"scope": suite.projects.get_scope(proj),
+                                "exclude": suite.projects.get_scope_exclude(proj)})
                 elif path == "/issues":
                     q = parse_qs(urlparse(self.path).query)
                     proj = (q.get("project") or [None])[0]
@@ -6056,6 +17446,242 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.autorepeater_result(proj, (q.get("index") or [None])[0]))
+                elif path == "/nmap/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap.state(proj))
+                elif path == "/nmap/sweep/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_sweep_state(proj))
+                elif path == "/nmap/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_events(since, proj))
+                elif path == "/nmap/result":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json({"scan": suite.nmap.get(proj, (q.get("id") or [None])[0])})
+                elif path == "/nmap/diff":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_diff(proj, (q.get("a") or [None])[0], (q.get("b") or [None])[0]))
+                elif path == "/nmap/hosts":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap.hosts(proj))
+                elif path == "/nmap/profiles":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_profiles(proj))
+                elif path == "/nmap/export":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_export(proj, (q.get("id") or [None])[0],
+                                                 (q.get("fmt") or ["xml"])[0]))
+                elif path == "/browser/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_state(proj))
+                elif path == "/browser/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_events(int((q.get("since") or ["0"])[0]), proj))
+                elif path == "/browser/intercept/list":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_intercept_list(proj))
+                elif path == "/browser/frame":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_frame(proj, (q.get("since") or ["0"])[0]))
+                elif path == "/browser/ws":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._ws(suite.browser_controllers.get(str(proj)), proj)
+                    return      # hijacked the socket; do not fall through
+                elif path == "/browser/stream":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._mjpeg(suite.browser_controllers.get(str(proj)))
+                    return      # hijacked the socket; do not fall through
+                elif path == "/browser/popout":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._send(200, _browser_popout_page(proj).encode("utf-8"),
+                               "text/html; charset=utf-8")
+                elif path == "/http/search":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.http_search(proj, (q.get("q") or [""])[0]))
+                elif path == "/data/undo_state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.data_undo_state((q.get("store") or [None])[0], proj))
+                elif path == "/http/history":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.http_history(proj, (q.get("host") or [None])[0],
+                                                  (q.get("scope") or ["0"])[0] in ("1", "true"),
+                                                  (q.get("q") or [""])[0]))
+                elif path == "/http/detail":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.http_detail(proj, (q.get("id") or [None])[0]))
+                elif path == "/http/sitemap":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.http_sitemap(proj, (q.get("scope") or ["0"])[0] in ("1", "true")))
+                elif path == "/packets/env":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packet_env(proj))
+                elif path == "/packets/list":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packets_list(proj, (q.get("id") or [None])[0],
+                                                  (q.get("filter") or [""])[0],
+                                                  (q.get("offset") or ["0"])[0]))
+                elif path == "/packets/detail":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packet_detail_at(proj, (q.get("id") or [None])[0],
+                                                       (q.get("n") or ["0"])[0]))
+                elif path == "/packets/stream":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packets_stream(proj, (q.get("id") or [None])[0],
+                                                     (q.get("n") or ["0"])[0]))
+                elif path == "/packets/stats":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packets_stats(proj, (q.get("id") or [None])[0]))
+                elif path == "/packets/export":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packets_export(proj, (q.get("id") or [None])[0],
+                                                    (q.get("filter") or [""])[0]))
+                elif path == "/packets/capture/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.capture_events(since, proj))
+                elif path == "/recon/catalog":
+                    self._json({"components": recon_engine.component_catalog()})
+                elif path == "/recon/workspace":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon.workspace(proj))
+                elif path == "/recon/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon_events(since, proj))
+                elif path == "/recon/sweep/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon_sweep_state(proj))
+                elif path == "/passive/catalog":
+                    self._json(suite.passive_catalog())
+                elif path == "/passive/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.passive_events(since, proj))
+                elif path == "/nuclei/env":
+                    self._json(nuclei_runner.available())
+                elif path == "/nuclei/catalog":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(nuclei_runner.template_catalog(
+                        (q.get("q") or [""])[0], (q.get("severity") or [""])[0]))
+                elif path == "/nuclei/template":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(nuclei_runner.read_template((q.get("path") or [""])[0]))
+                elif path == "/nuclei/tree":
+                    q = parse_qs(urlparse(self.path).query)
+                    self._json(nuclei_runner.browse_tree((q.get("path") or [""])[0]))
+                elif path == "/nuclei/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nuclei.state(proj))
+                elif path == "/nuclei/result":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nuclei.run_findings(proj, int((q.get("run") or ["0"])[0])))
+                elif path == "/nuclei/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nuclei_events(since, proj))
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -6093,6 +17719,39 @@ class SuiteServer:
                     except Exception as e:  # noqa: BLE001
                         result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
                     self._json(result)
+                elif path == "/msf/start":
+                    self._json(suite.msf.start())
+                elif path == "/msf/stop":
+                    suite.msf.stop()
+                    self._json({"ok": True})
+                elif path == "/msf/console/write":
+                    self._json(suite.msf.console_write(payload.get("data", "")))
+                elif path == "/msf/console/tabcomplete":
+                    self._json(suite.msf.console_tabs(payload.get("line", "")))
+                elif path == "/msf/module/search":
+                    self._json({"results": suite.msf.try_call("module.search", payload.get("query", ""))})
+                elif path == "/msf/exec":
+                    for c in (payload.get("commands") or []):
+                        suite.msf.console_write(str(c))
+                    self._json({"ok": True})
+                elif path == "/msf/session/read":
+                    self._json(suite.msf.session_read(payload.get("id")))
+                elif path == "/msf/session/write":
+                    self._json(suite.msf.session_write(payload.get("id"), payload.get("data", "")))
+                elif path == "/msf/session/stop":
+                    self._json(suite.msf.try_call("session.stop", str(payload.get("id"))))
+                elif path == "/msf/job/stop":
+                    self._json(suite.msf.try_call("job.stop", str(payload.get("id"))))
+                elif path == "/msf/globals":
+                    self._json(suite.msf.try_call("core.setg", payload.get("name", ""), payload.get("value", "")))
+                elif path == "/msf/plugin":
+                    act = payload.get("action", "load")
+                    suite.msf.console_write(("load " if act == "load" else "unload ") + str(payload.get("name", "")))
+                    self._json({"ok": True})
+                elif path == "/msf/venom":
+                    self._json(suite.msf.venom(payload))
+                elif path == "/msf/import/apply":
+                    self._json(suite.msf_import_apply(suite.projects.state().get("active")))
                 elif path == "/ghost/run":
                     proj = payload.get("project")
                     if proj is None:
@@ -6116,7 +17775,9 @@ class SuiteServer:
                     self._json(suite.start_hunt_run(
                         payload.get("target", ""), payload.get("modules") or [],
                         payload.get("preset", "custom"), bool(payload.get("ai")), proj,
-                        resume=bool(payload.get("resume")), debug=bool(payload.get("debug"))))
+                        resume=bool(payload.get("resume")), debug=bool(payload.get("debug")),
+                        seed_from_sitemap=bool(payload.get("seed_from_sitemap")),
+                        seed_mode=(payload.get("seed_mode") or "confirm")))
                 elif path == "/hunt/stop":
                     proj = payload.get("project")
                     if proj is None:
@@ -6151,6 +17812,25 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.projects.clear_scope(proj))
+                elif path == "/scope/exclude/add":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    entries = _parse_scope_text(payload.get("text", ""))
+                    if not entries:
+                        self._json({"ok": False, "error": "no valid hosts/URLs found"})
+                    else:
+                        self._json(suite.projects.add_scope_exclude(proj, entries))
+                elif path == "/scope/exclude/remove":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.projects.remove_scope_exclude(proj, payload.get("entry", "")))
+                elif path == "/scope/exclude/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.projects.clear_scope_exclude(proj))
                 elif path == "/issues/update":
                     proj = payload.get("project")
                     if proj is None:
@@ -6214,11 +17894,231 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.stop_autorepeater_run(proj))
+                elif path == "/nmap/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_nmap_scan(proj, payload))
+                elif path == "/nmap/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_nmap_scan(proj))
+                elif path == "/nmap/sweep/start":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_nmap_sweep(proj, payload))
+                elif path == "/nmap/sweep/resume":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_nmap_sweep(proj, payload, resume=True))
+                elif path == "/nmap/sweep/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_sweeps.clear(proj))
+                elif path == "/nmap/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap.delete(proj, payload.get("id")))
+                elif path == "/nmap/delete_host":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap.delete_host(proj, payload.get("ip")))
+                elif path == "/nmap/profiles/save":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_profile_save(proj, payload.get("name"), payload.get("args")))
+                elif path == "/nmap/profiles/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.nmap_profile_delete(proj, payload.get("name")))
+                elif path == "/packets/upload":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.packets_upload(proj, payload.get("name"), payload.get("data")))
+                elif path == "/packets/capture/start":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_capture(proj, payload))
+                elif path == "/packets/capture/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_capture(proj))
+                elif path == "/packets/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.captures.delete(proj, payload.get("id")))
+                elif path == "/scapy/send":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_send(proj, payload))
+                elif path == "/scapy/tls":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_tls(proj, payload))
+                elif path == "/browser/launch":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_launch(proj))
+                elif path == "/browser/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_stop(proj))
+                elif path == "/browser/navigate":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_navigate(proj, payload.get("url", "")))
+                elif path == "/browser/intercept/set":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_intercept_set(proj, bool(payload.get("on"))))
+                elif path == "/browser/intercept/forward":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_intercept_forward(proj, payload.get("id"),
+                                                               payload.get("overrides")))
+                elif path == "/browser/intercept/drop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_intercept_drop(proj, payload.get("id")))
+                elif path == "/browser/input":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_input(proj, payload.get("ev") or {}))
+                elif path == "/browser/nav":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.browser_nav(proj, payload.get("action", "")))
+                elif path == "/http/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.http_clear(proj))
+                elif path == "/data/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.data_delete(payload.get("store"), proj, payload.get("ids")))
+                elif path == "/data/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.data_clear(payload.get("store"), proj))
+                elif path == "/data/undo":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.data_undo(payload.get("store"), proj))
+                elif path == "/scapy/replay":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_replay(proj, payload))
+                elif path == "/scapy/resend":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_resend(proj, payload))
+                elif path == "/scapy/traceroute":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_traceroute(proj, payload))
+                elif path == "/scapy/console":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.scapy_console(proj, payload.get("code")))
+                elif path == "/nuclei/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_nuclei_run(proj, payload))
+                elif path == "/nuclei/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_nuclei(proj))
+                elif path == "/nuclei/custom/save":
+                    self._json(nuclei_runner.save_custom_template(
+                        payload.get("name") or "", payload.get("text") or ""))
+                elif path == "/recon/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_recon_component(proj, payload))
+                elif path == "/recon/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_recon(proj))
+                elif path == "/recon/sweep/start":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_recon_sweep(proj, payload))
+                elif path == "/recon/sweep/resume":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_recon_sweep(proj, payload, resume=True))
+                elif path == "/recon/sweep/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon_sweeps.clear(proj))
+                elif path == "/passive/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_passive_scan(proj, payload))
+                elif path == "/passive/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_passive(proj))
+                elif path == "/recon/import_nmap":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon_import_nmap(proj))
+                elif path == "/recon/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon.delete(proj, payload.get("kind"), payload.get("key")))
+                elif path == "/recon/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.recon.clear(proj))
                 elif path == "/projects/new":
                     self._json(suite.projects.new())
                 elif path == "/projects/select":
                     self._json(suite.projects.select(payload.get("id")))
                 elif path == "/projects/delete":
+                    suite._close_project(payload.get("id"))   # free its ports/subprocesses first
                     self._json(suite.projects.delete(payload.get("id")))
                 else:
                     self._send(404, b"not found", "text/plain")
@@ -6243,6 +18143,22 @@ class SuiteServer:
         return self.url
 
     def stop(self) -> None:
+        # Tear down any privileged scapy workers so no root subprocess is orphaned.
+        for w in list(self.scapy_workers.values()):
+            try:
+                w.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.scapy_workers.clear()
+        # Close any live capture-browser windows (Playwright/Chromium + CDP) so no
+        # browser subprocess or debugging port is left open after shutdown.
+        for bc in list(self.browser_controllers.values()):
+            try:
+                bc.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.browser_controllers.clear()
+        self._stop_all_msf()                     # terminate every per-project msfrpcd
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()

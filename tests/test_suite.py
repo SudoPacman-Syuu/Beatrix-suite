@@ -1555,6 +1555,23 @@ def test_repeater_raw_send_is_byte_faithful_and_decodes_chunked_gzip():
     assert r["body"] == "hello gzip world"                # chunked + gzip decoded for display
 
 
+def test_repeater_decodes_zstd_response_body():
+    # Regression: Cloudflare & friends answer Accept-Encoding: zstd with a
+    # Content-Encoding: zstd body. The Repeater must decode it for display
+    # (both size-framed and streamed-without-size frames), not show raw bytes.
+    import io
+    zstandard = pytest.importorskip("zstandard")
+    from beatrix.cli.suite import _decompress_body
+    html = b"<!doctype html><title>ok</title>" + b"zstd body " * 40
+    cctx = zstandard.ZstdCompressor()
+    framed = cctx.compress(html)                                  # embeds content size
+    streamed = cctx.stream_reader(io.BytesIO(html)).read()        # no embedded size (CDN style)
+    for blob in (framed, streamed):
+        assert _decompress_body([["Content-Encoding", "zstd"]], blob) == html
+    # A corrupt zstd body must fall back to the raw bytes, never raise.
+    assert _decompress_body([["Content-Encoding", "zstd"]], b"not-zstd") == b"not-zstd"
+
+
 def test_real_scanner_request_flows_through_as_captured():
     # The whole point of wiring scanners to BaseScanner.format_http_request: a
     # real captured transaction must be recognized as REAL by the issue store

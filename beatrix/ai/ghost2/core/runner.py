@@ -24,6 +24,7 @@ async def run_investigation(
     base_headers: Optional[Dict[str, str]] = None,
     base_cookies: Optional[Dict[str, str]] = None,
     allowed_hosts: Optional[List[str]] = None,
+    denied_hosts: Optional[List[str]] = None,
     console: Any = None,
     verbose: bool = False,
     persist: bool = True,
@@ -68,6 +69,7 @@ async def run_investigation(
         base_headers=base_headers or {},
         base_cookies=base_cookies or {},
         allowed_hosts=allowed_hosts or [],
+        denied_hosts=denied_hosts or [],
     )
     runtime = make_runtime(cfg, console=console)
     hooks = GhostHooks(

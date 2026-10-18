@@ -308,8 +308,11 @@ class BeatrixEngine:
         auth: Optional[Any] = None,
         browser_auth: bool = False,
         scope: Optional[List[str]] = None,
+        scope_deny: Optional[List[str]] = None,
         completed_modules: Optional[List[str]] = None,
         debug: bool = False,
+        seed_urls: Optional[List[str]] = None,
+        seed_mode: str = "off",
     ) -> KillChainState:
         """
         Execute a hunt against a target.
@@ -374,6 +377,13 @@ class BeatrixEngine:
         if scope:
             context["scope"] = scope
             context["force_browser_transport"] = True  # skip calibration override
+        if scope_deny:
+            context["scope_deny"] = scope_deny   # hosts the crawler must never follow
+        # Site-map reuse: known URLs to seed the crawl phase with, so the scan
+        # reuses prior recon instead of re-crawling from the root.
+        if seed_urls:
+            context["seed_urls"] = list(seed_urls)
+            context["seed_mode"] = seed_mode if seed_mode in ("confirm", "skip") else "confirm"
 
         # Execute kill chain
         state = await self.kill_chain.execute(

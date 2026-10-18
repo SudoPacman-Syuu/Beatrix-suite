@@ -43,6 +43,8 @@ findings.json
 /*.txt
 # HTML reports at repo root (preserves docs/manual/index.html)
 /*.html
+# XML artifacts at repo root (nmap -oX / tlsx output, etc.)
+/*.xml
 reports/
 *.log
 
@@ -58,6 +60,7 @@ notes for improvement/
 # ── Local test sites / scratch targets — never commit ─────────────────────────
 mysite/
 **/mysite/
+prototypes/
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store

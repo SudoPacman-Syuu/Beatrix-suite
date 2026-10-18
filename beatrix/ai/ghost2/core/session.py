@@ -85,6 +85,9 @@ class Scope:
     objective: str = "Find and validate security vulnerabilities."
     # Hosts the agent is permitted to touch. Empty => derived from target host.
     allowed_hosts: List[str] = field(default_factory=list)
+    # Hosts STRICTLY out of scope — excluded even if they'd match an allowed
+    # host/subdomain (deny wins). Empty => no exclusions.
+    denied_hosts: List[str] = field(default_factory=list)
     base_headers: Dict[str, str] = field(default_factory=dict)
     base_cookies: Dict[str, str] = field(default_factory=dict)
 
@@ -107,6 +110,10 @@ class Scope:
         netloc = urlparse(raw if "://" in raw else f"//{raw}").netloc
         host = netloc.split("@")[-1].split(":")[0].lower()
         if not host:
+            return False
+        # Strict exclusions win: out of scope even if it matches an allowed host.
+        denied = [h.lower() for h in (self.denied_hosts or [])]
+        if any(host == d or host.endswith("." + d) for d in denied):
             return False
         allowed = [h.lower() for h in (self.allowed_hosts or [self.host()])]
         return any(host == a or host.endswith("." + a) for a in allowed)
