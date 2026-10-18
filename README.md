@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Platform-Linux-orange?style=flat-square&logo=linux" alt="Platform">
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License">
   <img src="https://img.shields.io/github/stars/SudoPacman-Syuu/Beatrix-suite?style=flat-square" alt="Stars">
-  <img src="https://img.shields.io/badge/Version-2.0%20·%20The%20Black%20Mamba-brightgreen?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.1%20·%20The%20Black%20Mamba-brightgreen?style=flat-square" alt="Version">
 </p>
 
 <p align="center">
