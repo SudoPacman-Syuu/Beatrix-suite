@@ -645,7 +645,9 @@ install_external_tools() {
         PIP_CMD="$VENV_DIR/bin/pip install"
     fi
 
-    for tool in mitmproxy commix; do
+    # arjun + clairvoyance power the Repeater's ⚡ active parameter verification
+    # (hidden-param discovery + GraphQL schema recovery when introspection is off).
+    for tool in mitmproxy commix arjun clairvoyance; do
         if command_exists "$tool"; then
             success "$tool (already installed)"
             ((skipped++))
@@ -860,7 +862,7 @@ check_optional_tools() {
     echo ""
     echo -e "${BOLD}External tools status:${RESET}"
 
-    local tools=("nuclei" "httpx" "subfinder" "ffuf" "katana" "sqlmap" "nmap" "adb" "mitmproxy" "playwright" "amass" "whatweb" "webanalyze" "gospider" "hakrawler" "gau" "dirsearch" "dalfox" "commix" "jwt_tool" "msfconsole")
+    local tools=("nuclei" "httpx" "subfinder" "ffuf" "katana" "sqlmap" "nmap" "adb" "mitmproxy" "playwright" "amass" "whatweb" "webanalyze" "gospider" "hakrawler" "gau" "dirsearch" "dalfox" "commix" "jwt_tool" "msfconsole" "arjun" "clairvoyance")
     local found=0
     local total=${#tools[@]}
 

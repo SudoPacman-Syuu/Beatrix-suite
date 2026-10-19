@@ -409,6 +409,19 @@ later* below.
 
 ## Ideas for later (beyond hover)
 
+- **[shipped] Predictive parameters (Params).** The hover tip for `__schema`
+  says "try introspection"; the Repeater's **Params** button now does that and
+  much more — it discovers an endpoint's parameters from the best source
+  available (GraphQL introspection · OpenAPI/Swagger · HTML forms · captured
+  traffic), shows each param's type / required / enum / **source** / confidence
+  (the endpoint's own ruleset, not a guess), and inserts a correctly-typed,
+  ready-to-send stencil (params written into the query string, JSON body, form
+  body, or GraphQL document). **Verify (active)** then confirms what the
+  server actually accepts via Arjun (REST) or Clairvoyance (GraphQL schema
+  recovery), scope-gated. Server core in `suite.py`: `_param_discover` /
+  `_param_active_verify` + the per-source parsers (`_src_openapi`, `_html_forms`,
+  `_src_observed`, `_src_graphql`) and location-aware stencil builders; reuses
+  `beatrix/core/external_tools.py` (`ArjunRunner`, `ClairvoyanceRunner`).
 - A "why is this interesting?" severity dot on tokens that commonly indicate
   misconfig (e.g. `Server: Apache/2.2.3`, `ACAO: *`).
 - Click-through: hover shows the gist, click opens a fuller reference panel.

@@ -22,7 +22,9 @@ from beatrix.cli.suite import (
     _AUTH_GET, _AUTH_POST, _IssueStore, _ProjectStore, _RepeaterStore,
     _ar_count, _ar_expand_set, _ar_generate, _ar_parse_positions, _ar_process,
     _finding_to_issue, _ghost_validation_objective, _ghost_validation_target,
-    _normalize_severity, _parse_raw_request, SuiteServer,
+    _gql_find_hints, _gql_normalize, _gql_stencil, _gql_type_str,
+    _graphql_discover, _html_forms, _normalize_severity, _param_active_verify,
+    _param_discover, _param_shape, _parse_raw_request, SuiteServer,
 )
 
 
@@ -69,8 +71,10 @@ def test_shell_served_at_root(server):
     code, body = _get(server, "/")
     assert code == 200
     text = body.decode()
-    # Top tab bar with the three v1 tools.
-    for tab in ('data-tab="dashboard"', 'data-tab="auth"', 'data-tab="ghost"'):
+    # Kill-chain-staged nav: stage wrappers in the bar, their module tabs inside.
+    for stage in ('data-stage="setup"', 'data-stage="recon"', 'data-stage="exploitation"'):
+        assert stage in text
+    for tab in ('data-tab="auth"', 'data-tab="ghost"', 'data-tab="repeater"'):
         assert tab in text
 
 
@@ -88,7 +92,7 @@ def test_auth_gui_mounted_same_origin(server):
     # The Auth tab iframes /auth on the SAME origin — full reuse of the existing page.
     code, body = _get(server, "/auth")
     assert code == 200
-    assert b"Beatrix Auth" in body
+    assert b"Beatrix" in body and b"Auth" in body
 
 
 def test_auth_api_dispatches_to_backend(server):
@@ -564,12 +568,12 @@ def test_project_store_scope_persists_across_restart(tmp_path):
 def test_scope_get_empty_by_default(server):
     code, body = _get(server, "/scope?project=1")
     assert code == 200
-    assert json.loads(body) == {"scope": []}
+    assert json.loads(body) == {"scope": [], "exclude": []}
 
 
 def test_scope_get_defaults_to_active_project(server):
     _post(server, "/scope/add", {"project": 1, "text": "example.com"})
-    assert json.loads(_get(server, "/scope")[1]) == {"scope": ["example.com"]}
+    assert json.loads(_get(server, "/scope")[1]) == {"scope": ["example.com"], "exclude": []}
 
 
 def test_scope_add_route_parses_pasted_text(server):
@@ -604,8 +608,8 @@ def test_scope_isolated_between_projects_over_http(server):
     _post(server, "/projects/new", {})  # project 2
     _post(server, "/scope/add", {"project": 1, "text": "a.com"})
     _post(server, "/scope/add", {"project": 2, "text": "b.com"})
-    assert json.loads(_get(server, "/scope?project=1")[1]) == {"scope": ["a.com"]}
-    assert json.loads(_get(server, "/scope?project=2")[1]) == {"scope": ["b.com"]}
+    assert json.loads(_get(server, "/scope?project=1")[1]) == {"scope": ["a.com"], "exclude": []}
+    assert json.loads(_get(server, "/scope?project=2")[1]) == {"scope": ["b.com"], "exclude": []}
 
 
 # ── Scope: enforcement wired into start_hunt_run / start_ghost_run ───────
@@ -2004,3 +2008,457 @@ def test_ghost_validate_route_gathers_real_issues(server):
     # and it got past id-gathering/target/objective (never "No matching issues").
     _, r = _post(server, "/ghost/validate", {"project": 1, "ids": [1]})
     assert "ok" in r and r.get("error") != "No matching issues to validate."
+
+
+# ── GraphQL schema discovery (predictive Repeater parameters) ────────────
+# The Repeater's "Schema" button asks a GraphQL endpoint for its exact type
+# system (introspection) rather than guessing parameter names, then generates a
+# typed, ready-to-send operation stencil. These cover the normalisation of a
+# raw __schema payload, stencil generation, the disabled-introspection path,
+# and a real introspection round trip over HTTP.
+
+def _gql_nn(t):
+    return {"kind": "NON_NULL", "ofType": t}
+
+
+def _gql_list(t):
+    return {"kind": "LIST", "ofType": t}
+
+
+def _gql_named(kind, name):
+    return {"kind": kind, "name": name}
+
+
+def _demo_schema():
+    """A small but representative __schema payload: a required scalar arg, an
+    enum arg with a default, and a mutation taking a nested input object."""
+    nn, lst, nm = _gql_nn, _gql_list, _gql_named
+    return {
+        "queryType": {"name": "Query"},
+        "mutationType": {"name": "Mutation"},
+        "subscriptionType": None,
+        "types": [
+            {"kind": "OBJECT", "name": "Query", "fields": [
+                {"name": "user", "description": "Fetch a user", "isDeprecated": False,
+                 "args": [
+                     {"name": "id", "type": nn(nm("SCALAR", "ID")), "defaultValue": None,
+                      "description": "the user id"},
+                     {"name": "role", "type": nm("ENUM", "Role"), "defaultValue": "USER",
+                      "description": ""}],
+                 "type": nm("OBJECT", "User")},
+                {"name": "ping", "args": [], "type": nn(nm("SCALAR", "String")),
+                 "isDeprecated": False},
+            ]},
+            {"kind": "OBJECT", "name": "Mutation", "fields": [
+                {"name": "login", "isDeprecated": False,
+                 "args": [{"name": "input", "type": nn(nm("INPUT_OBJECT", "LoginInput")),
+                           "defaultValue": None}],
+                 "type": nm("OBJECT", "AuthPayload")},
+            ]},
+            {"kind": "OBJECT", "name": "User", "fields": [
+                {"name": "id", "args": [], "type": nn(nm("SCALAR", "ID"))},
+                {"name": "email", "args": [], "type": nm("SCALAR", "String")},
+                {"name": "role", "args": [], "type": nm("ENUM", "Role")},
+                {"name": "friends", "args": [], "type": lst(nm("OBJECT", "User"))},
+            ]},
+            {"kind": "OBJECT", "name": "AuthPayload", "fields": [
+                {"name": "token", "args": [], "type": nm("SCALAR", "String")},
+            ]},
+            {"kind": "INPUT_OBJECT", "name": "LoginInput", "inputFields": [
+                {"name": "username", "type": nn(nm("SCALAR", "String")), "defaultValue": None},
+                {"name": "password", "type": nn(nm("SCALAR", "String")), "defaultValue": None},
+                {"name": "remember", "type": nm("SCALAR", "Boolean"), "defaultValue": None},
+            ]},
+            {"kind": "ENUM", "name": "Role",
+             "enumValues": [{"name": "ADMIN"}, {"name": "USER"}, {"name": "GUEST"}]},
+        ],
+    }
+
+
+def test_gql_type_str_renders_modifiers():
+    nn, lst, nm = _gql_nn, _gql_list, _gql_named
+    assert _gql_type_str(nm("SCALAR", "ID")) == "ID"
+    assert _gql_type_str(nn(nm("SCALAR", "ID"))) == "ID!"
+    assert _gql_type_str(lst(nn(nm("OBJECT", "User")))) == "[User!]"
+    assert _gql_type_str(nn(lst(nn(nm("OBJECT", "User"))))) == "[User!]!"
+
+
+def test_gql_normalize_extracts_operations_and_rulesets():
+    m = _gql_normalize(_demo_schema())
+    assert m["roots"] == {"query": "Query", "mutation": "Mutation", "subscription": None}
+    assert [o["name"] for o in m["operations"]["query"]] == ["user", "ping"]
+    user = m["operations"]["query"][0]
+    assert user["signature"] == "user(id: ID!, role: Role): User"
+    id_arg, role_arg = user["args"]
+    assert id_arg["required"] is True and id_arg["type"] == "ID!"
+    assert role_arg["required"] is False and role_arg["default"] == "USER"
+    # The enum's full accepted-value set is the ruleset for that parameter.
+    assert role_arg["enum"] == ["ADMIN", "USER", "GUEST"]
+
+
+def test_gql_stencil_builds_typed_operation_with_variables():
+    m = _gql_normalize(_demo_schema())
+    user = m["operations"]["query"][0]
+    st = _gql_stencil(user, "query", m)
+    # Arguments are declared as typed $variables and passed through by name.
+    assert "query BeatrixUser($id: ID!, $role: Role)" in st["gql"]
+    assert "user(id: $id, role: $role)" in st["gql"]
+    # Selection set is the return type's scalar/enum leaves (not the object child).
+    assert "id email role" in st["gql"] and "friends" not in st["gql"]
+    # Variables skeleton: empty string for ID, first enum value for the enum.
+    assert st["variables"] == {"id": "", "role": "ADMIN"}
+
+
+def test_gql_stencil_expands_nested_input_object():
+    m = _gql_normalize(_demo_schema())
+    login = m["operations"]["mutation"][0]
+    st = _gql_stencil(login, "mutation", m)
+    assert st["gql"].startswith("mutation BeatrixLogin($input: LoginInput!)")
+    assert st["variables"] == {"input": {"username": "", "password": "", "remember": False}}
+
+
+def test_gql_stencil_scalar_return_has_no_selection_set():
+    m = _gql_normalize(_demo_schema())
+    ping = m["operations"]["query"][1]
+    gql = _gql_stencil(ping, "query", m)["gql"]
+    assert "ping" in gql and "{" not in gql.split("ping", 1)[1]
+
+
+def test_gql_find_hints_harvests_did_you_mean():
+    payload = {"errors": [{"message": 'Cannot query field "usr" on type "Query". '
+                                       'Did you mean "user" or "users"?'}]}
+    assert _gql_find_hints(payload) == ["user", "users"]
+
+
+class _GqlMock:
+    """A throwaway GraphQL endpoint for the round-trip tests. /graphql answers
+    introspection (and echoes the Authorization header it saw); /nointro refuses
+    introspection the way a locked-down server does."""
+
+    def __init__(self, schema):
+        import http.server
+        import threading
+        sch = schema
+        saw = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode() or "{}")
+                saw["auth"] = self.headers.get("Authorization")
+                saw["ctype"] = self.headers.get("Content-Type")
+                if self.path == "/nointro":
+                    out = {"errors": [{"message": "GraphQL introspection is not allowed."}],
+                           "data": None}
+                elif "__schema" in body.get("query", ""):
+                    out = {"data": {"__schema": sch}}
+                else:
+                    out = {"data": {}}
+                b = json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+        self.saw = saw
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.base = "http://127.0.0.1:%d" % self.port
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+@pytest.fixture
+def gql_mock():
+    m = _GqlMock(_demo_schema())
+    try:
+        yield m
+    finally:
+        m.close()
+
+
+def test_graphql_discover_introspects_live_endpoint(gql_mock):
+    raw = ("POST /graphql HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+           "Authorization: Bearer SECRET\r\nContent-Type: application/json\r\n\r\n"
+           '{"query":"{ping}"}' % gql_mock.port)
+    d = _graphql_discover(raw, gql_mock.base)
+    assert d["ok"] is True and d["introspection"] is True
+    assert d["endpoint"] == gql_mock.base + "/graphql"
+    assert d["counts"]["query"] == 2 and d["counts"]["mutation"] == 1
+    # The tester's auth header was reused for the introspection request.
+    assert gql_mock.saw["auth"] == "Bearer SECRET"
+    # ...and would be reused for the stencil too (returned, not re-sent here).
+    assert ["Authorization", "Bearer SECRET"] in d["headers"]
+    user = d["operations"]["query"][0]
+    assert user["signature"] == "user(id: ID!, role: Role): User"
+    assert '"id": ""' in user["body"] and "$id: ID!" in user["body"]
+
+
+def test_graphql_discover_reports_disabled_introspection(gql_mock):
+    raw = ("POST /nointro HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+           "Content-Type: application/json\r\n\r\n{}" % gql_mock.port)
+    d = _graphql_discover(raw, gql_mock.base)
+    assert d["ok"] is False and d["introspection"] is False
+    assert "introspection is disabled" in d["error"]
+
+
+def test_graphql_discover_without_target_is_a_clean_error():
+    d = _graphql_discover("GET / HTTP/1.1\r\n\r\n", "")
+    assert d["ok"] is False and "No target" in d["error"]
+
+
+def test_repeater_schema_route_wired(server, gql_mock):
+    raw = ("POST /graphql HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+           "Content-Type: application/json\r\n\r\n{}" % gql_mock.port)
+    code, body = _post(server, "/repeater/schema", {"request": raw, "target": gql_mock.base})
+    assert code == 200 and body["ok"] is True
+    assert body["counts"]["mutation"] == 1
+    assert body["operations"]["mutation"][0]["name"] == "login"
+
+
+# ── Predictive parameters for ALL parameterized queries ──────────────────
+# GraphQL (above) gives an exact ruleset because it declares a schema. These
+# cover the generalization to every endpoint: OpenAPI/Swagger + HTML forms
+# (declared), captured traffic (observed), and active verification (Arjun /
+# Clairvoyance, both availability-gated and monkeypatched here so CI needs no
+# external CLI).
+
+_OAPI_SPEC = {
+    "openapi": "3.0.0",
+    "servers": [{"url": "https://api.example.com/api"}],
+    "paths": {
+        "/users/{id}": {
+            "get": {"summary": "Get user", "parameters": [
+                {"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}},
+                {"name": "expand", "in": "query", "required": False,
+                 "schema": {"type": "string", "enum": ["posts", "friends"]}}]},
+            "post": {"summary": "Update", "requestBody": {"content": {"application/json": {
+                "schema": {"type": "object", "required": ["name"], "properties": {
+                    "name": {"type": "string"}, "age": {"type": "integer"},
+                    "role": {"type": "string", "enum": ["admin", "user"]}}}}}}},
+        }
+    },
+}
+
+
+def test_param_shape_detection():
+    def shape(raw, target="https://h.example.com", resp=""):
+        from beatrix.cli.suite import _param_ctx
+        return _param_shape(_param_ctx(raw, target), resp)
+    assert shape("GET /search?q=x HTTP/1.1\r\nHost: h.example.com\r\n\r\n") == "query"
+    assert shape("POST /u HTTP/1.1\r\nHost: h.example.com\r\nContent-Type: application/json\r\n\r\n{\"a\":1}") == "json"
+    assert shape("POST /u HTTP/1.1\r\nHost: h.example.com\r\n"
+                 "Content-Type: application/x-www-form-urlencoded\r\n\r\na=1&b=2") == "form"
+    assert shape("POST /graphql HTTP/1.1\r\nHost: h.example.com\r\n"
+                 "Content-Type: application/json\r\n\r\n{\"query\":\"{x}\"}") == "graphql"
+
+
+def test_param_discover_openapi_matches_templated_path_and_builds_stencil():
+    fetch = lambda p: json.dumps(_OAPI_SPEC) if p == "/openapi.json" else None
+    raw = ("GET /api/users/123?expand=posts HTTP/1.1\r\nHost: api.example.com\r\n"
+           "Authorization: Bearer T\r\n\r\n")
+    d = _param_discover(raw, "https://api.example.com", history=[], response_body="", fetch=fetch)
+    assert d["ok"] is True
+    oapi = [s for s in d["stencils"] if s["source"] == "openapi"]
+    assert {s["label"] for s in oapi} == {"GET /users/{id}", "POST /users/{id}"}
+    get = next(s for s in oapi if s["label"].startswith("GET"))
+    names = {(p["name"], p["in"], p["required"]) for p in get["params"]}
+    assert ("id", "path", True) in names and ("expand", "query", False) in names
+    expand = next(p for p in get["params"] if p["name"] == "expand")
+    assert expand["enum"] == ["posts", "friends"] and expand["confidence"] == "exact"
+    # The POST operation expands its JSON requestBody into typed body params.
+    post = next(s for s in oapi if s["label"].startswith("POST"))
+    assert any(p["name"] == "name" and p["in"] == "body-json" and p["required"] for p in post["params"])
+    assert "Authorization: Bearer T" in get["request"]  # auth reused in the stencil
+
+
+def test_param_discover_html_forms():
+    html = ('<form method="POST" action="/login">'
+            '<input name="user" required><input type="password" name="pass" required>'
+            '<input type="hidden" name="csrf" value="abc">'
+            '<select name="role"><option value="admin">A</option><option value="user">U</option></select>'
+            '</form>')
+    raw = "GET /login HTTP/1.1\r\nHost: shop.example.com\r\n\r\n"
+    d = _param_discover(raw, "https://shop.example.com", history=[], response_body=html)
+    form = [s for s in d["stencils"] if s["source"] == "form"][0]
+    byname = {p["name"]: p for p in form["params"]}
+    assert set(byname) == {"user", "pass", "csrf", "role"}
+    assert byname["user"]["required"] and byname["csrf"]["required"]      # required + hidden
+    assert byname["role"]["enum"] == ["admin", "user"]
+    assert byname["csrf"]["default"] == "abc"
+    assert "csrf=abc" in form["request"] and form["request"].startswith("POST /login")
+
+
+def test_html_forms_parser_ignores_fieldless_and_malformed():
+    assert _html_forms("") == []
+    assert _html_forms("<form></form>") == []                              # no fields → dropped
+    forms = _html_forms("<form><input name=q></form><p>not html<form><input name=x></form>")
+    assert [f["fields"][0]["name"] for f in forms] == ["q", "x"]
+
+
+def test_param_discover_observed_infers_types_and_confidence():
+    hist = [
+        {"method": "GET", "url": "https://x.example.com/search?q=hi&page=2",
+         "req_headers": {"Host": "x.example.com"}, "req_body": ""},
+        {"method": "GET", "url": "https://x.example.com/search?q=yo&page=5&debug=true",
+         "req_headers": {"Host": "x.example.com"}, "req_body": ""},
+    ]
+    raw = "GET /search?q=foo HTTP/1.1\r\nHost: x.example.com\r\n\r\n"
+    d = _param_discover(raw, "https://x.example.com", history=hist)
+    obs = [s for s in d["stencils"] if s["source"] == "observed"][0]
+    by = {p["name"]: p for p in obs["params"]}
+    assert set(by) == {"q", "page", "debug"}
+    assert by["q"]["confidence"] == "high" and by["q"]["required"] is True   # 3/3 requests
+    assert by["page"]["type"] == "integer" and by["page"]["confidence"] == "medium"
+    assert by["debug"]["type"] == "boolean" and by["debug"]["confidence"] == "low"
+    assert obs["request"].startswith("GET /search?")                         # query-string stencil
+
+
+class _FakeArjun:
+    available = True
+
+    async def discover(self, url, method="GET", headers=None, **kw):
+        _FakeArjun.seen_headers = headers or {}
+        return {"params": ["debug", "admin_override"], "url": url, "method": method}
+
+
+def test_param_active_verify_rest_uses_arjun(monkeypatch):
+    import beatrix.core.external_tools as et
+    monkeypatch.setattr(et, "ArjunRunner", _FakeArjun)
+    raw = "GET /api/thing HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer T\r\n\r\n"
+    d = _param_active_verify(raw, "https://api.example.com")
+    assert d["ok"] is True and d["tool"] == "arjun"
+    names = {p["name"] for p in d["stencils"][0]["params"]}
+    assert names == {"debug", "admin_override"}
+    assert all(p["source"] == "probed" for p in d["stencils"][0]["params"])
+    assert _FakeArjun.seen_headers.get("Authorization") == "Bearer T"   # auth forwarded
+
+
+class _FakeClair:
+    available = True
+
+    async def reconstruct_schema(self, url, **kw):
+        nn = {"kind": "NON_NULL", "ofType": {"kind": "SCALAR", "name": "String"}}
+        schema = {"data": {"__schema": {"queryType": {"name": "Query"},
+                  "mutationType": None, "subscriptionType": None, "types": [
+                      {"kind": "OBJECT", "name": "Query", "fields": [
+                          {"name": "secret", "isDeprecated": False,
+                           "args": [{"name": "key", "type": nn, "defaultValue": None}],
+                           "type": {"kind": "SCALAR", "name": "String"}}]}]}}}
+        return {"success": True, "schema": json.dumps(schema)}
+
+
+def test_param_active_verify_graphql_uses_clairvoyance(monkeypatch):
+    import beatrix.core.external_tools as et
+    monkeypatch.setattr(et, "ClairvoyanceRunner", _FakeClair)
+    raw = ("POST /graphql HTTP/1.1\r\nHost: g.example.com\r\n"
+           "Content-Type: application/json\r\n\r\n{\"query\":\"{x}\"}")
+    d = _param_active_verify(raw, "https://g.example.com")
+    assert d["ok"] is True and d["tool"] == "clairvoyance"
+    st = d["stencils"][0]
+    assert st["label"] == "query: secret" and "$key: String!" in st["request"]
+
+
+def test_param_active_verify_graphql_tool_absent_is_clean(monkeypatch):
+    import beatrix.core.external_tools as et
+
+    class _Off:
+        available = False
+    monkeypatch.setattr(et, "ClairvoyanceRunner", _Off)
+    raw = ("POST /graphql HTTP/1.1\r\nHost: g.example.com\r\n"
+           "Content-Type: application/json\r\n\r\n{\"query\":\"{x}\"}")
+    d = _param_active_verify(raw, "https://g.example.com")
+    assert d["ok"] is False and "clairvoyance" in d["error"]
+
+
+def test_repeater_params_route_discovers_graphql(server, gql_mock):
+    raw = ("POST /graphql HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+           "Content-Type: application/json\r\n\r\n{}" % gql_mock.port)
+    code, body = _post(server, "/repeater/params", {"request": raw, "target": gql_mock.base})
+    assert code == 200 and body["ok"] is True and body["request_shape"] == "graphql"
+    labels = {s["label"] for s in body["stencils"] if s["source"] == "introspection"}
+    assert "mutation: login" in labels
+
+
+def test_repeater_params_verify_is_scope_gated(server):
+    _post(server, "/scope/add", {"project": 1, "text": "example.com"})
+    raw = "GET /x HTTP/1.1\r\nHost: 10.9.9.9\r\n\r\n"
+    code, body = _post(server, "/repeater/params/verify",
+                       {"project": 1, "request": raw, "target": "http://10.9.9.9"})
+    assert code == 200 and body["ok"] is False and body["needs_confirm"] is True
+    assert body["host"] == "10.9.9.9"
+
+
+# ── JWT workbench (operator module: analyze via jwt_tool → Issues; tamper) ──
+class _FakeJwt:
+    available = True
+
+    async def analyze(self, token):
+        return {"vulnerabilities": [{"type": "Algorithm None Attack", "detail": "accepts alg=none"}],
+                "header": {}, "payload": {}, "output": "[+] jwt_tool done"}
+
+    async def tamper(self, token, claim, value):
+        return "eyJhbGciOiJub25lIn0.eyJyb2xlIjoiYWRtaW4ifQ."
+
+
+def test_jwt_analyze_route_parses_and_files_issue(server, monkeypatch):
+    import beatrix.core.external_tools as et
+    monkeypatch.setattr(et, "JwtToolRunner", _FakeJwt)
+    code, body = _post(server, "/jwt/analyze", {"project": 1, "token": "eyJ.eyJ.x"})
+    assert code == 200 and body["available"] is True
+    assert any("none" in ((v.get("type", "") + v.get("detail", "")).lower()) for v in body["vulnerabilities"])
+    assert any("JWT" in (i.get("title", "") or "") for i in server.issues.list(1))   # landed in Issues
+
+
+def test_jwt_analyze_route_tool_absent_is_clean(server, monkeypatch):
+    import beatrix.core.external_tools as et
+
+    class _Off:
+        available = False
+    monkeypatch.setattr(et, "JwtToolRunner", _Off)
+    code, body = _post(server, "/jwt/analyze", {"project": 1, "token": "eyJ.eyJ.x"})
+    assert code == 200 and body["available"] is False      # clean degrade, no crash
+
+
+def test_jwt_tamper_route(server, monkeypatch):
+    import beatrix.core.external_tools as et
+    monkeypatch.setattr(et, "JwtToolRunner", _FakeJwt)
+    code, body = _post(server, "/jwt/tamper", {"token": "eyJ.eyJ.x", "claim": "role", "value": "admin"})
+    assert code == 200 and body.get("token", "").startswith("eyJ")
+
+
+# ── OAST / Collaborator (Weaponization) ──
+def test_oast_mint_and_callback_recorded(server):
+    code, body = _post(server, "/oast/mint", {"project": 1, "vuln_type": "ssrf", "note": "q param"})
+    assert code == 200 and body["uid"]
+    uid = body["uid"]
+    base = server.url.rstrip("/")
+    # a target "fetches" the canary (GET) ...
+    urllib.request.urlopen(base + "/cb/" + uid, timeout=5).read()
+    # ... and again via POST with a body
+    req = urllib.request.Request(base + "/cb/" + uid, data=b"leaked=secret", method="POST")
+    urllib.request.urlopen(req, timeout=5).read()
+    st = json.loads(_get(server, "/oast/state?project=1")[1])
+    assert st["count"] >= 2
+    cb = st["callbacks"][0]                       # newest first
+    assert cb["uid"] == uid and cb["vuln_type"] == "ssrf" and cb["note"] == "q param" and cb["known"] is True
+    assert any(c["method"] == "POST" and "secret" in c["body"] for c in st["callbacks"])
+
+
+def test_oast_unknown_uid_still_recorded(server):
+    base = server.url.rstrip("/")
+    urllib.request.urlopen(base + "/cb/deadbeef", timeout=5).read()
+    st = json.loads(_get(server, "/oast/state")[1])
+    hit = next((c for c in st["callbacks"] if c["uid"] == "deadbeef"), None)
+    assert hit is not None and hit["known"] is False
+
+
+def test_oast_base_override(server):
+    _post(server, "/oast/base", {"base": "https://pub.example.com/"})
+    assert json.loads(_get(server, "/oast/state")[1])["base"] == "https://pub.example.com"  # trailing slash stripped

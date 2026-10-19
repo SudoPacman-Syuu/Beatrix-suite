@@ -1393,9 +1393,13 @@ class ArjunRunner(ExternalTool):
         method: str = "GET",
         threads: int = 5,
         timeout: int = 15,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Discover hidden parameters on a URL.
+
+        ``headers`` (e.g. Cookie / Authorization) are forwarded via Arjun's
+        ``--headers`` so an authenticated endpoint is probed as that session.
 
         Returns:
             {params: ["param1", "param2", ...], url: str, method: str}
@@ -1412,6 +1416,8 @@ class ArjunRunner(ExternalTool):
                 "--timeout", str(timeout),
                 "-oJ", outfile.name,
             ]
+            if headers:
+                cmd += ["--headers", "\n".join("%s: %s" % (k, v) for k, v in headers.items())]
             if not self._verbose_mode:
                 cmd.append("-q")
 

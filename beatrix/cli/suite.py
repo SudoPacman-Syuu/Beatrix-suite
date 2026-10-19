@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, parse_qsl, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlparse
 
 # Reuse the auth GUI wholesale: its self-contained page + the exact backend
 # functions the standalone `beatrix auth gui` uses, so saved data is identical.
@@ -1457,9 +1457,20 @@ _PAGE = r"""<!doctype html>
      flash). Exposed as window.BeatrixUI for the menu control. Tune the constants. */
   window.BeatrixUI = (function () {
     var BASE_W = 1440, BASE_H = 900;        /* viewport the layout is tuned for → auto-scale 1.0 */
-    var AUTO_MIN = 0.72, AUTO_MAX = 1.20;   /* automatic window-fit clamp */
+    var RAIL = 54;                          /* left project-rail (.projects) — NOT usable by modules */
+    var MODULE_MIN = 1120;                   /* min width a module's content area (the workspace) needs.
+                                               Headless audit (seeded data, every module, landscape worst-
+                                               case) is clean at 1026; 1120 adds margin so landscape — where
+                                               the width ceiling BINDS and pins workspace to exactly this —
+                                               never clips even for content the audit can't reproduce. */
+    var CONTENT_MIN = MODULE_MIN + RAIL;    /* => the zoom keeps (viewport − rail) >= MODULE_MIN, so a
+                                               module never gets clipped by the overflow:hidden panes.
+                                               The rail is reserved in the budget (this was the missing
+                                               piece: the ceiling used to guarantee the whole viewport,
+                                               letting the module area come up ~54px short on the right). */
+    var AUTO_MIN = 0.60, AUTO_MAX = 1.20;   /* automatic window-fit clamp */
     var USER_MIN = 0.70, USER_MAX = 1.60;   /* manual "Text size" range */
-    var ABS_MIN = 0.55, ABS_MAX = 2.00;     /* safety clamp on the final product */
+    var ABS_MIN = 0.40, ABS_MAX = 2.00;     /* safety clamp on the final product */
     var KEY = "beatrix.textScale", pending = 0;
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
     function getTextScale() {
@@ -1469,8 +1480,15 @@ _PAGE = r"""<!doctype html>
     }
     function apply() {
       pending = 0;
-      var auto = clamp(Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H), AUTO_MIN, AUTO_MAX);
-      document.documentElement.style.zoom = String(clamp(auto * getTextScale(), ABS_MIN, ABS_MAX));
+      var w = window.innerWidth, h = window.innerHeight;
+      var auto = clamp(Math.min(w / BASE_W, h / BASE_H), AUTO_MIN, AUTO_MAX);
+      /* Width ceiling: keep innerWidth/zoom >= CONTENT_MIN. This wins over both the
+         window-fit scale and the user's text size, so a narrow panel (e.g. the VS Code
+         webview) shrinks the UI to fit instead of clipping its right edge. On a wide
+         screen the ceiling is large and has no effect. */
+      var widthCeil = w / CONTENT_MIN;
+      var z = Math.min(auto * getTextScale(), widthCeil);
+      document.documentElement.style.zoom = String(clamp(z, ABS_MIN, ABS_MAX));
     }
     function setTextScale(f) {
       try { localStorage.setItem(KEY, String(clamp(f, USER_MIN, USER_MAX))); } catch (e) {}
@@ -1518,12 +1536,18 @@ _PAGE = r"""<!doctype html>
       --elev-2:0 8px 24px -6px rgba(31,54,40,.16), 0 2px 7px -3px rgba(31,54,40,.1);
       --elev-3:0 22px 56px -10px rgba(31,54,40,.24), 0 8px 22px -8px rgba(31,54,40,.14); } }
   * { box-sizing:border-box; }
-  html, body { height:100%; }
+  html, body { height:100%; max-width:100%; }
+  /* Guard: nothing may force a page-level horizontal scroll / right-edge cutoff.
+     Genuinely-wide content (data tables) scrolls inside its own contained wrap
+     (.pane/.rtab-wrap/.ar-table-wrap all overflow:auto), so clipping here only
+     catches stray overflow — it never hides real content. `clip` (not hidden)
+     avoids creating a scroll container, so sticky table headers keep working. */
+  html { overflow-x:clip; }
   /* Matrix rain sits BEHIND everything (negative z-index → below the static
      content, above the body background). Using -1 means the content needs no
      stacking-context of its own, so dropdowns/menus keep working normally; the
      transparent panes still let the rain glimmer through. */
-  #mrain { position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.38; }
+  #mrain { position:fixed; inset:0; width:100%; height:100%; z-index:-1; pointer-events:none; opacity:.38; }
   #mrain.off { display:none; }
   /* CRT whisper: a faint STATIC scanline wash over everything (no motion). Sits
      above content but below menus/modals (z 50–90) so dropdowns stay crisp.
@@ -1791,7 +1815,7 @@ _PAGE = r"""<!doctype html>
     .proj.scanning, .stage-menu .mod.scanning, nav .mod.scanning {
       animation:none; box-shadow:0 0 10px #7fe61a; } }
 
-  .body { flex:1; min-height:0; display:flex; }
+  .body { flex:1; min-height:0; min-width:0; max-width:100%; display:flex; }
 
   /* Left project rail */
   .projects { width:54px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--border);
@@ -1952,7 +1976,7 @@ _PAGE = r"""<!doctype html>
     background:transparent; border:0; padding:6px 10px; border-radius:4px; cursor:pointer; }
   .ctx button:hover { background:var(--bg); }
 
-  .pad { padding:20px 24px; }
+  .pad { padding:20px var(--gutter); }
   h2 { font-size:16px; margin:0 0 8px; }
   p.sub { color:var(--muted); margin:0 0 18px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px; }
@@ -2171,7 +2195,7 @@ _PAGE = r"""<!doctype html>
   .sev.info { background:#8a94a6; color:#fff; }
   .conf { color:var(--muted); font-size:11.5px; }
   .iss-empty { padding:24px; color:var(--muted); font-size:13px; text-align:center; }
-  .iss-dtabs { display:flex; gap:2px; padding:6px 12px 0; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .iss-dtabs { display:flex; flex-wrap:wrap; row-gap:4px; gap:2px; padding:6px 12px 0; border-bottom:1px solid var(--border); flex-shrink:0; }
   .iss-dtabs button { font:inherit; font-size:12px; color:var(--muted); background:transparent; border:none;
     border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
   .iss-dtabs button:hover { color:var(--fg); }
@@ -2352,8 +2376,86 @@ _PAGE = r"""<!doctype html>
     white-space:pre-wrap; word-break:break-word; margin-top:2px; }
   .dec-val .dec-mono { color:var(--tok-sensitive); }
 
+  /* ── GraphQL schema panel (predictive parameters) ── */
+  .rep-schemapanel { flex-shrink:0; max-height:46%; overflow:auto; border-top:1px solid var(--border);
+    background:var(--panel); padding:8px 12px 14px; }
+  .gql-top { display:flex; align-items:baseline; gap:10px; margin:2px 0 8px; flex-wrap:wrap; }
+  .gql-top h4 { margin:0; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  .gql-ep { font-family:var(--rep-font); font-size:12px; color:var(--accent); word-break:break-all; }
+  .gql-counts { font-size:11.5px; color:var(--muted); }
+  .gql-x { margin-left:auto; cursor:pointer; color:var(--muted); background:none; border:0; font-size:14px; padding:0 4px; }
+  .gql-x:hover { color:var(--fg); }
+  .gql-note { font-size:12px; color:var(--muted); line-height:1.5; margin:4px 0 8px;
+    padding:7px 10px; border-left:2px solid var(--border); background:color-mix(in srgb, var(--fg) 4%, transparent); border-radius:0 6px 6px 0; }
+  .gql-note.warn { border-left-color:var(--red); color:var(--fg); }
+  .gql-hints { display:flex; flex-wrap:wrap; gap:5px; margin-top:6px; }
+  .gql-hint { font-family:var(--rep-font); font-size:11.5px; padding:1px 7px; border-radius:10px;
+    background:color-mix(in srgb, var(--violet) 18%, transparent); color:var(--violet); }
+  .gql-grp { font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted);
+    margin:12px 0 4px; font-weight:700; }
+  .gql-grp:first-of-type { margin-top:4px; }
+  .gql-op { border-top:1px solid var(--border); }
+  .gql-op > summary { display:flex; align-items:baseline; gap:9px; padding:6px 2px; cursor:pointer; list-style:none; }
+  .gql-op > summary::-webkit-details-marker { display:none; }
+  .gql-op > summary::before { content:"\25B8"; color:var(--muted); font-size:10px; transition:transform var(--dur-1,.12s) ease; }
+  .gql-op[open] > summary::before { transform:rotate(90deg); }
+  .gql-op > summary:hover { background:color-mix(in srgb, var(--fg) 5%, transparent); border-radius:5px; }
+  .gql-name { font-family:var(--rep-font); font-size:13px; font-weight:700; color:var(--tok-param); }
+  .gql-sig { font-family:var(--rep-font); font-size:11.5px; color:var(--muted); word-break:break-all; }
+  .gql-dep { font-size:10px; color:var(--red); border:1px solid var(--red); border-radius:4px; padding:0 5px; align-self:center; }
+  .gql-body { padding:3px 2px 10px 20px; }
+  .gql-desc { font-size:12px; color:var(--fg); margin:2px 0 8px; line-height:1.5; }
+  .gql-arg { display:grid; grid-template-columns:auto auto 1fr; gap:4px 9px; align-items:baseline;
+    padding:4px 0; border-top:1px dashed color-mix(in srgb, var(--border) 70%, transparent); }
+  .gql-arg:first-child { border-top:0; }
+  .gql-arg-n { font-family:var(--rep-font); font-size:12.5px; color:var(--fg); }
+  .gql-arg-t { font-family:var(--rep-font); font-size:12px; color:var(--blue); }
+  .gql-flag { font-size:10px; font-weight:700; padding:0 6px; border-radius:4px; align-self:center; }
+  .gql-flag.req { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .gql-flag.opt { background:color-mix(in srgb, var(--muted) 20%, transparent); color:var(--muted); }
+  .gql-meta { grid-column:2 / -1; font-size:11.5px; color:var(--muted); line-height:1.5; }
+  .gql-enums { display:flex; flex-wrap:wrap; gap:4px; margin-top:3px; }
+  .gql-enumchip { font-family:var(--rep-font); font-size:11px; padding:0 6px; border-radius:4px;
+    background:color-mix(in srgb, var(--green) 16%, transparent); color:var(--green); }
+  .gql-noargs { font-size:12px; color:var(--muted); font-style:italic; margin:2px 0 8px; }
+  .gql-use { font:inherit; font-size:12px; font-weight:600; color:#08131a; background:var(--accent);
+    border:0; border-radius:6px; padding:5px 12px; cursor:pointer; margin-top:4px; }
+  .gql-use:hover { filter:brightness(1.08); }
+  /* generalized param-source badges (every parameterized query, not just GraphQL) */
+  .gql-where { font-family:var(--rep-font); font-size:11px; color:var(--muted); align-self:center;
+    border:1px solid var(--border); border-radius:4px; padding:0 5px; }
+  .gql-srcbadge { font-size:10px; font-weight:700; letter-spacing:.02em; padding:1px 6px; border-radius:4px;
+    align-self:center; background:color-mix(in srgb, var(--muted) 20%, transparent); color:var(--muted); }
+  .gql-srcbadge.off { opacity:.5; text-decoration:line-through; }
+  .gql-srcbadge.src-introspection { background:color-mix(in srgb, var(--accent) 20%, transparent); color:var(--accent); }
+  .gql-srcbadge.src-openapi { background:color-mix(in srgb, var(--blue) 20%, transparent); color:var(--blue); }
+  .gql-srcbadge.src-form { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .gql-srcbadge.src-observed { background:color-mix(in srgb, var(--muted) 22%, transparent); color:var(--muted); }
+  .gql-srcbadge.src-probed { background:color-mix(in srgb, var(--violet) 22%, transparent); color:var(--violet); }
+  .gql-conf { font-size:10px; font-weight:600; padding:1px 6px; border-radius:4px; align-self:center; }
+  .gql-conf.conf-high { background:color-mix(in srgb, var(--blue) 16%, transparent); color:var(--blue); }
+  .gql-conf.conf-medium { background:color-mix(in srgb, var(--yellow) 18%, transparent); color:var(--yellow); }
+  .gql-conf.conf-low { background:color-mix(in srgb, var(--muted) 18%, transparent); color:var(--muted); }
+  .gql-sources { display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 8px; }
+  .gql-verify { font:inherit; font-size:11.5px; font-weight:600; color:var(--violet);
+    background:color-mix(in srgb, var(--violet) 12%, transparent); border:1px solid var(--violet);
+    border-radius:6px; padding:3px 9px; cursor:pointer; margin-left:auto; }
+  .gql-verify:hover { background:color-mix(in srgb, var(--violet) 22%, transparent); }
+  .gql-top .gql-x { margin-left:8px; }
+
   /* ── AutoRepeater (Intruder-style) ── */
   #pane-autorepeater.active { display:flex; flex-direction:column; overflow:hidden; }
+  /* Landscape (wide/short window): the vertical stack squeezes the results to nothing
+     (the fixed-height config + short height). Lay it out as a grid instead — toolbar across
+     the top, config (its two columns stacked) on the left, results filling the right. */
+  @media (orientation: landscape) {
+    #pane-autorepeater.active { display:grid; grid-template-columns:minmax(380px,38%) 1fr;
+      grid-template-rows:auto minmax(0,1fr); grid-template-areas:"toolbar toolbar" "config results"; }
+    #pane-autorepeater.active > .ar-toolbar { grid-area:toolbar; }
+    #pane-autorepeater.active > .ar-config { grid-area:config; height:auto; min-height:0;
+      flex-direction:column; overflow:auto; border-right:1px solid var(--border); }
+    #pane-autorepeater.active > .ar-results { grid-area:results; min-height:0; min-width:0; }
+  }
   .ar-toolbar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:10px var(--gutter);
     background:var(--bg); border-bottom:1px solid var(--border); }
   #ar-target { flex:1; min-width:160px; font:inherit; font-size:13px; color:var(--fg);
@@ -2420,7 +2522,7 @@ _PAGE = r"""<!doctype html>
   .ar-st-4xx, .ar-st-5xx { color:var(--red); font-weight:600; } .ar-st-err { color:var(--red); }
   .ar-empty { padding:18px 14px; color:var(--muted); font-size:12.5px; font-style:italic; }
   .ar-detail-wrap { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--bg); }
-  .ar-dtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 10px 0; border-bottom:1px solid var(--border); }
+  .ar-dtabs { flex-shrink:0; display:flex; flex-wrap:wrap; row-gap:4px; gap:2px; padding:6px 10px 0; border-bottom:1px solid var(--border); }
   .ar-dtabs button { font:inherit; font-size:12px; color:var(--muted); background:transparent; border:0;
     border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
   .ar-dtabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
@@ -2507,6 +2609,7 @@ _PAGE = r"""<!doctype html>
   .net-topo .node.root { fill:var(--fg); }
   .net-topo text { fill:var(--fg); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
   .net-topo text.meta { fill:var(--muted); }
+  .net-topo .lblbg { fill:var(--panel); opacity:.88; }   /* plate behind each label: hides edges that pass behind the text */
   /* ── HTTP module (capture-browser history + site map) ── */
   #pane-http.active { display:flex; flex-direction:column; overflow:hidden; }
   .http-search { flex:0 1 220px !important; min-width:120px; }
@@ -2773,7 +2876,7 @@ _PAGE = r"""<!doctype html>
   .net-hostrow.active, .net-histrow.active { background:var(--panel); border-left-color:var(--accent); }
   .net-hostrow .st-up { color:var(--green); } .net-hostrow .st-down { color:var(--muted); }
   .net-histrow .meta { color:var(--muted); font-size:11px; }
-  .net-rtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--panel);
+  .net-rtabs { flex-shrink:0; display:flex; flex-wrap:wrap; row-gap:4px; gap:2px; padding:6px 8px 0; background:var(--panel);
     border-bottom:1px solid var(--border); }
   .net-rtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent;
     border:0; border-bottom:2px solid transparent; padding:6px 10px; cursor:pointer; }
@@ -2807,7 +2910,7 @@ _PAGE = r"""<!doctype html>
   .pk-toolbar button.run { color:#08131a; background:var(--accent); border:0; font-weight:600; }
   .pk-toolbar button:disabled { opacity:.5; cursor:default; }
   .pk-toolbar .spacer { flex:1; } .pk-vsep { width:1px; align-self:stretch; background:var(--border); }
-  .pk-subtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--panel);
+  .pk-subtabs { flex-shrink:0; display:flex; flex-wrap:wrap; row-gap:4px; gap:2px; padding:6px 8px 0; background:var(--panel);
     border-bottom:1px solid var(--border); }
   .pk-subtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent;
     border:0; border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
@@ -2936,7 +3039,7 @@ _PAGE = r"""<!doctype html>
   /* ── Nuclei (manual templated scanning) ── */
   #pane-nuclei.active { display:flex; flex-direction:column; overflow:hidden; }
   .nuc-flagin { flex:0 1 200px !important; min-width:120px !important; }
-  .nuc-subtabs { flex-shrink:0; display:flex; gap:2px; padding:6px 8px 0; background:var(--bar-bg);
+  .nuc-subtabs { flex-shrink:0; display:flex; flex-wrap:wrap; row-gap:4px; gap:2px; padding:6px 8px 0; background:var(--bar-bg);
     border-bottom:1px solid var(--edge); box-shadow:inset 0 1px 0 var(--bevel-hi), inset 0 -2px 5px -3px var(--bevel-lo); }
   .nuc-subtabs button { font:inherit; font-size:12.5px; color:var(--muted); background:transparent; border:0;
     border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
@@ -2972,6 +3075,71 @@ _PAGE = r"""<!doctype html>
   .nuc-dact .btn { font:inherit; font-size:12px; color:var(--fg); background:var(--bg); border:1px solid var(--border);
     border-radius:6px; padding:5px 10px; cursor:pointer; }
   .nuc-dact .btn:hover { border-color:var(--accent); }
+
+  /* ── JWT workbench (operator tool module; decode local, analyze via jwt_tool, forge) ── */
+  #pane-jwt.active { display:flex; flex-direction:column; overflow:hidden; }
+  #jwt-input { flex:1; min-width:200px; font:inherit; font-size:13px; font-family:var(--rep-font); color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  .jwt-body { flex:1; min-height:0; min-width:0; overflow:auto; padding:12px var(--gutter); }
+  .jwt-pane { display:none; } .jwt-pane.active { display:block; }
+  .jwt-sec { margin-bottom:14px; }
+  .jwt-seclabel { font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:0 0 6px; }
+  .jwt-kv { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; font-family:var(--rep-font); font-size:12.5px; }
+  .jwt-kv .k { color:var(--tok-param); white-space:nowrap; }
+  .jwt-kv .v { color:var(--fg); word-break:break-all; }
+  .jwt-kv .v.warn { color:var(--yellow); } .jwt-kv .v.bad { color:var(--red); }
+  .jwt-note { font-size:12px; color:var(--muted); line-height:1.5; margin-top:8px; padding:7px 10px;
+    border-left:2px solid var(--border); background:color-mix(in srgb, var(--fg) 4%, transparent); border-radius:0 6px 6px 0; }
+  .jwt-note.bad { border-left-color:var(--red); color:var(--fg); }
+  .jwt-vuln { display:flex; gap:8px; align-items:baseline; padding:5px 0; border-top:1px solid var(--border); font-size:12.5px; }
+  .jwt-vuln:first-child { border-top:0; }
+  .jwt-vuln .t { color:var(--red); font-weight:600; white-space:nowrap; }
+  .jwt-raw { font-family:var(--rep-font); font-size:12px; white-space:pre-wrap; word-break:break-word; color:var(--muted);
+    background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; max-height:38vh; overflow:auto; margin-top:8px; }
+  .jwt-forge-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; align-items:start; }
+  .jwt-forge-grid label, .jwt-outl { font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+  .jwt-ta { width:100%; box-sizing:border-box; min-height:92px; resize:vertical; font-family:var(--rep-font); font-size:12.5px;
+    color:var(--fg); background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; }
+  .jwt-ta.jwt-out { min-height:60px; color:var(--accent); }
+  .jwt-outl { display:block; margin:12px 0 4px; }
+  .jwt-forge-ctl { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
+  .jwt-forge-ctl select, .jwt-secret, #jwt-secret { height:var(--ctrl-h); box-sizing:border-box; font:inherit; font-size:13px;
+    color:var(--fg); background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:0 10px; }
+  #jwt-secret { flex:1; min-width:150px; }
+  .jwt-forge-act { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  #pane-jwt .btn2 { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:6px; padding:0 12px; height:var(--ctrl-h); cursor:pointer; }
+  #pane-jwt .btn2:hover { border-color:var(--accent); }
+
+  /* ── OAST / Collaborator (Weaponization) ── */
+  #pane-oast.active { display:flex; flex-direction:column; overflow:hidden; }
+  .oast-lbl { font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); align-self:center; }
+  #oast-base { flex:1; min-width:180px; font:inherit; font-size:12.5px; font-family:var(--rep-font); color:var(--fg);
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px; }
+  #oast-base::placeholder { color:var(--muted); }
+  .oast-note { flex:1; min-width:150px; }
+  #pane-oast .btn2 { font:inherit; font-size:13px; color:var(--fg); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:6px; padding:0 12px; height:var(--ctrl-h); cursor:pointer; }
+  #pane-oast .btn2:hover { border-color:var(--accent); }
+  .oast-body { flex:1; min-height:0; min-width:0; overflow:auto; padding:12px var(--gutter); }
+  .oast-canary { border:1px solid var(--edge); border-radius:8px; background:color-mix(in srgb, var(--accent) 6%, var(--panel));
+    box-shadow:var(--bevel); padding:10px 12px; margin-bottom:14px; }
+  .oast-canary .oc-url { font-family:var(--rep-font); font-size:13px; color:var(--accent); word-break:break-all; user-select:all; }
+  .oast-canary .oc-sub { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin:8px 0 4px; }
+  .oast-snip { display:flex; align-items:center; gap:8px; margin:3px 0; }
+  .oast-snip code { flex:1; min-width:0; font-family:var(--rep-font); font-size:12px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:5px; padding:4px 8px; overflow:auto; white-space:pre; }
+  .oast-canary .oc-act { display:flex; gap:8px; margin-top:10px; }
+  .oast-cbhdr { display:flex; align-items:center; margin:2px 0 8px; font-size:12.5px; color:var(--fg); }
+  .oast-count { display:inline-block; min-width:18px; padding:0 6px; border-radius:9px; font-size:11px; font-weight:700;
+    color:#08131a; background:var(--muted); margin-left:4px; }
+  .oast-count.hot { background:var(--accent); box-shadow:0 0 9px color-mix(in srgb, var(--accent) 60%, transparent); }
+  .oast-callbacks table { width:100%; border-collapse:collapse; font-size:12px; }
+  .oast-callbacks th { position:sticky; top:0; z-index:3; text-align:left; padding:6px 9px; background:var(--panel);
+    color:var(--muted); font-weight:600; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .oast-callbacks td { padding:5px 9px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .oast-cb-m { color:var(--accent); font-weight:600; }
+  .oast-cb-unknown { color:var(--yellow); }
   /* template browser */
   .nuc-tplbar, .nuc-custom-bar { flex-shrink:0; display:flex; align-items:center; flex-wrap:wrap; row-gap:8px; gap:8px; padding:8px var(--gutter);
     border-bottom:1px solid var(--border); background:var(--bg); }
@@ -3307,6 +3475,24 @@ _PAGE = r"""<!doctype html>
   .rtab-grip::after { content:""; position:absolute; top:0; right:0; width:1px; height:100%;
     background:transparent; transition:background .12s ease; }
   .rtab-grip:hover::after, .rtab-grip.drag::after { background:var(--accent); width:2px; }
+
+  /* ── Row/column DEPTH (matrix-themed, subtle): low-alpha color-mix blends that let the
+     eye group rows/columns without caging them in borders (not the Sitemap's full cards).
+     Centralized on .rtab (every data table) and LAST in the sheet, and applied to the CELLS
+     (`> *`) so they win over per-module flat tr-hover rules. Holds in light + dark (tokens). ── */
+  table.rtab tbody tr:nth-child(even) > * {        /* zebra: a whisper of phosphor on alt rows */
+    background:color-mix(in srgb, var(--accent) 4%, transparent); }
+  table.rtab tbody td:not(:first-child) {          /* faint column separation (not a full grid) */
+    box-shadow:inset 1px 0 0 color-mix(in srgb, var(--border) 45%, transparent); }
+  table.rtab tbody tr:hover > * {                  /* hover: brighter phosphor wash (sitemap parity) */
+    background:color-mix(in srgb, var(--accent) 11%, transparent); }
+  table.rtab tbody tr.sel > *, table.rtab tbody tr.selected > *,
+  table.rtab tbody tr[aria-selected="true"] > * {  /* selection: stronger tint (module hl-* bars still layer on top) */
+    background:color-mix(in srgb, var(--accent) 18%, transparent); }
+  table.rtab thead th, table.rtab > tbody > tr:first-child > th {   /* header reads as a lit shelf above the rows */
+    background:linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--panel) 82%, #000));
+    box-shadow:inset 0 1px 0 var(--bevel-hi),
+               inset 0 -1px 0 color-mix(in srgb, var(--accent) 30%, var(--border)); }
 </style>
 </head>
 <body>
@@ -3370,8 +3556,10 @@ _PAGE = r"""<!doctype html>
         </div>
       </div>
       <div class="stage-wrap" data-stage="weaponization">
-        <button class="stage empty" aria-haspopup="true" aria-expanded="false">Weaponization<span class="caret"></span></button>
-        <div class="stage-menu" role="menu"><div class="mod-empty">No modules yet</div></div>
+        <button class="stage" aria-haspopup="true" aria-expanded="false">Weaponization<span class="caret"></span></button>
+        <div class="stage-menu" role="menu">
+          <button class="mod" data-tab="oast" role="menuitem" title="OAST / Collaborator — catch blind SSRF/XXE/RCE/SQLi callbacks">Collaborator</button>
+        </div>
       </div>
       <div class="stage-wrap" data-stage="delivery">
         <button class="stage" aria-haspopup="true" aria-expanded="false">Delivery<span class="caret"></span></button>
@@ -3388,6 +3576,7 @@ _PAGE = r"""<!doctype html>
           <button class="mod" data-tab="nuclei" role="menuitem">Nuclei</button>
           <button class="mod" data-tab="repeater" role="menuitem">Repeater</button>
           <button class="mod" data-tab="autorepeater" role="menuitem">AutoRepeater</button>
+          <button class="mod" data-tab="jwt" role="menuitem" title="JWT workbench — decode, analyze (jwt_tool), and forge JSON Web Tokens">JWT</button>
           <button class="mod" data-tab="metasploit" role="menuitem">Metasploit</button>
         </div>
       </div>
@@ -3597,6 +3786,7 @@ _PAGE = r"""<!doctype html>
           <button id="rep-tips" class="rep-tipbtn" title="Hover any header, method, status code, or tag for an explanation">Tips: off</button>
           <button id="rep-pretty" class="rep-tipbtn" title="Pretty-print the response body (JSON / XML / HTML). Headers are left as-is; toggle off for the raw bytes.">Beautify: off</button>
           <button id="rep-decode" class="rep-tipbtn" title="List every cookie, token, and encoded value in this request/response with its decoded form">Decode: off</button>
+          <button id="rep-params" class="rep-tipbtn" title="Discover this endpoint's parameters from the best source available — GraphQL introspection, OpenAPI/Swagger, HTML forms, or captured traffic — and drop a ready-to-edit, correctly-typed stencil into the request. Stops you guessing parameter names. (The panel then offers Verify to actively confirm accepted params.)">Params</button>
           <div class="rep-settings">
             <button id="rep-gear" class="rep-gear" title="Font & colors">Aa ▾</button>
             <div id="rep-pop" class="rep-pop">
@@ -3629,6 +3819,7 @@ _PAGE = r"""<!doctype html>
           </div>
         </div>
         <div id="rep-decoded" hidden></div>
+        <div id="rep-schemapanel" class="rep-schemapanel" hidden></div>
       </section>
 
       <section id="pane-browser" class="pane">
@@ -4191,10 +4382,87 @@ _PAGE = r"""<!doctype html>
           </div>
         </div>
       </section>
+
+      <section id="pane-jwt" class="pane">
+        <div class="net-toolbar">
+          <input id="jwt-input" type="text" spellcheck="false"
+            placeholder="Paste a JWT (eyJ…) — or right-click a request → Send to JWT">
+          <button id="jwt-decode-btn" class="run">Decode</button>
+          <button id="jwt-analyze-btn" class="btn2" title="Run jwt_tool's full test suite (alg confusion, none, blank/weak secret, known CVEs)">Analyze</button>
+          <button id="jwt-torep" class="btn2" title="Send the current token to a new Repeater tab">&#8677; Send to Repeater</button>
+          <span class="spacer"></span>
+          <span id="jwt-status" class="rep-status"></span>
+        </div>
+        <div class="nuc-subtabs jwt-subtabs">
+          <button data-jwt="decode" class="active">Decode</button>
+          <button data-jwt="analyze">Analyze</button>
+          <button data-jwt="forge">Forge</button>
+        </div>
+        <div class="jwt-body">
+          <div id="jwt-decode" class="jwt-pane active"><div class="net-empty">Paste a token above and press Decode. Everything here is local — nothing is sent anywhere until you choose Send to Repeater.</div></div>
+          <div id="jwt-analyze" class="jwt-pane"><div class="net-empty">Analyze runs jwt_tool's full test suite against the token (alg confusion, none-alg, blank/weak secret, known CVEs). Findings also land in Issues.</div></div>
+          <div id="jwt-forge" class="jwt-pane">
+            <div class="jwt-forge-grid">
+              <label>Header (JSON)</label><textarea id="jwt-h" class="jwt-ta" spellcheck="false" placeholder='{"alg":"HS256","typ":"JWT"}'></textarea>
+              <label>Payload (JSON)</label><textarea id="jwt-p" class="jwt-ta" spellcheck="false" placeholder='{"sub":"1","role":"user"}'></textarea>
+            </div>
+            <div class="jwt-forge-ctl">
+              <select id="jwt-alg" title="How to (re)sign the forged token">
+                <option value="none">alg: none (unsigned)</option>
+                <option value="HS256">HS256 — HMAC</option>
+                <option value="HS384">HS384 — HMAC</option>
+                <option value="HS512">HS512 — HMAC</option>
+              </select>
+              <input id="jwt-secret" type="text" spellcheck="false" placeholder="HMAC secret (HS* only)">
+              <button id="jwt-forge-btn" class="run">Forge token</button>
+              <button id="jwt-tamper-btn" class="btn2" title="Inject/overwrite one claim via jwt_tool">jwt_tool inject…</button>
+            </div>
+            <label class="jwt-outl">Forged token</label>
+            <textarea id="jwt-out" class="jwt-ta jwt-out" spellcheck="false" readonly placeholder="the forged token appears here"></textarea>
+            <div class="jwt-forge-act">
+              <button id="jwt-out-copy" class="btn2">Copy</button>
+              <button id="jwt-out-rep" class="btn2">&#8677; Send to Repeater</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-oast" class="pane">
+        <div class="net-toolbar">
+          <span class="oast-lbl">Collaborator base</span>
+          <input id="oast-base" type="text" spellcheck="false"
+            title="Where canaries point. Blank = this suite's own address (localhost / a forwarded port). For external targets, set a public URL that routes back here."
+            placeholder="(blank = this suite's address)">
+          <button id="oast-base-save" class="btn2">Set</button>
+          <span class="pk-vsep"></span>
+          <select id="oast-vuln" title="What you're testing — tags the callback when it fires">
+            <option value="ssrf">SSRF</option>
+            <option value="xxe">XXE</option>
+            <option value="rce">RCE</option>
+            <option value="sqli">blind SQLi</option>
+            <option value="generic">generic</option>
+          </select>
+          <input id="oast-note" type="text" spellcheck="false" class="oast-note" placeholder="note (optional) — e.g. 'q param on /search'">
+          <button id="oast-mint" class="run">Mint canary</button>
+          <span class="spacer"></span>
+          <span id="oast-status" class="rep-status"></span>
+        </div>
+        <div class="oast-body">
+          <div id="oast-canary" class="oast-canary" hidden></div>
+          <div class="oast-cbhdr">
+            <b>Callbacks <span id="oast-count" class="oast-count">0</span></b>
+            <span class="spacer"></span>
+            <button id="oast-clear" class="btn2">Clear</button>
+          </div>
+          <div id="oast-callbacks" class="oast-callbacks">
+            <div class="net-empty">Mint a canary, paste its URL into a request (Repeater, a param, an XXE SYSTEM entity, a ${jndi}/shell payload…), and send it. When the target fetches it, the hit appears here — proof of a blind vulnerability.</div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </div>
-<div id="ctxmenu" class="ctx"><button id="ctx-del">Delete project</button></div>
+<div id="proj-ctxmenu" class="ctx"><button id="ctx-del">Delete project</button></div>
 <div id="issue-ctx" class="iss-ctx"></div>
 <div id="mod-tooltip" class="mod-tooltip"></div>
 <div id="rep-tip"></div>
@@ -4356,6 +4624,7 @@ function activateTab(tab) {
   if (tab === "packets") loadPacketsFor(activeProject);
   if (tab === "recon") loadReconFor(activeProject);
   if (tab === "nuclei") loadNucleiFor(activeProject);
+  if (tab === "oast") oastStartPoll(); else oastStopPoll();
   if (tab === "metasploit") loadMetasploitFor(activeProject);
   document.body.classList.toggle("msf-focus", tab === "metasploit");   // full-width: hide the project rail in Metasploit
   reclampSplitters();   // a newly-shown pane can now measure itself
@@ -4590,6 +4859,12 @@ function bxMapPan(container) {
    widths are re-measured each load so they always fit the current content/scale.
    Mirrors the pane-splitter pointer-drag idiom above. ─────────────────────────── */
 const RTAB_MIN = 48, RTAB_MAX = 460, RTAB_DRAG_MIN = 36;
+// Smart distribution: a column whose content measures <= RTAB_RIGID_MAX is "rigid"
+// (ids, status, counts, dates, short enums) and holds its content width; wider
+// columns are "flex" (urls, titles, descriptions) and absorb slack/deficit down to
+// RTAB_FLEX_FLOOR. This fills the container cleanly instead of letting one column
+// balloon or get cramped.
+const RTAB_RIGID_MAX = 150, RTAB_FLEX_FLOOR = 90;
 const rtabMem = Object.create(null);          // key -> { w:[px], manual:[bool] }  (session cache)
 let rtabScanPending = false, _rtabIO = null, _rtabResizeT = null, rtabDragging = false;
 
@@ -4633,14 +4908,70 @@ function rtabMeasure(table) {
   return out;
 }
 
-function rtabApply(table, w) {
-  // Fill the container: interior columns take their auto-fit/dragged px, the LAST column is left
-  // auto so it flexes out to the right wall. The far ends (left wall, right wall) are thus fixed
-  // anchors = the baseline the whole table scales between as the window/zoom changes.
-  const cells = rtabHeaderCells(table), last = cells.length - 1;
+// The container width available to the table, in layout px (getBoundingClientRect
+// is VISUAL px under CSS zoom, so ÷ uiZoom()). Prefer the scroll wrap's inner width.
+function rtabContainerW(table) {
+  const host = table.parentElement || table;
+  const z = uiZoom();
+  const w = (host.clientWidth || table.clientWidth || 0) / z;
+  return w > 20 ? w - 1 : 0;                           // -1px: avoid a sub-pixel overflow
+}
+
+// Reconcile rounding so the columns in `idxs` sum the table to exactly `target`
+// (grow freely; shrink only down to `floor`). Keeps the table flush to both walls.
+function rtabReconcile(out, idxs, target, floor) {
+  if (!idxs.length) return;
+  let delta = Math.round(target - out.reduce((a, b) => a + b, 0));
+  const order = idxs.slice().sort((a, b) => out[b] - out[a]);   // widest first
+  let guard = 20000;
+  while (delta !== 0 && guard-- > 0) {
+    let moved = false;
+    for (const i of order) {
+      if (delta === 0) break;
+      if (delta > 0) { out[i]++; delta--; moved = true; }
+      else if (out[i] > floor) { out[i]--; delta++; moved = true; }
+    }
+    if (!moved) break;                                 // everything at floor → table will scroll
+  }
+}
+
+// Turn per-column target widths into final widths that fill `containerW`: rigid
+// (and manually-dragged) columns hold their width; flex columns share the slack or
+// the deficit proportionally down to a floor. Returns a px array summing to the
+// container (or to its own min, when even the floors don't fit → contained scroll).
+function rtabDistribute(containerW, ideal, manual) {
+  const n = ideal.length;
+  const out = ideal.map(v => Math.max(RTAB_MIN, Math.round(v)));
+  if (!(containerW > 20) || !n) return out;
+  manual = manual || [];
+  let pool = [], floor = RTAB_FLEX_FLOOR;
+  for (let i = 0; i < n; i++) if (!manual[i] && ideal[i] > RTAB_RIGID_MAX) pool.push(i);
+  if (!pool.length) { floor = RTAB_MIN; for (let i = 0; i < n; i++) if (!manual[i]) pool.push(i); }
+  if (!pool.length) { for (let i = 0; i < n; i++) pool.push(i); }     // all manual → still fill
+  let fixedSum = 0, poolSum = 0;
+  for (let i = 0; i < n; i++) (pool.indexOf(i) < 0 ? fixedSum += out[i] : poolSum += out[i]);
+  const avail = containerW - fixedSum;
+  if (poolSum > 0 && avail >= floor * pool.length) {
+    const scale = avail / poolSum;                     // grow (>1) or shrink (<1) the flex columns
+    for (const i of pool) out[i] = Math.max(floor, Math.round(out[i] * scale));
+  } else if (avail > 0) {
+    for (const i of pool) out[i] = floor;              // too tight for a clean scale → floor + scroll
+  }
+  rtabReconcile(out, pool, containerW, floor);
+  return out;
+}
+
+function rtabApply(table, w, manual) {
+  // table-layout:fixed + width:100%, with an explicit width on EVERY column (no
+  // last-column-auto). Widths come from rtabDistribute so the table always fills
+  // the container: text columns absorb the slack, short columns stay tight, and
+  // nothing balloons or overflows unless the content genuinely can't fit.
+  const cells = rtabHeaderCells(table);
   table.style.tableLayout = "fixed";
   table.style.width = "100%";
-  cells.forEach((c, i) => { c.style.width = (i === last) ? "" : Math.round(w[i]) + "px"; });
+  const final = rtabDistribute(rtabContainerW(table), w, manual);
+  cells.forEach((c, i) => { c.style.width = Math.round(final[i]) + "px"; });
+  return final;
 }
 
 function rtabLSKey(key) { return "beatrix.rtab." + key; }
@@ -4675,7 +5006,7 @@ function rtabAutofitCol(table, key, i) {
   const mem = rtabMem[key];
   if (mem) { mem.w[i] = auto[i]; mem.manual[i] = false; }
   rtabClearManual(key, i);                                 // forget the stored manual width (revert to auto)
-  rtabApply(table, mem ? mem.w : auto);                    // re-apply all columns so the table reflows cleanly
+  rtabApply(table, mem ? mem.w : auto, mem ? mem.manual : null);   // re-apply so the table reflows cleanly
 }
 function rtabAddGrips(table, key) {
   const cells = rtabHeaderCells(table), last = cells.length - 1;
@@ -4702,6 +5033,9 @@ function rtabAddGrips(table, key) {
       const flush = () => {
         raf = 0;
         const w = Math.round(Math.max(RTAB_DRAG_MIN, startW + (lastX - startX) / z));  // visual delta → layout px
+        // Set ONLY the dragged column (the freed last column absorbs the slack) — one cheap
+        // reflow, no container re-measure/redistribute, so the grip tracks the cursor exactly.
+        // (Redistributing every frame fought the 100%-width container and lagged/glitched.)
         th.style.width = w + "px"; if (mem) mem.w[i] = w;
       };
       const move = ev => {
@@ -4709,6 +5043,7 @@ function rtabAddGrips(table, key) {
         if (!moved && Math.abs(lastX - startX) > 3) {                // crossed the drag threshold
           moved = true; rtabDragging = true; grip.classList.add("drag");
           document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
+          if (cells[last]) cells[last].style.width = "";             // free the last column to absorb the drag (exact tracking)
         }
         if (moved && !raf) raf = requestAnimationFrame(flush);
       };
@@ -4726,7 +5061,8 @@ function rtabAddGrips(table, key) {
           if (mem) { mem.w[i] = px; mem.manual[i] = true; }
           rtabSaveManual(key, i, px);
           rtabDragging = false;
-          requestAnimationFrame(rtabScan);
+          if (mem) rtabApply(table, mem.w, mem.manual);              // ONE clean redistribute (restores all-explicit widths)
+          else requestAnimationFrame(rtabScan);
         } else if (isDbl) {                                          // double-click, no drag → auto-fit this column
           grip._rtabLastDown = 0;
           rtabAutofitCol(table, key, i);
@@ -4749,7 +5085,7 @@ function rtabEnhance(table) {
   const key = rtabKey(table), mem = rtabEnsureMem(table, key);
   if (!mem) return;
   table._rtabKey = key;
-  rtabApply(table, mem.w);
+  rtabApply(table, mem.w, mem.manual);
   rtabAddGrips(table, key);
   table.dataset.rtab = "1";
 }
@@ -4770,18 +5106,17 @@ function rtabScan() {
 function rtabScanFlush() { rtabScanPending = false; rtabScan(); }
 
 function rtabOnResize() { clearTimeout(_rtabResizeT); _rtabResizeT = setTimeout(rtabRefit, 160); }
-function rtabRefit() {                                               // re-fit only the columns the user has not dragged
+function rtabRefit() {                                               // re-measure content + redistribute to the new container width
   const t = document.querySelectorAll('table.rtab[data-rtab="1"]');
   for (let i = 0; i < t.length; i++) {
     const table = t[i];
     if (!rtabVisible(table)) continue;
     const mem = rtabMem[table._rtabKey]; if (!mem) continue;
     if (rtabHeaderCells(table).length !== mem.w.length) continue;
-    const auto = rtabMeasure(table); if (!auto) continue;
-    let changed = false;
-    for (let c = 0; c < mem.w.length; c++)
-      if (!mem.manual[c] && Math.round(auto[c]) !== Math.round(mem.w[c])) { mem.w[c] = auto[c]; changed = true; }
-    if (changed) rtabApply(table, mem.w);
+    const auto = rtabMeasure(table);
+    if (auto) for (let c = 0; c < mem.w.length; c++)
+      if (!mem.manual[c]) mem.w[c] = auto[c];                        // refresh content targets (dragged columns stay pinned)
+    rtabApply(table, mem.w, mem.manual);                            // always redistribute — the container width changed
   }
 }
 
@@ -5929,19 +6264,20 @@ function teardownProjectViews() {
   if (msfSeshTimer) { clearTimeout(msfSeshTimer); msfSeshTimer = null; }
 }
 
-// Context menu
+// Project-tab delete menu (its own element #proj-ctxmenu — NOT the shared routing #ctxmenu;
+// they used to collide on a duplicate id, which left the routing menu stuck display:none).
 function showCtx(e, id) {
-  const m = $("ctxmenu");
+  const m = $("proj-ctxmenu");
   const z = uiZoom();                                  // map cursor (visual) coords into the zoomed space
   m.style.display = "block"; m.style.left = (e.clientX / z) + "px"; m.style.top = (e.clientY / z) + "px";
   m.dataset.pid = id;
 }
 document.addEventListener("click", () => {
-  $("ctxmenu").style.display = "none"; $("issue-ctx").style.display = "none";
+  $("proj-ctxmenu").style.display = "none"; $("issue-ctx").style.display = "none";
 });
 $("ctx-del").onclick = () => {
-  const id = parseInt($("ctxmenu").dataset.pid, 10);
-  $("ctxmenu").style.display = "none";
+  const id = parseInt($("proj-ctxmenu").dataset.pid, 10);
+  $("proj-ctxmenu").style.display = "none";
   deleteProject(id);
 };
 
@@ -6772,6 +7108,10 @@ function initRepSettings() {
   let decodeSaved = false;
   try { decodeSaved = localStorage.getItem("beatrix.rep.decode") === "1"; } catch (e) {}
   setRepDecode(decodeSaved);
+
+  // Params — discover this endpoint's parameters from the best source (one-shot,
+  // not a persisted toggle: it fetches + opens a dismissable panel).
+  $("rep-params").onclick = repFetchParams;
 
   applyRepDisplay();
 }
@@ -8352,6 +8692,177 @@ function setRepDecode(on) {
   if (on) renderDecodePanel();
 }
 
+// ── Predictive parameters for ALL parameterized queries ──────────────────────
+// Rather than guess which parameters an endpoint accepts, ASK the best source:
+// GraphQL introspection + OpenAPI/Swagger + HTML forms give an exact ruleset;
+// captured traffic gives an empirical one; Verify actively confirms which
+// params the server accepts. Every source yields a ready-to-send *stencil* with
+// the params written into the right place. repParams caches the last result so
+// a click inserts a stencil without a round trip.
+let repParams = null, repParamsBusy = false;
+
+const REP_SRC_LABEL = { introspection: "GraphQL", openapi: "OpenAPI", form: "form",
+                        observed: "observed", probed: "verified" };
+
+function repCurrentResponseRaw() {
+  const r = (typeof currentRepResponse === "function") ? currentRepResponse() : null;
+  return (r && !r.error) ? (r.raw || "") : "";
+}
+
+async function repFetchParams() {
+  const btn = $("rep-params");
+  const request = ($("rep-request") || {}).value || "", target = ($("rep-target") || {}).value || "";
+  if (btn) { btn.disabled = true; btn.textContent = "Discovering…"; }
+  $("rep-status").innerHTML = '<span class="dim">discovering parameters…</span>';
+  try {
+    repParams = await (await fetch("/repeater/params", { method: "POST",
+      body: JSON.stringify({ project: activeProject, request, target,
+        response: repCurrentResponseRaw() }) })).json();
+    renderParamsPanel(repParams);
+    $("rep-status").textContent = "";
+  } catch (e) {
+    $("rep-status").innerHTML = '<span class="bad">params request failed: ' + esc(e.message || e) + '</span>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Params"; }
+  }
+}
+
+// Tier 3 — active verification. Scope-gated server-side; an out-of-scope target
+// comes back needs_confirm, and we ask before re-sending with force.
+async function repVerifyParams(force) {
+  if (repParamsBusy) return;
+  const request = ($("rep-request") || {}).value || "", target = ($("rep-target") || {}).value || "";
+  repParamsBusy = true;
+  $("rep-status").innerHTML = '<span class="dim">actively verifying parameters (this sends requests)…</span>';
+  let d;
+  try {
+    d = await (await fetch("/repeater/params/verify", { method: "POST",
+      body: JSON.stringify({ project: activeProject, request, target, force: !!force,
+        response: repCurrentResponseRaw() }) })).json();
+  } catch (e) {
+    $("rep-status").innerHTML = '<span class="bad">verify failed: ' + esc(e.message || e) + '</span>';
+    repParamsBusy = false; return;
+  }
+  repParamsBusy = false;
+  $("rep-status").textContent = "";
+  if (d && d.needs_confirm) {
+    const ok = await confirmDialog({ title: "Active parameter probing",
+      body: (d.reason || "This target is out of scope.") + " Active probing sends many requests. Proceed?",
+      danger: true, confirmLabel: "Probe anyway" });
+    if (ok) repVerifyParams(true);
+    return;
+  }
+  if (!d || !d.ok) { toast((d && d.error) || "Active verification failed.", { ms: 7000 }); return; }
+  const got = (d.stencils || []);
+  if (!repParams || !repParams.stencils) repParams = { ok: true, endpoint: target, sources: [], stencils: [] };
+  if (got.length) {
+    repParams.stencils = repParams.stencils.concat(got);
+    (repParams.sources = repParams.sources || []).push({ kind: "probed", ok: true,
+      note: d.note || "", count: got.reduce((n, s) => n + (s.params ? s.params.length : 0), 0) });
+    renderParamsPanel(repParams);
+  }
+  toast(d.note || (got.length ? ("Verified " + got.length + " stencil(s).") : "No additional parameters found."), { ms: 6000 });
+}
+
+// One param row: name · where · type · required/optional · source · confidence,
+// then (second line) description, default/example, and any enum values.
+function paramRow(p) {
+  const flag = p.required ? '<span class="gql-flag req">required</span>'
+             : p.required === false ? '<span class="gql-flag opt">optional</span>' : "";
+  const src = '<span class="gql-srcbadge src-' + esc(p.source) + '">' + esc(REP_SRC_LABEL[p.source] || p.source) + '</span>';
+  const conf = p.confidence && p.confidence !== "exact"
+    ? '<span class="gql-conf conf-' + esc(p.confidence) + '">' + esc(p.confidence) + '</span>' : "";
+  let meta = "";
+  if (p.description) meta += esc(p.description) + " ";
+  if (p.default !== null && p.default !== undefined && p.default !== "")
+    meta += '<span class="dim">default: ' + esc(String(p.default)) + '</span> ';
+  else if (p.example !== null && p.example !== undefined && p.example !== "")
+    meta += '<span class="dim">e.g. ' + esc(String(p.example)) + '</span> ';
+  let enums = "";
+  if (p.enum && p.enum.length)
+    enums = '<div class="gql-enums">' + p.enum.map(v => '<span class="gql-enumchip">' + esc(String(v)) + '</span>').join("") + '</div>';
+  const where = '<span class="gql-where">' + esc(p["in"]) + '</span>';
+  return '<div class="gql-arg"><span class="gql-arg-n">' + esc(p.name) + '</span>' +
+    '<span class="gql-arg-t">' + esc(p.type || "") + '</span>' + where + flag + src + conf +
+    (meta || enums ? '<div class="gql-meta">' + meta + enums + '</div>' : '') + '</div>';
+}
+
+function stencilBlock(st, idx) {
+  const src = '<span class="gql-srcbadge src-' + esc(st.source) + '">' + esc(REP_SRC_LABEL[st.source] || st.source) + '</span>';
+  const rows = (st.params && st.params.length)
+    ? st.params.map(paramRow).join("")
+    : '<div class="gql-noargs">No parameters for this operation.</div>';
+  return '<details class="gql-op"><summary>' +
+    '<span class="gql-name">' + esc(st.label) + '</span>' + src +
+    (st.note ? '<span class="gql-sig">' + esc(st.note) + '</span>' : '') + '</summary>' +
+    '<div class="gql-body">' + rows +
+    '<button class="gql-use" data-idx="' + idx + '">↪ Insert stencil into editor</button>' +
+    '</div></details>';
+}
+
+function renderParamsPanel(d) {
+  const panel = $("rep-schemapanel"); if (!panel) return;
+  panel.hidden = false;
+  const close = '<button class="gql-x" title="Close">✕</button>';
+  const verify = '<button class="gql-verify" title="Actively send requests to confirm which parameters the server accepts (Arjun / Clairvoyance; in-scope only)">Verify (active)</button>';
+  const stencils = (d && d.stencils) || [];
+  // Give each stencil a stable index for the Insert button.
+  stencils.forEach((s, i) => { s._idx = i; });
+  let html = '<div class="gql-top"><h4>Parameters</h4>' +
+    (d && d.endpoint ? '<span class="gql-ep">' + esc(d.endpoint) + '</span>' : '') +
+    verify + close + '</div>';
+  // Source summary line.
+  if (d && d.sources && d.sources.length) {
+    const bits = d.sources.map(s => {
+      const lbl = REP_SRC_LABEL[s.kind] || s.kind;
+      return '<span class="gql-srcbadge src-' + esc(s.kind) + (s.ok ? '' : ' off') + '">' +
+        esc(lbl) + (s.ok ? ' · ' + (s.count || 0) : ' · —') + '</span>';
+    }).join(" ");
+    html += '<div class="gql-sources">' + bits + '</div>';
+  }
+  if (!stencils.length) {
+    const warn = !!(d && d.error);
+    html += '<div class="gql-note' + (warn ? ' warn' : '') + '">' +
+      esc((d && d.error) || "No parameters discovered.") + '</div>';
+    if (d && d.hints && d.hints.length) {
+      html += '<div class="gql-grp">Field names leaked by error messages</div>' +
+        '<div class="gql-hints">' + d.hints.map(h => '<span class="gql-hint">' + esc(h) + '</span>').join("") + '</div>';
+    }
+    panel.innerHTML = html;
+    return;
+  }
+  // Group stencils by source, most authoritative first.
+  const order = ["introspection", "openapi", "form", "observed", "probed"];
+  const bySrc = {};
+  stencils.forEach(s => { (bySrc[s.source] = bySrc[s.source] || []).push(s); });
+  for (const src of order) {
+    const list = bySrc[src]; if (!list || !list.length) continue;
+    html += '<div class="gql-grp">' + esc(REP_SRC_LABEL[src] || src) + ' (' + list.length + ')</div>';
+    html += list.map(s => stencilBlock(s, s._idx)).join("");
+  }
+  panel.innerHTML = html;
+}
+
+function repInsertStencil(idx) {
+  const st = ((repParams && repParams.stencils) || [])[idx];
+  if (!st || !st.request) return;
+  $("rep-request").value = st.request;
+  try { const u = new URL(repParams.endpoint); $("rep-target").value = u.protocol + "//" + u.host; } catch (e) {}
+  repView = { live: true, idx: 0 };
+  repHighlightRequest(); scheduleRepSave(); updateRepHistUI();
+  if (repDecodeOn) renderDecodePanel();
+  const ta = $("rep-request"); if (ta) { ta.scrollTop = 0; ta.focus(); }
+  toast('Stencil "' + st.label + '" inserted — edit the values and Send.', { ms: 5000 });
+}
+
+// Panel clicks: close, the active-Verify button, or a stencil's Insert button.
+$("rep-schemapanel").addEventListener("click", (e) => {
+  if (e.target.closest(".gql-x")) { $("rep-schemapanel").hidden = true; return; }
+  if (e.target.closest(".gql-verify")) { e.preventDefault(); repVerifyParams(false); return; }
+  const use = e.target.closest(".gql-use");
+  if (use) { e.preventDefault(); repInsertStencil(+use.getAttribute("data-idx")); }
+});
+
 function renderRepResponse(resp) {
   const pre = $("rep-response");
   if (!resp) { pre.textContent = ""; pre.classList.remove("err"); $("rep-status").textContent = ""; renderDecodePanel(); return; }
@@ -9236,21 +9747,48 @@ function renderNetTopology(hosts) {
     let sum = 0; for (const k of kids) sum += layout(k, depth + 1, id);
     nodes[id].y = sum / kids.length; return nodes[id].y;
   })(root, 0, null);
-  const COLW = 150, ROWH = 34, PADX = 20, PADY = 18, R = 5;
-  const W = PADX * 2 + maxDepth * COLW + 130, H = PADY * 2 + Math.max(1, leaf) * ROWH;
-  const X = d => PADX + d * COLW, Y = y => PADY + y * ROWH + 6;
+  // Legibility (never overlap/cross): ellipsize labels (full value stays in the node
+  // <title>), size each COLUMN to its own widest label so a long host can't run into the
+  // next column, run a per-column vertical separation pass so no two nodes/labels touch,
+  // and draw a plate behind each label so edges passing behind are occluded (never cross text).
+  const R = 5, CHARW = 6.7, ROWH = 38, LABEL_H = 32, PADX = 18, PADY = 20, GAPX = 40, MINCOL = 110;
+  const ell = (s, n) => { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+  for (const n of nodes) {
+    n.l1 = n.isRoot ? "you" : ell(n.ip, 26);
+    n.l2 = n.host ? ell(n.host, 26) : "";
+    n.full = n.rtt ? (n.ip + " · " + n.rtt + " ms") : n.ip;
+    n.labelW = 9 + Math.ceil(Math.max(n.l1.length, n.l2.length) * CHARW) + 10;
+  }
+  const colW = [];
+  for (let d = 0; d <= maxDepth; d++) colW[d] = MINCOL;
+  for (const n of nodes) if (n.labelW > colW[n.depth]) colW[n.depth] = n.labelW;
+  const colX = [PADX];
+  for (let d = 1; d <= maxDepth; d++) colX[d] = colX[d - 1] + colW[d - 1] + GAPX;
+  for (const n of nodes) n.py = PADY + n.y * ROWH + 6;
+  const byCol = {};
+  for (const n of nodes) (byCol[n.depth] = byCol[n.depth] || []).push(n);
+  let maxPy = PADY + 6;
+  for (const d in byCol) {                                      // push crowded siblings apart (>= LABEL_H gap)
+    const col = byCol[d].sort((a, b) => a.py - b.py);
+    let minPy = PADY + 6;
+    for (const n of col) { if (n.py < minPy) n.py = minPy; minPy = n.py + LABEL_H; if (n.py > maxPy) maxPy = n.py; }
+  }
+  const X = n => colX[n.depth] + R;
+  const W = colX[maxDepth] + colW[maxDepth] + PADX, H = maxPy + LABEL_H + PADY;
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
   for (const [p, c] of edges) {
-    const x1 = X(nodes[p].depth), y1 = Y(nodes[p].y), x2 = X(nodes[c].depth), y2 = Y(nodes[c].y), mx = (x1 + x2) / 2;
+    const x1 = X(nodes[p]), y1 = nodes[p].py, x2 = X(nodes[c]), y2 = nodes[c].py, mx = (x1 + x2) / 2;
     svg += '<path class="edge" d="M' + x1 + ' ' + y1 + ' C' + mx + ' ' + y1 + ' ' + mx + ' ' + y2 + ' ' + x2 + ' ' + y2 + '"/>';
   }
   for (const n of nodes) {
-    const x = X(n.depth), y = Y(n.y);
+    const x = X(n), y = n.py;
     const cls = n.isRoot ? "node root" : (n.isTarget ? "node target" : "node");
     svg += '<circle class="' + cls + '" cx="' + x + '" cy="' + y + '" r="' + (n.isTarget ? R + 1 : R) + '">' +
-      '<title>' + esc(n.rtt ? (n.ip + " · " + n.rtt + " ms") : n.ip) + '</title></circle>';
-    svg += '<text x="' + (x + 9) + '" y="' + (y + 4) + '">' + (n.isRoot ? "you" : esc(n.ip)) + '</text>';
-    if (n.host) svg += '<text class="meta" x="' + (x + 9) + '" y="' + (y + 15) + '">' + esc(n.host) + '</text>';
+      '<title>' + esc(n.full) + '</title></circle>';
+    const bx = x + 6, bw = n.labelW - 6, bh = n.l2 ? 30 : 16, by = y - (n.l2 ? 15 : 8);
+    svg += '<rect class="lblbg" x="' + bx + '" y="' + by + '" width="' + bw + '" height="' + bh + '" rx="4"/>';
+    svg += '<text x="' + (x + 9) + '" y="' + (y + (n.l2 ? -3 : 4)) + '">' + esc(n.l1) + '</text>';
+    if (n.l2) svg += '<text class="meta" x="' + (x + 9) + '" y="' + (y + 12) + '">' + esc(n.l2) + '</text>';
   }
   svg += '</svg>';
   box.innerHTML = '<div class="net-topo">' + svg + '</div>';
@@ -9732,7 +10270,7 @@ function httpRowHtml(r) {
   const an = httpAnnot[r.id] || {};
   const kind = httpKind(r), kl = SM_KIND_LABEL[kind] || "", w = SM_WRITE.test(r.method || "");
   const typeTxt = kl || esc((r.mime || "").replace("application/", ""));
-  return '<tr class="http-row' + (r.in_scope ? "" : " oos") + (r.id === httpSelId ? " sel" : "") + (an.hl ? " hl-" + an.hl : "") + '" data-id="' + r.id + '">' +
+  return '<tr class="http-row' + (r.in_scope ? "" : " oos") + (httpSelected.has(r.id) ? " sel" : "") + (r.id === httpSelId ? " active" : "") + (an.hl ? " hl-" + an.hl : "") + '" data-id="' + r.id + '">' +
     '<td class="http-ck"><input type="checkbox" class="http-rck" data-id="' + r.id + '"' + (httpSelected.has(r.id) ? " checked" : "") + '></td>' +
     '<td>' + r.id + '</td>' +
     '<td><span class="http-m' + (w ? " w" : "") + '">' + esc(r.method || "") + '</span></td>' +
@@ -9906,16 +10444,21 @@ function httpWireList(box) {
     const id = parseInt(tr.getAttribute("data-id"), 10);
     tr.onclick = (e) => {
       const rows = [...box.querySelectorAll("tr.http-row")], idx = rows.indexOf(tr);
-      if (e.shiftKey && httpLastRow >= 0 && httpLastRow < rows.length) {   // range into the selection
+      if (e.shiftKey && httpLastRow >= 0 && httpLastRow < rows.length) {   // range from the anchor (replaces selection)
         const a = Math.min(idx, httpLastRow), b = Math.max(idx, httpLastRow);
+        httpSelected = new Set();
         for (let i = a; i <= b; i++) httpSelected.add(parseInt(rows[i].getAttribute("data-id"), 10));
-        httpSyncRowChecks(box); httpRenderSelbar();
-      } else if (e.ctrlKey || e.metaKey) {                                 // toggle one
+        httpSelId = id; httpPaintSelection(); httpLoadDetail(id);          // anchor (httpLastRow) stays so shift extends from it
+      } else if (e.ctrlKey || e.metaKey) {                                 // toggle this row in/out of the selection
         if (httpSelected.has(id)) httpSelected.delete(id); else httpSelected.add(id);
-        httpLastRow = idx; httpSyncRowChecks(box); httpRenderSelbar();
-      } else { httpSelect(id); httpLastRow = idx; }                        // plain click = view detail
+        httpLastRow = idx; httpSelId = id; httpPaintSelection(); httpLoadDetail(id);
+      } else { httpSelect(id); httpLastRow = idx; }                        // plain = select only this row + preview
     };
-    tr.oncontextmenu = (e) => { e.preventDefault(); if (!httpSelected.has(id)) httpSelect(id); httpRowMenu(e, id); };
+    tr.oncontextmenu = (e) => {                                            // right-click acts on the selection
+      e.preventDefault();
+      if (!httpSelected.has(id)) { httpSelect(id); httpLastRow = [...box.querySelectorAll("tr.http-row")].indexOf(tr); }
+      httpRowMenu(e, id);
+    };
   });
   box.querySelectorAll("thead th[data-sort]").forEach(th => th.onclick = () => httpSortBy(th.getAttribute("data-sort")));
   box.querySelectorAll("tr.http-grp-row").forEach(tr => tr.onclick = () => {
@@ -9932,14 +10475,13 @@ function httpWireList(box) {
       for (let i = a; i <= b; i++) apply(all[i], on);
     } else apply(cb, cb.checked);
     httpLastCk = curIdx;
-    const ckAll = $("http-ck-all"); if (ckAll) ckAll.checked = all.length > 0 && all.every(c => c.checked);
-    httpRenderSelbar();
+    httpPaintSelection();                                 // mirror into the row highlights (checkbox is just a mirror now)
   });
   const ckAll = $("http-ck-all");
   if (ckAll) ckAll.onclick = (e) => {
     e.stopPropagation(); const on = ckAll.checked;
-    box.querySelectorAll(".http-rck").forEach(c => { c.checked = on; const cid = parseInt(c.getAttribute("data-id"), 10); if (on) httpSelected.add(cid); else httpSelected.delete(cid); });
-    httpRenderSelbar();
+    box.querySelectorAll(".http-rck").forEach(c => { const cid = parseInt(c.getAttribute("data-id"), 10); if (on) httpSelected.add(cid); else httpSelected.delete(cid); });
+    httpPaintSelection();
   };
   const rep = box.querySelector(".http-sel-rep"); if (rep) rep.onclick = () => { if (httpSelected.size) httpBulkToRepeater([...httpSelected]); };
   const del = box.querySelector(".http-sel-del"); if (del) del.onclick = () => { if (httpSelected.size) httpDeleteIds([...httpSelected]); };
@@ -10083,15 +10625,33 @@ async function httpCopyFromDetail(id, what) {
     else copyText(httpRawRequest(tx));
   } catch (e) { toast("Copy failed."); }
 }
+// Plain-select a single row: it becomes the ENTIRE selection (highlight), the anchor, and
+// the previewed detail — so "highlighted" == "selected" (OS/office style). Ctrl/Shift in the
+// row handler build multi-row selections on top of this.
 async function httpSelect(id) {
+  httpSelected = new Set([id]);
   httpSelId = id;
-  document.querySelectorAll("#http-list tr.http-row").forEach(tr =>
-    tr.classList.toggle("sel", tr.getAttribute("data-id") === String(id)));
+  httpPaintSelection();
+  await httpLoadDetail(id);
+}
+async function httpLoadDetail(id) {
   const d = await (await fetch("/http/detail?id=" + id + "&project=" + activeProject)).json();
   const tx = d.tx;
   if (!tx || id !== httpSelId) return;
   httpDetail = tx;
   httpRenderDetail();
+}
+// Repaint .sel (selected rows) + .active (the previewed anchor) across the visible rows and
+// keep the checkbox mirror + selbar count in sync — cheaper/snappier than a full re-render.
+function httpPaintSelection() {
+  const box = document.getElementById("http-list"); if (!box) return;
+  box.querySelectorAll("tr.http-row").forEach(tr => {
+    const rid = parseInt(tr.getAttribute("data-id"), 10);
+    tr.classList.toggle("sel", httpSelected.has(rid));
+    tr.classList.toggle("active", rid === httpSelId);
+  });
+  httpSyncRowChecks(box);
+  httpRenderSelbar();
 }
 let httpDetail = null, httpPrettyOn = false, httpDecodeOn = false;
 function httpRawRequest(tx) {
@@ -10175,9 +10735,13 @@ function showCtxMenu(x, y, items) {
   hideCtxSub();
   const m = $("ctxmenu"); m.innerHTML = "";
   ctxBuildInto(m, items);
-  m.hidden = false;
-  m.style.left = Math.min(x, window.innerWidth - m.offsetWidth - 8) + "px";
-  m.style.top = Math.min(y, window.innerHeight - m.offsetHeight - 8) + "px";
+  m.hidden = false; m.style.display = "";             // unhide BEFORE measuring offsetWidth/Height (clear any stray inline display)
+  // The cursor coords are VISUAL px but #ctxmenu is position:fixed under the root CSS zoom,
+  // so its left/top are in LAYOUT px — divide by uiZoom() or the menu lands off-screen at any
+  // zoom != 1 (the "no right-click menu" bug). Mirrors placeFixedUnder.
+  const z = uiZoom(), vw = window.innerWidth / z, vh = window.innerHeight / z;
+  m.style.left = Math.max(6, Math.min(x / z, vw - m.offsetWidth - 8)) + "px";
+  m.style.top = Math.max(6, Math.min(y / z, vh - m.offsetHeight - 8)) + "px";
 }
 function ctxBuildInto(m, items) {
   for (const it of items) {
@@ -10201,10 +10765,11 @@ function ctxOpenSub(anchor, items) {
   const sub = document.createElement("div"); sub.className = "ctxmenu"; sub.id = "ctxsub";
   ctxBuildInto(sub, items);
   document.body.appendChild(sub); sub.hidden = false;
-  const r = anchor.getBoundingClientRect();
-  let left = r.right - 2, top = r.top;
-  if (left + sub.offsetWidth > window.innerWidth - 8) left = r.left - sub.offsetWidth + 2;
-  if (top + sub.offsetHeight > window.innerHeight - 8) top = window.innerHeight - sub.offsetHeight - 8;
+  // Same zoom correction as showCtxMenu: rect edges are visual px, the fixed submenu is layout px.
+  const z = uiZoom(), r = anchor.getBoundingClientRect(), vw = window.innerWidth / z, vh = window.innerHeight / z;
+  let left = r.right / z - 2, top = r.top / z;
+  if (left + sub.offsetWidth > vw - 8) left = r.left / z - sub.offsetWidth + 2;
+  if (top + sub.offsetHeight > vh - 8) top = vh - sub.offsetHeight - 8;
   sub.style.left = Math.max(6, left) + "px"; sub.style.top = Math.max(6, top) + "px";
   _ctxSub = sub;
 }
@@ -10327,6 +10892,244 @@ function importHostsToMsf() {
   setTimeout(() => { try { msfImport(); } catch (e) {} }, 180);
 }
 // ctx = { raw, url, response?, selection? [{raw,url}] }
+// ── JWT workbench (operator tool module) ─────────────────────────────────────
+// Decode is 100% local (no CLI, no network); Analyze shells out to jwt_tool (via
+// the server, availability-gated); Forge builds tokens locally (alg=none + HMAC
+// re-sign via WebCrypto) or injects a claim via jwt_tool. Nothing leaves the box
+// until the operator explicitly sends a token to the Repeater.
+let jwtSource = null;                                   // {request,target} when routed in from a real request
+
+function b64urlFromBytes(bytes) {
+  let s = ""; for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function strToB64url(str) { return b64urlFromBytes(new TextEncoder().encode(str)); }
+
+function jwtDecodeLocal(tok) {
+  const parts = String(tok || "").trim().split(".");
+  if (parts.length < 2) return { ok: false };
+  let header, payload;
+  try { header = JSON.parse(b64urlToStr(parts[0])); } catch (e) { return { ok: false }; }
+  try { payload = JSON.parse(b64urlToStr(parts[1])); } catch (e) { return { ok: false }; }
+  if (!header || typeof header !== "object" || !payload || typeof payload !== "object") return { ok: false };
+  return { ok: true, header: header, payload: payload, sig: parts[2] || "" };
+}
+function jwtTime(v) {
+  const n = Number(v); if (!n) return String(v);
+  const d = new Date(n * 1000), rel = n - Date.now() / 1000, ago = Math.abs(rel);
+  const u = ago < 3600 ? Math.round(ago / 60) + "m" : ago < 86400 ? Math.round(ago / 3600) + "h" : Math.round(ago / 86400) + "d";
+  return d.toISOString().slice(0, 19).replace("T", " ") + "Z (" + (rel < 0 ? u + " ago" : "in " + u) + ")";
+}
+function jwtAlgNote(alg) {
+  const a = String(alg).toLowerCase();
+  if (a === "none") return "alg=none — the token is UNSIGNED. Many libraries will accept forged claims outright; forge one in the Forge tab and replay it.";
+  if (a[0] === "h") return "HMAC (HS*) — forgeable if the secret is weak/guessable. Analyze (jwt_tool) tries a dictionary; once you know the secret, re-sign in the Forge tab.";
+  if (a[0] === "r" || a[0] === "e" || a[0] === "p") return "Asymmetric (RS/ES/PS) — test algorithm confusion: re-sign as HS256 using the server's PUBLIC key as the HMAC secret.";
+  return "Check exp/nbf and whether privileged claims (role/admin/scope) are trusted server-side.";
+}
+function jwtStatus(msg, cls) {
+  const el = $("jwt-status"); if (!el) return;
+  el.innerHTML = msg ? '<span class="' + (cls === "bad" ? "bad" : "dim") + '">' + esc(msg) + "</span>" : "";
+}
+function jwtShowSub(name) {
+  document.querySelectorAll("#pane-jwt .jwt-subtabs button").forEach(b => b.classList.toggle("active", b.getAttribute("data-jwt") === name));
+  document.querySelectorAll("#pane-jwt .jwt-pane").forEach(p => p.classList.toggle("active", p.id === "jwt-" + name));
+}
+function renderJwtDecode() {
+  const tok = ($("jwt-input").value || "").trim(), box = $("jwt-decode");
+  if (!tok) { box.innerHTML = '<div class="net-empty">Paste a token above and press Decode.</div>'; return; }
+  const d = jwtDecodeLocal(tok);
+  if (!d.ok) { box.innerHTML = '<div class="jwt-note bad">Not a JWT — expected three dot-separated base64url segments (eyJ…).</div>'; return; }
+  const alg = d.header.alg || "?";
+  const kv = (obj, timeKeys) => {
+    let h = '<div class="jwt-kv">';
+    for (const k in obj) {
+      const v = obj[k]; let disp = (typeof v === "object") ? JSON.stringify(v) : String(v), cls = "";
+      if (timeKeys && (k === "exp" || k === "iat" || k === "nbf")) { disp = jwtTime(v); if (k === "exp" && Number(v) * 1000 < Date.now()) cls = " bad"; }
+      if (k === "alg" && String(v).toLowerCase() === "none") cls = " bad";
+      h += '<span class="k">' + esc(k) + '</span><span class="v' + cls + '">' + esc(disp) + "</span>";
+    }
+    return h + "</div>";
+  };
+  let h = '<div class="jwt-sec"><div class="jwt-seclabel">Header</div>' + kv(d.header, false) + "</div>";
+  h += '<div class="jwt-sec"><div class="jwt-seclabel">Payload — claims</div>' + kv(d.payload, true) + "</div>";
+  h += '<div class="jwt-sec"><div class="jwt-seclabel">Signature</div><div class="jwt-kv"><span class="k">present</span><span class="v">' +
+    (d.sig ? "yes · " + d.sig.length + " chars" : "— none (unsigned)") + "</span></div></div>";
+  h += '<div class="jwt-note' + (String(alg).toLowerCase() === "none" ? " bad" : "") + '">' + esc(jwtAlgNote(alg)) + "</div>";
+  box.innerHTML = h;
+  try { $("jwt-h").value = JSON.stringify(d.header, null, 2); $("jwt-p").value = JSON.stringify(d.payload, null, 2); } catch (e) {}
+}
+async function jwtAnalyze() {
+  const tok = ($("jwt-input").value || "").trim();
+  if (!tok) { jwtStatus("Paste a token first.", "bad"); return; }
+  jwtShowSub("analyze"); $("jwt-analyze").innerHTML = '<div class="net-empty">Analyzing with jwt_tool…</div>'; jwtStatus("running jwt_tool…");
+  let d;
+  try { d = await (await fetch("/jwt/analyze", { method: "POST", body: JSON.stringify({ project: activeProject, token: tok }) })).json(); }
+  catch (e) { $("jwt-analyze").innerHTML = '<div class="jwt-note bad">Request failed: ' + esc(e.message || e) + "</div>"; jwtStatus(""); return; }
+  jwtStatus("");
+  if (!d.available) { $("jwt-analyze").innerHTML = '<div class="jwt-note bad">' + esc(d.error || "jwt_tool isn't installed — Decode and Forge still work. Install it (pip install jwt_tool, or via install.sh) for the automated test suite.") + "</div>"; return; }
+  if (d.error) { $("jwt-analyze").innerHTML = '<div class="jwt-note bad">' + esc(d.error) + "</div>"; return; }
+  const v = d.vulnerabilities || [];
+  let h = v.length
+    ? '<div class="jwt-sec"><div class="jwt-seclabel">Findings (' + v.length + ')</div>' +
+      v.map(x => '<div class="jwt-vuln"><span class="t">' + esc(x.type) + '</span><span>' + esc(x.detail || "") + "</span></div>").join("") + "</div>"
+    : '<div class="jwt-note">jwt_tool\'s automated suite reported nothing. Still review the claims and whether the server trusts them.</div>';
+  if (d.output) h += '<div class="jwt-seclabel" style="margin-top:12px">jwt_tool output</div><div class="jwt-raw">' + esc(d.output) + "</div>";
+  $("jwt-analyze").innerHTML = h;
+  if (v.length) toast("JWT: " + v.length + " finding(s) added to Issues.");
+}
+async function jwtHsSign(signingInput, secret, alg) {
+  const hash = { HS256: "SHA-256", HS384: "SHA-384", HS512: "SHA-512" }[alg] || "SHA-256";
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: hash }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signingInput));
+  return b64urlFromBytes(new Uint8Array(sig));
+}
+async function jwtForge() {
+  let header, payload;
+  try { header = JSON.parse($("jwt-h").value || "{}"); } catch (e) { jwtStatus("Header isn't valid JSON.", "bad"); jwtShowSub("forge"); return; }
+  try { payload = JSON.parse($("jwt-p").value || "{}"); } catch (e) { jwtStatus("Payload isn't valid JSON.", "bad"); jwtShowSub("forge"); return; }
+  const alg = $("jwt-alg").value;
+  header.alg = alg === "none" ? "none" : alg;
+  if (!header.typ) header.typ = "JWT";
+  const si = strToB64url(JSON.stringify(header)) + "." + strToB64url(JSON.stringify(payload));
+  let token;
+  if (alg === "none") token = si + ".";
+  else {
+    try { token = si + "." + await jwtHsSign(si, $("jwt-secret").value || "", alg); }
+    catch (e) { jwtStatus("Signing failed: " + (e.message || e), "bad"); return; }
+  }
+  $("jwt-out").value = token;
+  jwtStatus("Forged " + (alg === "none" ? "unsigned" : alg) + " token — edit or Send to Repeater.");
+}
+async function jwtTamper() {
+  const tok = ($("jwt-input").value || "").trim();
+  if (!tok) { jwtStatus("Paste a token first (Decode tab).", "bad"); return; }
+  const claim = prompt("Claim to inject / overwrite (e.g. role):"); if (!claim) return;
+  const value = prompt('New value for "' + claim + '":'); if (value === null) return;
+  jwtStatus("jwt_tool injecting…");
+  let d;
+  try { d = await (await fetch("/jwt/tamper", { method: "POST", body: JSON.stringify({ project: activeProject, token: tok, claim: claim, value: value }) })).json(); }
+  catch (e) { jwtStatus("request failed", "bad"); return; }
+  jwtStatus("");
+  if (d.token) { $("jwt-out").value = d.token; jwtShowSub("forge"); toast("Injected " + claim + " via jwt_tool."); }
+  else toast(d.error || "jwt_tool couldn't produce a token (is it installed?).");
+}
+function jwtSwapToken(raw, token) {
+  const reJwt = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/;
+  if (reJwt.test(raw)) return raw.replace(reJwt, token);          // swap the existing JWT in place
+  const reBearer = /(Authorization:\s*Bearer\s+)\S+/i;
+  if (reBearer.test(raw)) return raw.replace(reBearer, "$1" + token);   // swap a non-JWT bearer value
+  const i = raw.indexOf("\n");                                     // otherwise inject an Authorization header
+  return i < 0 ? raw : raw.slice(0, i + 1) + "Authorization: Bearer " + token + "\r\n" + raw.slice(i + 1);
+}
+async function jwtSendToRepeater(token) {
+  token = (token || "").trim();
+  if (!token) { toast("No token to send — Decode or Forge one first."); return; }
+  let request, target = "";
+  if (jwtSource && jwtSource.request) { request = jwtSwapToken(jwtSource.request, token); target = jwtSource.target || ""; }
+  else request = "GET / HTTP/1.1\r\nHost: \r\nAuthorization: Bearer " + token + "\r\nAccept: */*\r\n\r\n";
+  try { await fetch("/repeater/new", { method: "POST", body: JSON.stringify({ project: activeProject, request: request, target: target }) }); } catch (e) {}
+  document.querySelector('nav button[data-tab="repeater"]').click();
+  toast("Sent token to a new Repeater tab.");
+}
+// Routing in: hand a token (and optionally the source request to replay it on) to the workbench.
+function sendTokenToJwt(token, srcRequest, srcTarget) {
+  jwtSource = srcRequest ? { request: srcRequest, target: srcTarget || "" } : null;
+  const btn = document.querySelector('nav button[data-tab="jwt"]'); if (btn) btn.click();
+  $("jwt-input").value = (token || "").trim();
+  jwtShowSub("decode"); renderJwtDecode();
+}
+$("jwt-decode-btn").onclick = () => { jwtShowSub("decode"); renderJwtDecode(); };
+$("jwt-input").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); jwtShowSub("decode"); renderJwtDecode(); } });
+$("jwt-analyze-btn").onclick = jwtAnalyze;
+$("jwt-torep").onclick = () => jwtSendToRepeater($("jwt-input").value);
+$("jwt-forge-btn").onclick = jwtForge;
+$("jwt-tamper-btn").onclick = jwtTamper;
+$("jwt-out-copy").onclick = () => { copyText($("jwt-out").value); toast("Copied."); };
+$("jwt-out-rep").onclick = () => jwtSendToRepeater($("jwt-out").value);
+document.querySelectorAll("#pane-jwt .jwt-subtabs button").forEach(b => b.onclick = () => jwtShowSub(b.getAttribute("data-jwt")));
+
+// ── OAST / Collaborator (Weaponization) ──────────────────────────────────────
+// Mint a canary URL, paste it into a request (Repeater / a param / an XXE entity /
+// an RCE command), and watch for the target's out-of-band callback — proof of a
+// blind vuln. The receiver (/cb/<uid> on this same server) only records hits.
+let oastBase = "", oastPollTimer = null, oastLastCount = 0, oastCanary = null;
+
+function oastCanaryBase() { return (oastBase && oastBase.trim()) ? oastBase.replace(/\/+$/, "") : location.origin; }
+
+function oastSnippets(url, vuln) {
+  const s = [["URL", url], ["curl", "curl " + url]];
+  if (vuln === "xxe") s.push(["XXE entity", '<!DOCTYPE r [<!ENTITY x SYSTEM "' + url + '">]>\n<r>&x;</r>']);
+  if (vuln === "rce") { s.push(["shell", "; curl " + url + " #"]); s.push(["subshell", "$(curl " + url + ")"]); }
+  if (vuln === "ssrf") s.push(["param", "?url=" + url]);
+  return s;
+}
+function oastRenderCanary(uid, vuln, note) {
+  const url = oastCanaryBase() + "/cb/" + uid;
+  oastCanary = { url: url, uid: uid };
+  const box = $("oast-canary"); box.hidden = false;
+  let h = '<div class="oc-sub">Canary' + (note ? " · " + esc(note) : "") + " · " + esc(vuln) + '</div>' +
+    '<div class="oc-url">' + esc(url) + '</div><div class="oc-sub">Paste into a target request:</div>';
+  for (const [label, snip] of oastSnippets(url, vuln))
+    h += '<div class="oast-snip"><code>' + esc(snip) + '</code>' +
+      '<button class="btn2 oast-copy" data-snip="' + escAttr(snip) + '">Copy</button></div>';
+  h += '<div class="oc-act"><button class="btn2" id="oast-torep">⇥ Send to Repeater</button>' +
+    '<button class="btn2" id="oast-copyurl">Copy URL</button></div>';
+  box.innerHTML = h;
+  box.querySelectorAll(".oast-copy").forEach(b => b.onclick = () => { copyText(b.getAttribute("data-snip")); toast("Copied."); });
+  $("oast-copyurl").onclick = () => { copyText(url); toast("Canary URL copied."); };
+  $("oast-torep").onclick = () => oastSendToRepeater(url);
+}
+async function oastMint() {
+  const vuln = $("oast-vuln").value, note = $("oast-note").value || "";
+  let d;
+  try { d = await (await fetch("/oast/mint", { method: "POST", body: JSON.stringify({ project: activeProject, vuln_type: vuln, note: note }) })).json(); }
+  catch (e) { $("oast-status").innerHTML = '<span class="bad">mint failed</span>'; return; }
+  if (!d.uid) { $("oast-status").innerHTML = '<span class="bad">mint failed</span>'; return; }
+  $("oast-status").innerHTML = '<span class="dim">canary minted — paste it into a request</span>';
+  oastRenderCanary(d.uid, vuln, note);
+  loadOastState();
+}
+async function oastSendToRepeater(url) {
+  // A template the operator redirects at the real target+param; the canary rides in ?url=.
+  const request = "GET /?url=" + url + " HTTP/1.1\r\nHost: \r\nUser-Agent: beatrix-oast\r\nAccept: */*\r\n\r\n";
+  try { await fetch("/repeater/new", { method: "POST", body: JSON.stringify({ project: activeProject, request: request, target: "" }) }); } catch (e) {}
+  document.querySelector('nav button[data-tab="repeater"]').click();
+  toast("Canary sent to a new Repeater tab — set the target + injection point.");
+}
+function oastRenderCallbacks(d) {
+  const box = $("oast-callbacks"), cbs = (d && d.callbacks) || [];
+  const cnt = $("oast-count"); if (cnt) cnt.textContent = (d && d.count) || 0;
+  if (!cbs.length) { box.innerHTML = '<div class="net-empty">No callbacks yet. Mint a canary, place it in a target request, and send it — a hit here proves the target reached out.</div>'; return; }
+  const rows = cbs.map(c => '<tr><td>' + esc(new Date(c.ts * 1000).toLocaleTimeString()) + '</td>' +
+    '<td class="oast-cb-m">' + esc(c.method) + '</td>' +
+    '<td>' + (c.known ? '<span>' + esc(c.vuln_type || "") + '</span>' : '<span class="oast-cb-unknown">unknown uid</span>') +
+      (c.note ? ' · ' + esc(c.note) : '') + '</td>' +
+    '<td>' + esc(c.uid) + '</td><td>' + esc(c.src_ip || "") + '</td><td>' + esc(c.path || "") + '</td></tr>').join("");
+  box.innerHTML = '<table><thead><tr><th>Time</th><th>Method</th><th>Context</th><th>uid</th><th>Source</th><th>Path</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+async function loadOastState() {
+  let d; try { d = await (await fetch("/oast/state?project=" + activeProject)).json(); } catch (e) { return; }
+  oastBase = d.base || "";
+  const bi = $("oast-base"); if (bi && document.activeElement !== bi) bi.value = oastBase;
+  const cnt = d.count || 0, badge = $("oast-count");
+  if (badge && cnt > oastLastCount) { badge.classList.add("hot"); toast("OAST: callback received!"); setTimeout(() => badge.classList.remove("hot"), 4000); }
+  oastLastCount = cnt;
+  oastRenderCallbacks(d);
+}
+function oastStartPoll() { loadOastState(); if (!oastPollTimer) oastPollTimer = setInterval(loadOastState, 3000); }
+function oastStopPoll() { if (oastPollTimer) { clearInterval(oastPollTimer); oastPollTimer = null; } }
+$("oast-mint").onclick = oastMint;
+$("oast-base-save").onclick = async () => {
+  try { await fetch("/oast/base", { method: "POST", body: JSON.stringify({ base: $("oast-base").value || "" }) }); } catch (e) {}
+  loadOastState(); toast("Collaborator base set.");
+};
+$("oast-clear").onclick = async () => {
+  try { await fetch("/oast/clear", { method: "POST", body: JSON.stringify({}) }); } catch (e) {}
+  oastLastCount = 0; loadOastState();
+};
+$("oast-note").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); oastMint(); } });
+
 function routeReqMenu(ctx) {
   ctx = ctx || {};
   const raw = ctx.raw || "", url = ctx.url || "";
@@ -10338,6 +11141,8 @@ function routeReqMenu(ctx) {
   items.push({ label: "\u21e5 Send to AutoRepeater", fn: () => sendToAutoRepeater(raw, origin) });
   items.push({ sep: true });
   if (url) items.push({ label: "\u2316 Scan URL with Nuclei", fn: () => scanUrlWithNuclei(url) });
+  const jwtTok = (String(raw) + "\n" + String(ctx.response || "")).match(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/);
+  if (jwtTok) items.push({ label: "\u21e5 Send JWT to JWT workbench", fn: () => sendTokenToJwt(jwtTok[0], raw, origin) });
   if (host) {
     items.push({ label: "\u2295 Add host to scope", fn: () => quickScopeAdd(host, false) });
     items.push({ label: "\u2298 Exclude host from scope", fn: () => quickScopeAdd(host, true) });
@@ -13238,6 +14043,1235 @@ def _exec_repeater_request(raw_request: str, target_base: str) -> Dict[str, Any]
     }
 
 
+# ── GraphQL schema discovery (predictive parameters for the Repeater) ──────────
+# Parameterised endpoints normally force a tester to GUESS which arguments the
+# server accepts. GraphQL removes the guessing: the spec defines an
+# introspection query (``__schema``) that returns the endpoint's exact type
+# system — every operation, every argument, each argument's type, whether it is
+# required (``NON_NULL``) or optional, its default value, and for enums the full
+# set of allowed values. That is the endpoint's own ruleset, verbatim. We ask
+# for it, normalise it, and from it generate a correctly-typed, ready-to-send
+# operation *stencil* the tester can drop into the editor and start poking at.
+#
+# When introspection is switched off (common in production) we do NOT pretend to
+# know the schema — we say so, and surface any "Did you mean <field>" hints the
+# server leaked in its own error messages, which is the honest next lead.
+_GQL_INTROSPECTION_QUERY = """\
+query BeatrixIntrospection {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types { ...FullType }
+  }
+}
+fragment FullType on __Type {
+  kind
+  name
+  description
+  fields(includeDeprecated: true) {
+    name
+    description
+    args { ...InputValue }
+    type { ...TypeRef }
+    isDeprecated
+    deprecationReason
+  }
+  inputFields { ...InputValue }
+  enumValues(includeDeprecated: true) { name description isDeprecated deprecationReason }
+  possibleTypes { ...TypeRef }
+}
+fragment InputValue on __InputValue {
+  name
+  description
+  type { ...TypeRef }
+  defaultValue
+}
+fragment TypeRef on __Type {
+  kind name
+  ofType { kind name
+    ofType { kind name
+      ofType { kind name
+        ofType { kind name
+          ofType { kind name
+            ofType { kind name
+              ofType { kind name } } } } } } }
+}
+"""
+
+# Headers we manage ourselves on a GraphQL send (framing + the JSON envelope);
+# everything else the tester set — Cookie, Authorization, X-Api-Key, custom
+# headers — is kept so an authenticated schema introspects/sends authenticated.
+_GQL_DROP_HEADERS = {"content-length", "content-type", "accept", "connection",
+                     "transfer-encoding"}
+# A GraphQL document can only grow so large via nested input objects / selection
+# sets; these caps keep stencil generation bounded on hostile or huge schemas.
+_GQL_MAX_DEPTH = 4
+_GQL_MAX_LEAVES = 12
+
+
+def _gql_type_str(tref: Any) -> str:
+    """Render a GraphQL type reference the way a tester writes it: ``[User!]!``.
+
+    NON_NULL → trailing ``!``; LIST → ``[...]``; otherwise the named type.
+    """
+    if not isinstance(tref, dict):
+        return "Unknown"
+    kind = tref.get("kind")
+    if kind == "NON_NULL":
+        return _gql_type_str(tref.get("ofType")) + "!"
+    if kind == "LIST":
+        return "[" + _gql_type_str(tref.get("ofType")) + "]"
+    return tref.get("name") or "Unknown"
+
+
+def _gql_named_type(tref: Any):
+    """Peel LIST/NON_NULL modifiers down to the underlying (name, kind)."""
+    while isinstance(tref, dict) and tref.get("kind") in ("NON_NULL", "LIST"):
+        tref = tref.get("ofType")
+    if isinstance(tref, dict):
+        return tref.get("name"), tref.get("kind")
+    return None, None
+
+
+def _gql_arg_model(arg: Dict[str, Any], by_name: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise one argument / input field into a compact, UI-ready record that
+    carries its full ruleset: exact type string, required flag, default, and —
+    for an enum — the complete set of values the server will accept."""
+    tref = arg.get("type") or {}
+    named, kind = _gql_named_type(tref)
+    model = {
+        "name": arg.get("name"),
+        "type": _gql_type_str(tref),
+        "required": (tref.get("kind") == "NON_NULL"),
+        "list": "[" in _gql_type_str(tref),
+        "default": arg.get("defaultValue"),
+        "named": named,
+        "kind": kind,
+        "description": arg.get("description") or "",
+    }
+    if kind == "ENUM" and named in by_name:
+        model["enum"] = [ev.get("name") for ev in (by_name[named].get("enumValues") or [])
+                         if ev.get("name")]
+    return model
+
+
+def _gql_signature(op: Dict[str, Any]) -> str:
+    """A one-line human signature: ``user(id: ID!, kind: Role): User``."""
+    if op.get("args"):
+        inner = ", ".join("%s: %s" % (a["name"], a["type"]) for a in op["args"])
+        return "%s(%s): %s" % (op["name"], inner, op.get("returns", ""))
+    return "%s: %s" % (op["name"], op.get("returns", ""))
+
+
+def _gql_normalize(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn a raw ``__schema`` payload into the model the Repeater renders and
+    builds stencils from: operations grouped by root type, plus the input-object,
+    enum, and object-field catalogs a stencil needs to expand itself."""
+    types = [t for t in (schema.get("types") or []) if isinstance(t, dict) and t.get("name")]
+    by_name = {t["name"]: t for t in types}
+    roots = {
+        "query": (schema.get("queryType") or {}).get("name"),
+        "mutation": (schema.get("mutationType") or {}).get("name"),
+        "subscription": (schema.get("subscriptionType") or {}).get("name"),
+    }
+
+    operations: Dict[str, List[Dict[str, Any]]] = {}
+    for root_kind, tname in roots.items():
+        ops: List[Dict[str, Any]] = []
+        root = by_name.get(tname) if tname else None
+        for f in (root.get("fields") if root else []) or []:
+            rnamed, rkind = _gql_named_type(f.get("type") or {})
+            op = {
+                "name": f.get("name"),
+                "description": f.get("description") or "",
+                "deprecated": bool(f.get("isDeprecated")),
+                "args": [_gql_arg_model(a, by_name) for a in (f.get("args") or [])],
+                "returns": _gql_type_str(f.get("type") or {}),
+                "returns_named": rnamed,
+                "returns_kind": rkind,
+            }
+            op["signature"] = _gql_signature(op)
+            ops.append(op)
+        operations[root_kind] = ops
+
+    inputs = {name: [_gql_arg_model(x, by_name) for x in (t.get("inputFields") or [])]
+              for name, t in by_name.items() if t.get("kind") == "INPUT_OBJECT"}
+    enums = {name: [ev.get("name") for ev in (t.get("enumValues") or []) if ev.get("name")]
+             for name, t in by_name.items() if t.get("kind") == "ENUM"}
+    objects = {}
+    for name, t in by_name.items():
+        if t.get("kind") in ("OBJECT", "INTERFACE"):
+            flds = []
+            for f in (t.get("fields") or []):
+                fn, fk = _gql_named_type(f.get("type") or {})
+                flds.append({"name": f.get("name"), "named": fn, "kind": fk,
+                             "args": len(f.get("args") or [])})
+            objects[name] = flds
+
+    return {"roots": roots, "operations": operations,
+            "inputs": inputs, "enums": enums, "objects": objects}
+
+
+def _gql_placeholder(arg: Dict[str, Any], model: Dict[str, Any], depth: int = 0):
+    """A JSON-serialisable placeholder value for one argument, shaped by its type
+    so the stencil is valid to send and obvious to edit: numbers → 0, booleans →
+    false, enums → their first legal value, input objects → a nested skeleton of
+    their required fields, lists → a one-element array of the above."""
+    named, kind = arg.get("named"), arg.get("kind")
+    wrap = (lambda v: [v]) if arg.get("list") else (lambda v: v)
+
+    if kind == "ENUM":
+        vals = model["enums"].get(named) or arg.get("enum") or []
+        return wrap(vals[0] if vals else named)
+    if kind == "INPUT_OBJECT" and depth < _GQL_MAX_DEPTH and named in model["inputs"]:
+        obj = {}
+        for f in model["inputs"][named]:
+            # Always fill required fields; at the top level fill optionals too so
+            # the tester sees the whole shape and can delete what they don't want.
+            if f.get("required") or depth == 0:
+                obj[f["name"]] = _gql_placeholder(f, model, depth + 1)
+        return wrap(obj)
+    scalar = (named or "").lower()
+    if scalar in ("int", "float") or scalar.endswith("int"):
+        return wrap(0)
+    if scalar == "boolean":
+        return wrap(False)
+    # String, ID, DateTime, and unknown custom scalars → empty string to fill in.
+    return wrap("")
+
+
+def _gql_selection(type_name: Optional[str], model: Dict[str, Any],
+                   depth: int = 0, seen: Optional[set] = None) -> str:
+    """Build a one-level selection set of an object's scalar/enum leaf fields so
+    the operation returns something concrete and stays valid. Falls back to
+    ``__typename`` for unions / unknown composite returns."""
+    if not type_name:
+        return ""
+    seen = seen or set()
+    fields = model["objects"].get(type_name)
+    if fields is None:
+        return ""                                   # scalar/enum return → no selection
+    leaves = [f["name"] for f in fields
+              if f.get("args", 0) == 0 and f.get("kind") in ("SCALAR", "ENUM")]
+    if leaves:
+        return "{ " + " ".join(leaves[:_GQL_MAX_LEAVES]) + " }"
+    if depth < 1:                                    # no scalar leaves → descend once
+        for f in fields:
+            if f.get("kind") in ("OBJECT", "INTERFACE") and f.get("named") \
+                    and f["named"] in model["objects"] and f["named"] not in seen:
+                sub = _gql_selection(f["named"], model, depth + 1, seen | {f["named"]})
+                if sub:
+                    return "{ %s %s }" % (f["name"], sub)
+    return "{ __typename }"
+
+
+def _gql_stencil(op: Dict[str, Any], root_kind: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a ready-to-edit operation from one normalised op: a typed GraphQL
+    document (arguments declared as ``$vars`` with their exact types) plus a
+    matching ``variables`` skeleton. Returns {gql, variables, body} where body is
+    the pretty JSON the Repeater drops into the request editor."""
+    op_kw = {"query": "query", "mutation": "mutation",
+             "subscription": "subscription"}.get(root_kind, "query")
+    name = op.get("name") or "op"
+    op_name = "Beatrix" + name[:1].upper() + name[1:]
+    decls, call_args, variables = [], [], {}
+    for a in (op.get("args") or []):
+        vn = a["name"]
+        decls.append("$%s: %s" % (vn, a["type"]))
+        call_args.append("%s: $%s" % (vn, vn))
+        variables[vn] = _gql_placeholder(a, model)
+
+    composite = op.get("returns_kind") in ("OBJECT", "INTERFACE", "UNION")
+    sel = (_gql_selection(op.get("returns_named"), model) or "{ __typename }") if composite else ""
+
+    head = op_kw + " " + op_name + (("(" + ", ".join(decls) + ")") if decls else "")
+    inner = name + (("(" + ", ".join(call_args) + ")") if call_args else "")
+    if sel:
+        inner += " " + sel
+    gql = head + " {\n  " + inner + "\n}"
+    body = json.dumps({"query": gql, "variables": variables}, indent=2)
+    return {"gql": gql, "variables": variables, "body": body}
+
+
+def _gql_find_hints(payload: Any) -> List[str]:
+    """Harvest "Did you mean <field>" field names from a GraphQL error payload —
+    the leak that makes schema recovery possible even when introspection is off.
+    """
+    hints: List[str] = []
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    for err in (errors or []):
+        msg = (err or {}).get("message", "") if isinstance(err, dict) else str(err)
+        for m in re.findall(r'[Dd]id you mean ([^?.]+)', msg or ""):
+            for name in re.findall(r'"([^"]+)"|\b([A-Za-z_][A-Za-z0-9_]*)\b', m):
+                val = name[0] or name[1]
+                if val and val.lower() not in ("or", "to", "use", "an", "inline", "fragment") \
+                        and val not in hints:
+                    hints.append(val)
+    return hints[:40]
+
+
+def _graphql_discover(raw_request: str, target_base: str) -> Dict[str, Any]:
+    """Introspect the GraphQL endpoint the Repeater is pointed at and return a
+    normalised schema + per-operation stencils — the predictive-parameters core.
+
+    The endpoint, scheme/host/port/path, and auth headers all come from the
+    tester's current request, so pointing the Repeater at an authenticated
+    ``/graphql`` and clicking Schema introspects it *as that session*.
+    """
+    method, rtarget, _version, headers, _body = _parse_raw_request(raw_request or "")
+    resolved = _resolve_target(rtarget or "/", target_base or "", headers)
+    if resolved is None:
+        return {"ok": False, "introspection": False,
+                "error": "No target: point the Repeater at a GraphQL endpoint "
+                "(set a target URL, or include a Host header), then try Schema again."}
+    scheme, host, port, path = resolved
+    netloc = host if port in (80, 443) else "%s:%d" % (host, port)
+    endpoint = "%s://%s%s" % (scheme, netloc, path)
+
+    base_headers = [[k, v] for (k, v) in headers if k.lower() not in _GQL_DROP_HEADERS
+                    and k.lower() != "host"]
+
+    intro_body = json.dumps({"query": _GQL_INTROSPECTION_QUERY,
+                             "operationName": "BeatrixIntrospection"})
+    lines = ["POST %s HTTP/1.1" % (path or "/"), "Host: " + netloc]
+    lines += ["%s: %s" % (k, v) for (k, v) in base_headers]
+    lines += ["Content-Type: application/json", "Accept: application/json"]
+    intro_raw = "\r\n".join(lines) + "\r\n\r\n" + intro_body
+
+    # Pass the resolved endpoint as the target so the scheme (http vs https) is
+    # preserved — re-deriving it from the Host header alone would default to TLS.
+    resp = _exec_repeater_request(intro_raw, endpoint)
+    out = {"ok": False, "introspection": False, "endpoint": endpoint,
+           "headers": base_headers, "status": resp.get("status"),
+           "exchange": resp.get("raw", ""), "error": None}
+
+    if resp.get("error"):
+        out["error"] = "Could not reach the endpoint: %s" % resp["error"]
+        return out
+    try:
+        payload = json.loads(resp.get("body") or "")
+    except (ValueError, TypeError):
+        out["error"] = ("The endpoint did not return JSON, so it is not answering "
+                        "GraphQL here (HTTP %s). Point the Repeater at the GraphQL "
+                        "path — often /graphql or /api/graphql — and try again."
+                        % resp.get("status"))
+        return out
+
+    if isinstance(payload, list):                     # some servers batch-wrap
+        payload = payload[0] if payload else {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    schema = (data or {}).get("__schema") if isinstance(data, dict) else None
+
+    if not schema:
+        hints = _gql_find_hints(payload)
+        out["hints"] = hints
+        errs = payload.get("errors") if isinstance(payload, dict) else None
+        first = ""
+        if errs:
+            first = (errs[0] or {}).get("message", "") if isinstance(errs[0], dict) else str(errs[0])
+        looks_gql = bool(errs) or (isinstance(data, dict))
+        disabled = any(mk in first.lower() for mk in
+                       ("introspection is not allowed", "introspection is disabled",
+                        "introspection has been disabled", "to prevent", "__schema",
+                        "not available on"))
+        if looks_gql:
+            out["introspection"] = False
+            lead = "introspection is disabled" if disabled else "introspection returned no schema"
+            said = (" — the server said: " + first.rstrip(".")) if first else ""
+            out["error"] = ("This looks like GraphQL, but " + lead + said + ". "
+                            + ("Field names leaked in the error (shown below) are a lead for recovery."
+                               if hints else
+                               "No field names leaked; try known operations by hand."))
+        else:
+            out["error"] = ("No GraphQL schema in the response (HTTP %s). Is this a "
+                            "GraphQL endpoint? Point the Repeater at its path and retry."
+                            % resp.get("status"))
+        return out
+
+    model = _gql_normalize(schema)
+    counts = {k: len(v) for k, v in model["operations"].items()}
+    counts["types"] = len(schema.get("types") or [])
+
+    ops_out: Dict[str, List[Dict[str, Any]]] = {}
+    for root_kind, ops in model["operations"].items():
+        lst = []
+        for op in ops:
+            stencil = _gql_stencil(op, root_kind, model)
+            lst.append({
+                "name": op["name"],
+                "description": op["description"],
+                "deprecated": op["deprecated"],
+                "returns": op["returns"],
+                "signature": op["signature"],
+                "args": op["args"],
+                "body": stencil["body"],
+            })
+        ops_out[root_kind] = lst
+
+    out.pop("exchange", None)           # the full schema response is large + unused on success
+    out.update({"ok": True, "introspection": True, "roots": model["roots"],
+                "counts": counts, "operations": ops_out})
+    return out
+
+
+# ── Predictive parameters for ALL parameterized queries ───────────────────────
+# GraphQL introspection (above) hands back an exact ruleset because GraphQL
+# *declares* its schema. Most endpoints don't — so "what parameters does this
+# endpoint accept?" is answered from the best source available, in this order:
+#
+#   Tier 1  declared schemas (exact):  GraphQL introspection · OpenAPI/Swagger ·
+#                                       HTML <form> declarations
+#   Tier 2  observed (empirical):      params seen in captured traffic + this
+#                                       very request (no new requests sent)
+#   Tier 3  active verify (opt-in):    Arjun / ParamMiner confirm which candidate
+#                                       params the server actually accepts;
+#                                       Clairvoyance recovers a GraphQL schema when
+#                                       introspection is off  (see _param_active_verify)
+#
+# Every source emits the same Param record + a ready-to-send *stencil* (a full raw
+# HTTP request with the parameters written into the right place — query string,
+# JSON body, form body, or GraphQL document), so the UI and the editor stay
+# source-agnostic.
+from html.parser import HTMLParser as _HTMLParser
+
+_PARAM_SRC_RANK = {"introspection": 5, "openapi": 4, "form": 3, "observed": 2, "probed": 1}
+_PARAM_CONF_RANK = {"exact": 4, "high": 3, "medium": 2, "low": 1}
+_PARAM_WIRE_DROP = {"content-length", "connection", "transfer-encoding"}
+_OPENAPI_WELL_KNOWN = ("/openapi.json", "/swagger.json", "/v3/api-docs",
+                       "/swagger/v1/swagger.json", "/api-docs")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _prec(name, loc, ptype="string", required=None, enum=None, default=None,
+          fmt=None, example=None, json_path=None, source="observed",
+          confidence="medium", description=""):
+    """One normalized parameter record — the shared shape every source emits."""
+    return {"name": name, "in": loc, "type": ptype, "required": required,
+            "enum": enum, "default": default, "format": fmt, "example": example,
+            "json_path": json_path, "source": source, "confidence": confidence,
+            "description": description}
+
+
+def _param_ctx(raw_request: str, target_base: str):
+    """Resolve the current request into the pieces every source/stencil needs."""
+    method, rtarget, _v, headers, body = _parse_raw_request(raw_request or "")
+    resolved = _resolve_target(rtarget or "/", target_base or "", headers)
+    if resolved is None:
+        return None
+    scheme, host, port, path = resolved
+    netloc = host if port in (80, 443) else "%s:%d" % (host, port)
+    ct = next((v.lower() for (k, v) in headers if k.lower() == "content-type"), "")
+    base_headers = [[k, v] for (k, v) in headers if k.lower() not in _PARAM_WIRE_DROP]
+    return {"method": (method or "GET").upper(), "scheme": scheme, "host": host,
+            "port": port, "path": path, "netloc": netloc,
+            "endpoint": "%s://%s%s" % (scheme, netloc, path),
+            "headers": headers, "base_headers": base_headers,
+            "body": body or "", "content_type": ct}
+
+
+def _param_shape(ctx, response_body=""):
+    """Where this endpoint's parameters live, for the empirical/active stencils."""
+    ct, body, path = ctx["content_type"], ctx["body"].strip(), ctx["path"].lower()
+    if "graphql" in ct or "graphql" in path or path.endswith("/gql"):
+        return "graphql"
+    if body.startswith("{") and '"query"' in body:
+        try:
+            j = json.loads(body)
+            if isinstance(j, dict) and isinstance(j.get("query"), str):
+                return "graphql"
+        except (ValueError, TypeError):
+            pass
+    if "json" in ct or (body[:1] in ("{", "[")):
+        return "json"
+    if "x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        return "form"
+    return "query"
+
+
+def _param_placeholder(p):
+    """A fill-in value shaped by the param's type (obvious to a tester to edit)."""
+    if p.get("enum"):
+        return p["enum"][0]
+    if p.get("default") is not None:
+        return p["default"]
+    if p.get("example") not in (None, ""):
+        return p["example"]
+    t = (p.get("type") or "").lower()
+    if t in ("integer", "int", "long", "number", "float", "double"):
+        return 0
+    if t in ("boolean", "bool"):
+        return False
+    return ""
+
+
+def _build_raw(method, netloc, path, base_headers, body="", content_type=None,
+               accept=None):
+    """Assemble a full raw HTTP request. Content-Length is omitted on purpose so
+    the send engine computes it (and recomputes as the tester edits the body)."""
+    lines = ["%s %s HTTP/1.1" % (method.upper(), path or "/")]
+    drop = set(_PARAM_WIRE_DROP)
+    if not any(k.lower() == "host" and str(v).strip() for k, v in base_headers):
+        lines.append("Host: " + netloc)
+    if content_type is not None:
+        drop |= {"content-type", "accept"}
+    for k, v in base_headers:
+        if k.lower() in drop:
+            continue
+        lines.append("%s: %s" % (k, v))
+    if content_type is not None:
+        lines.append("Content-Type: " + content_type)
+        lines.append("Accept: " + (accept or "*/*"))
+    return "\r\n".join(lines) + "\r\n\r\n" + (body or "")
+
+
+def _build_json_request(endpoint, headers, body):
+    """A POST application/json request to endpoint carrying body (used for the
+    GraphQL stencils). Mirrors _build_raw but always JSON."""
+    u = urlparse(endpoint)
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    return _build_raw("POST", u.netloc, path,
+                      [[k, v] for (k, v) in (headers or [])],
+                      body, content_type="application/json",
+                      accept="application/json")
+
+
+# ── Param typing / JSON flattening (for observed + body stencils) ─────────────
+def _infer_type(values):
+    sv = [str(v) for v in values if v is not None and str(v) != ""]
+    if not sv:
+        return ("string", None)
+    if all(re.fullmatch(r"-?\d+", s) for s in sv):
+        return ("integer", None)
+    if all(re.fullmatch(r"-?\d+\.\d+", s) for s in sv):
+        return ("number", None)
+    if all(s.lower() in ("true", "false") for s in sv):
+        return ("boolean", None)
+    if all(_UUID_RE.match(s) for s in sv):
+        return ("string", "uuid")
+    if all(_EMAIL_RE.match(s) for s in sv):
+        return ("string", "email")
+    return ("string", None)
+
+
+def _flatten_json(obj, prefix=""):
+    """Leaf values of a JSON value keyed by dot-path (arrays → first element)."""
+    out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.update(_flatten_json(v, prefix + ("." if prefix else "") + str(k)))
+    elif isinstance(obj, list):
+        if obj:
+            out.update(_flatten_json(obj[0], prefix))
+    else:
+        out[prefix] = obj
+    return out
+
+
+def _request_params(ctx):
+    """Parameters carried by THIS request: query keys + JSON/form body leaves."""
+    found = {}  # (loc, name) -> {values:[...], json_path}
+    q = urlparse("//x" + ctx["path"]).query
+    for k, v in parse_qsl(q, keep_blank_values=True):
+        found.setdefault(("query", k), {"values": [], "json_path": None})["values"].append(v)
+    body = ctx["body"]
+    if body.strip():
+        ct = ctx["content_type"]
+        if "json" in ct or body.strip()[:1] in "{[":
+            try:
+                for path, val in _flatten_json(json.loads(body)).items():
+                    found.setdefault(("body-json", path),
+                                     {"values": [], "json_path": path})["values"].append(val)
+            except (ValueError, TypeError):
+                pass
+        elif "x-www-form-urlencoded" in ct or ("=" in body and "\n" not in body.strip()):
+            for k, v in parse_qsl(body, keep_blank_values=True):
+                found.setdefault(("body-form", k), {"values": [], "json_path": None})["values"].append(v)
+    return found
+
+
+# ── HTML <form> source (Tier 1, declared) ────────────────────────────────────
+class _FormCollector(_HTMLParser):
+    """Collect <form> declarations and their fields from an HTML response."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self._cur = None
+        self._select = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._cur = {"method": (a.get("method") or "GET").upper(),
+                         "action": a.get("action", ""),
+                         "enctype": a.get("enctype", "application/x-www-form-urlencoded"),
+                         "fields": []}
+        elif tag == "input" and self._cur is not None:
+            name = a.get("name")
+            if name:
+                self._cur["fields"].append({
+                    "name": name, "type": (a.get("type") or "text").lower(),
+                    "required": "required" in a, "default": a.get("value"),
+                    "enum": None, "pattern": a.get("pattern"),
+                    "min": a.get("min"), "max": a.get("max"),
+                    "maxlength": a.get("maxlength")})
+        elif tag == "textarea" and self._cur is not None and a.get("name"):
+            self._cur["fields"].append({"name": a["name"], "type": "textarea",
+                                        "required": "required" in a, "default": None,
+                                        "enum": None})
+        elif tag == "select" and self._cur is not None and a.get("name"):
+            self._select = {"name": a["name"], "type": "select",
+                            "required": "required" in a, "default": None,
+                            "enum": [], "options": []}
+        elif tag == "option" and self._select is not None:
+            self._select["options"].append(a.get("value"))
+
+    def handle_endtag(self, tag):
+        if tag == "select" and self._cur is not None and self._select is not None:
+            opts = [o for o in self._select["options"] if o is not None]
+            self._select["enum"] = opts or None
+            self._select.pop("options", None)
+            self._cur["fields"].append(self._select)
+            self._select = None
+        elif tag == "form" and self._cur is not None:
+            self.forms.append(self._cur)
+            self._cur = None
+
+
+def _html_forms(html):
+    """Parse every <form> in an HTML document into {method, action, enctype,
+    fields:[...]}. Pure + testable."""
+    if not html or "<form" not in html.lower():
+        return []
+    p = _FormCollector()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:  # noqa: BLE001 — malformed HTML shouldn't kill discovery
+        pass
+    return [f for f in p.forms if f["fields"]]
+
+
+def _form_field_param(f):
+    hidden = f.get("type") == "hidden"
+    meta = []
+    for key in ("pattern", "min", "max", "maxlength"):
+        if f.get(key):
+            meta.append("%s=%s" % (key, f[key]))
+    ptype = "boolean" if f.get("type") in ("checkbox", "radio") else \
+            "integer" if f.get("type") == "number" else "string"
+    return _prec(f["name"], "body-form", ptype=ptype,
+                 required=bool(f.get("required")) or hidden,
+                 enum=f.get("enum"), default=f.get("default"),
+                 fmt=(f.get("type") if f.get("type") in ("email", "url", "date", "number") else None),
+                 source="form", confidence="exact",
+                 description=("hidden field" if hidden else "") +
+                             (("  " + ", ".join(meta)) if meta else ""))
+
+
+def _src_forms(ctx, response_body):
+    status = {"kind": "form", "ok": False, "note": "", "count": 0}
+    forms = _html_forms(response_body or "")
+    if not forms:
+        if response_body:
+            status["note"] = "no <form> in the response"
+        else:
+            status["note"] = "send the request first so forms can be read from the response"
+        return status, []
+    stencils = []
+    for i, f in enumerate(forms):
+        params = [_form_field_param(x) for x in f["fields"]]
+        get = f["method"] == "GET"
+        action = f["action"] or ctx["path"]
+        apath = action if action.startswith("/") or "://" in action else \
+            ctx["path"].rsplit("/", 1)[0] + "/" + action
+        if "://" in apath:
+            apath = urlparse(apath).path or "/"
+        if get:
+            qs = "&".join("%s=%s" % (p["name"], _qph(p)) for p in params)
+            req = _build_raw("GET", ctx["netloc"], apath + ("?" + qs if qs else ""),
+                             ctx["base_headers"], "", content_type=None)
+        else:
+            multipart = "multipart" in (f.get("enctype") or "")
+            body = "&".join("%s=%s" % (p["name"], _qph(p)) for p in params)
+            req = _build_raw("POST", ctx["netloc"], apath, ctx["base_headers"], body,
+                             content_type=("multipart/form-data" if multipart
+                                           else "application/x-www-form-urlencoded"))
+        stencils.append({"label": "form %s %s" % (f["method"], action or ctx["path"]),
+                         "source": "form", "confidence": "exact",
+                         "location": "body-form" if not get else "query",
+                         "params": params, "request": req,
+                         "note": "%d field(s)" % len(params)})
+    status.update(ok=True, count=len(stencils), note="%d form(s)" % len(forms))
+    return status, stencils
+
+
+def _qph(p):
+    v = _param_placeholder(p)
+    return quote(str(v), safe="") if v not in (None, "") else ""
+
+
+# ── OpenAPI / Swagger source (Tier 1, declared) ───────────────────────────────
+def _openapi_resolve(spec, node, _depth=0):
+    """Follow a local $ref ("#/components/schemas/X" or "#/definitions/X")."""
+    if isinstance(node, dict) and "$ref" in node and _depth < 8:
+        ref = node["$ref"]
+        if isinstance(ref, str) and ref.startswith("#/"):
+            cur = spec
+            for part in ref[2:].split("/"):
+                if not isinstance(cur, dict):
+                    return {}
+                cur = cur.get(part, {})
+            return _openapi_resolve(spec, cur, _depth + 1)
+    return node or {}
+
+
+def _openapi_schema_facts(spec, schema):
+    s = _openapi_resolve(spec, schema or {})
+    t = s.get("type") or ("object" if s.get("properties") else "string")
+    return (t, s.get("format"), s.get("enum"), s.get("default"))
+
+
+def _openapi_body_params(spec, schema, prefix="", depth=0, out=None):
+    """Flatten a JSON-Schema request body into Param records (dot-path names)."""
+    out = out if out is not None else []
+    s = _openapi_resolve(spec, schema or {})
+    if depth > 6:
+        return out
+    if s.get("type") == "array" or "items" in s:
+        return _openapi_body_params(spec, s.get("items") or {}, prefix, depth + 1, out)
+    props = s.get("properties")
+    if isinstance(props, dict):
+        req = set(s.get("required") or [])
+        for name, sub in props.items():
+            path = prefix + ("." if prefix else "") + name
+            rs = _openapi_resolve(spec, sub)
+            if rs.get("properties") or rs.get("type") == "object":
+                _openapi_body_params(spec, rs, path, depth + 1, out)
+            else:
+                t, fmt, enum, default = _openapi_schema_facts(spec, rs)
+                out.append(_prec(name, "body-json", ptype=t, required=name in req,
+                                 enum=enum, default=default, fmt=fmt, json_path=path,
+                                 source="openapi", confidence="exact",
+                                 description=rs.get("description", "")))
+    return out
+
+
+def _openapi_match_path(spec, req_path):
+    """Find the spec path (possibly templated /users/{id}) matching req_path,
+    accounting for a server/basePath prefix. Returns (spec_path, prefix) or None."""
+    paths = spec.get("paths") or {}
+    prefixes = {""}
+    for srv in (spec.get("servers") or []):
+        try:
+            pp = urlparse(srv.get("url", "")).path.rstrip("/")
+            if pp:
+                prefixes.add(pp)
+        except Exception:  # noqa: BLE001
+            pass
+    if spec.get("basePath"):
+        prefixes.add(str(spec["basePath"]).rstrip("/"))
+    for pfx in prefixes:
+        rel = req_path[len(pfx):] if pfx and req_path.startswith(pfx) else req_path
+        for spath in paths:
+            if spath == rel:
+                return spath, pfx
+            rx = "^" + re.sub(r"\{[^/}]+\}", r"[^/]+", re.escape(spath).replace(r"\{", "{").replace(r"\}", "}")) + "$"
+            try:
+                if re.match(rx, rel):
+                    return spath, pfx
+            except re.error:
+                pass
+    return None
+
+
+def _openapi_path_vars(spath, pfx, req_path):
+    """Recover the concrete {var} values the tester's own path already supplies,
+    so the stencil lands on the resource they were looking at (/users/123, not 0)."""
+    rel = (req_path[len(pfx):] if pfx and req_path.startswith(pfx) else req_path).split("?", 1)[0]
+    names = re.findall(r"\{([^/}]+)\}", spath)
+    if not names:
+        return {}
+    rx = "^" + re.sub(r"\{[^/}]+\}", r"([^/]+)",
+                      re.escape(spath).replace(r"\{", "{").replace(r"\}", "}")) + "$"
+    try:
+        mm = re.match(rx, rel)
+    except re.error:
+        return {}
+    return dict(zip(names, mm.groups())) if mm else {}
+
+
+def _openapi_stencils(spec, ctx):
+    """Build one stencil per operation (method) on the matched spec path."""
+    m = _openapi_match_path(spec, ctx["path"])
+    if not m:
+        return []
+    spath, pfx = m
+    real_vars = _openapi_path_vars(spath, pfx, ctx["path"])
+    item = (spec.get("paths") or {}).get(spath) or {}
+    shared = item.get("parameters") or []
+    stencils = []
+    for method, op in item.items():
+        if method.lower() not in ("get", "post", "put", "patch", "delete", "head", "options"):
+            continue
+        if not isinstance(op, dict):
+            continue
+        params, path_vals, query_parts = [], {}, []
+        for pr in (shared + (op.get("parameters") or [])):
+            pr = _openapi_resolve(spec, pr)
+            loc = pr.get("in", "query")
+            t, fmt, enum, default = _openapi_schema_facts(
+                spec, pr.get("schema") or {"type": pr.get("type", "string"),
+                                           "enum": pr.get("enum"), "format": pr.get("format")})
+            rec = _prec(pr.get("name", ""), {"query": "query", "path": "path",
+                        "header": "header", "cookie": "cookie"}.get(loc, "query"),
+                        ptype=t, required=bool(pr.get("required")), enum=enum,
+                        default=default, fmt=fmt, source="openapi", confidence="exact",
+                        description=pr.get("description", ""))
+            params.append(rec)
+            ph = _param_placeholder(rec)
+            if loc == "path":
+                nm = pr.get("name", "")
+                path_vals[nm] = quote(str(real_vars.get(nm) or ph), safe="") or "1"
+            elif loc == "query":
+                query_parts.append("%s=%s" % (pr.get("name"), quote(str(ph), safe="")))
+        body = ""
+        ct = None
+        rb = _openapi_resolve(spec, op.get("requestBody") or {})
+        content = rb.get("content") or {}
+        if "application/json" in content:
+            bparams = _openapi_body_params(spec, content["application/json"].get("schema") or {})
+            params.extend(bparams)
+            body = _assemble_json(bparams)
+            ct = "application/json"
+        wire_path = spath
+        for name, val in path_vals.items():
+            wire_path = wire_path.replace("{%s}" % name, val)
+        wire_path = pfx + wire_path
+        if query_parts:
+            wire_path += "?" + "&".join(query_parts)
+        req = _build_raw(method, ctx["netloc"], wire_path, ctx["base_headers"], body, content_type=ct)
+        stencils.append({"label": "%s %s" % (method.upper(), spath),
+                         "source": "openapi", "confidence": "exact",
+                         "location": "openapi", "params": params, "request": req,
+                         "note": (op.get("summary") or op.get("operationId") or "")})
+    return stencils
+
+
+def _src_openapi(ctx, history, fetch):
+    """Find an OpenAPI/Swagger spec (already-captured first, then a bounded probe
+    of well-known paths) and build stencils for the current path."""
+    status = {"kind": "openapi", "ok": False, "note": "", "count": 0}
+    spec, where = None, ""
+    # 1) a spec already in captured traffic
+    for tx in (history or []):
+        b = tx.get("resp_body") or ""
+        if ('"swagger"' in b or '"openapi"' in b) and '"paths"' in b:
+            try:
+                spec, where = json.loads(b), tx.get("url", "captured")
+                break
+            except (ValueError, TypeError):
+                pass
+    # 2) bounded probe of well-known locations (stop at first that parses)
+    if spec is None and fetch is not None:
+        for p in _OPENAPI_WELL_KNOWN:
+            doc = fetch(p)
+            if not doc:
+                continue
+            try:
+                cand = json.loads(doc)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(cand, dict) and cand.get("paths") and \
+                    (cand.get("openapi") or cand.get("swagger")):
+                spec, where = cand, p
+                break
+    if spec is None:
+        status["note"] = "no OpenAPI/Swagger spec found"
+        return status, []
+    stencils = _openapi_stencils(spec, ctx)
+    if not stencils:
+        status.update(note="spec found (%s) but no operation matches %s" % (where, ctx["path"]))
+        return status, []
+    status.update(ok=True, count=len(stencils), note="from %s" % where)
+    return status, stencils
+
+
+def _assemble_json(params):
+    """Nest dot-path params back into a JSON object skeleton (pretty)."""
+    root = {}
+    for p in params:
+        path = p.get("json_path") or p["name"]
+        cur, parts = root, str(path).split(".")
+        for seg in parts[:-1]:
+            cur = cur.setdefault(seg, {})
+        if isinstance(cur, dict):
+            cur[parts[-1]] = _param_placeholder(p)
+    return json.dumps(root, indent=2)
+
+
+# ── GraphQL source adapter (Tier 1) ───────────────────────────────────────────
+def _param_from_gql_arg(a):
+    return _prec(a.get("name", ""), "graphql-arg", ptype=(a.get("named") or a.get("type") or "string"),
+                 required=bool(a.get("required")), enum=a.get("enum"),
+                 default=a.get("default"), source="introspection", confidence="exact",
+                 description=a.get("description", ""))
+
+
+def _src_graphql(raw_request, target_base):
+    d = _graphql_discover(raw_request, target_base)
+    status = {"kind": "graphql", "ok": bool(d.get("ok")), "note": "", "count": 0}
+    hints = d.get("hints") or []
+    if not d.get("ok"):
+        status["note"] = d.get("error") or "introspection unavailable"
+        return status, [], hints
+    headers, stencils = d.get("headers") or [], []
+    for root_kind, ops in (d.get("operations") or {}).items():
+        for op in ops:
+            stencils.append({
+                "label": "%s: %s" % (root_kind, op["name"]),
+                "source": "introspection", "confidence": "exact", "location": "graphql-arg",
+                "params": [_param_from_gql_arg(a) for a in (op.get("args") or [])],
+                "request": _build_json_request(d["endpoint"], headers, op["body"]),
+                "note": op.get("signature", "")})
+    status.update(ok=True, count=len(stencils), note="introspection ok")
+    return status, stencils, hints
+
+
+# ── Observed source (Tier 2, empirical) ───────────────────────────────────────
+def _norm_path(u):
+    try:
+        return urlparse(u).path or "/"
+    except Exception:  # noqa: BLE001
+        return u or "/"
+
+
+def _src_observed(ctx, history):
+    """Union of params seen on this endpoint across captured traffic + this very
+    request. Type is inferred from observed values; frequency → confidence and a
+    likely-required guess. Sends no new requests."""
+    status = {"kind": "observed", "ok": False, "note": "", "count": 0}
+    samples = []  # each: dict (loc,name) -> {values, json_path}
+    samples.append(_request_params(ctx))
+    want = _norm_path(ctx["path"])
+    for tx in (history or []):
+        if _norm_path(tx.get("url") or tx.get("path") or "") != want:
+            continue
+        c = _param_ctx(_tx_to_raw(tx), tx.get("url", ""))
+        if c:
+            samples.append(_request_params(c))
+    total = len(samples)
+    agg = {}
+    for s in samples:
+        for key, info in s.items():
+            a = agg.setdefault(key, {"values": [], "count": 0, "json_path": info["json_path"]})
+            a["values"].extend(info["values"])
+            a["count"] += 1
+    params = []
+    for (loc, name), a in sorted(agg.items()):
+        t, fmt = _infer_type(a["values"])
+        ex = next((v for v in a["values"] if v not in (None, "")), "")
+        conf = "high" if a["count"] == total and total >= 3 else \
+               "medium" if a["count"] >= 2 else "low"
+        params.append(_prec(name, loc, ptype=t, required=(a["count"] == total and total >= 2),
+                            default=None, fmt=fmt, example=ex, json_path=a["json_path"],
+                            source="observed", confidence=conf,
+                            description="seen in %d/%d request(s)" % (a["count"], total)))
+    if not params:
+        status["note"] = "no parameters seen on this endpoint yet"
+        return status, []
+    stencils = [_paramset_stencil(ctx, params, "observed",
+                "observed", "%d param(s) from %d request(s)" % (len(params), total))]
+    status.update(ok=True, count=len(params), note="%d param(s), %d sample(s)" % (len(params), total))
+    return status, stencils
+
+
+def _tx_to_raw(tx):
+    """Reconstruct a raw request string from a stored history tx (headers dict)."""
+    try:
+        u = urlparse(tx.get("url", ""))
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    except Exception:  # noqa: BLE001
+        path = tx.get("path", "/")
+    lines = ["%s %s HTTP/1.1" % (tx.get("method", "GET"), path)]
+    for k, v in (tx.get("req_headers") or {}).items():
+        if not str(k).startswith(":"):
+            lines.append("%s: %s" % (k, v))
+    return "\r\n".join(lines) + "\r\n\r\n" + (tx.get("req_body") or "")
+
+
+def _paramset_stencil(ctx, params, source, location, note):
+    """Build one stencil that writes a set of params into the current request's
+    natural location (query string, JSON body, or form body)."""
+    shape = _param_shape(ctx)
+    base_path = ctx["path"].split("?", 1)[0]
+    if shape == "json" or any(p["in"] == "body-json" for p in params):
+        body = _assemble_json([p for p in params if p["in"] in ("body-json",)] or params)
+        req = _build_raw(ctx["method"] if ctx["method"] != "GET" else "POST",
+                         ctx["netloc"], base_path, ctx["base_headers"], body,
+                         content_type="application/json")
+    elif shape == "form" or any(p["in"] == "body-form" for p in params):
+        body = "&".join("%s=%s" % (p["name"], _qph(p)) for p in params if p["in"] != "query")
+        req = _build_raw(ctx["method"] if ctx["method"] != "GET" else "POST",
+                         ctx["netloc"], base_path, ctx["base_headers"], body,
+                         content_type="application/x-www-form-urlencoded")
+    else:
+        qs = "&".join("%s=%s" % (p["name"], _qph(p)) for p in params if p["in"] in ("query",) or p["in"] == "query")
+        if not qs:
+            qs = "&".join("%s=%s" % (p["name"], _qph(p)) for p in params)
+        req = _build_raw(ctx["method"], ctx["netloc"], base_path + ("?" + qs if qs else ""),
+                         ctx["base_headers"], "", content_type=None)
+    return {"label": location + " params", "source": source, "confidence": "medium",
+            "location": location, "params": params, "request": req, "note": note}
+
+
+def _merge_flat_params(stencils):
+    """A deduped flat union across sources — highest-authority source + confidence
+    wins for a given (in, name)."""
+    best = {}
+    for st in stencils:
+        for p in st["params"]:
+            key = (p["in"], p["name"])
+            cur = best.get(key)
+            if cur is None or (_PARAM_SRC_RANK.get(p["source"], 0),
+                               _PARAM_CONF_RANK.get(p["confidence"], 0)) > \
+                              (_PARAM_SRC_RANK.get(cur["source"], 0),
+                               _PARAM_CONF_RANK.get(cur["confidence"], 0)):
+                best[key] = p
+    return list(best.values())
+
+
+def _param_discover(raw_request, target_base, history=None, response_body="", fetch=None):
+    """Passive parameter discovery across every declared/observed source. Sends at
+    most one introspection request + a bounded OpenAPI probe; never brute-forces
+    (that is the explicit _param_active_verify)."""
+    ctx = _param_ctx(raw_request or "", target_base or "")
+    if ctx is None:
+        return {"ok": False, "error": "No target: set a target URL or include a Host "
+                "header, then try again.", "sources": [], "stencils": []}
+    shape = _param_shape(ctx, response_body)
+    sources, stencils, hints = [], [], []
+
+    if shape == "graphql":
+        st, sten, hints = _src_graphql(raw_request, target_base)
+        sources.append(st)
+        stencils += sten
+    else:
+        st, sten = _src_openapi(ctx, history, fetch)
+        sources.append(st)
+        stencils += sten
+
+    st, sten = _src_forms(ctx, response_body)
+    sources.append(st)
+    stencils += sten
+
+    st, sten = _src_observed(ctx, history)
+    sources.append(st)
+    stencils += sten
+
+    ok = any(s["ok"] for s in sources)
+    return {"ok": ok, "endpoint": ctx["endpoint"], "request_shape": shape,
+            "sources": sources, "stencils": stencils, "hints": hints,
+            "params": _merge_flat_params(stencils),
+            "error": None if ok else "No parameters discovered from any source. "
+            "Try Verify params (active) to probe which the server accepts."}
+
+
+def _run_async(coro):
+    """Run one coroutine to completion from a synchronous handler thread."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        _shutdown_loop(loop)
+
+
+def _param_active_verify(raw_request, target_base, budget=0, response_body=""):
+    """Tier 3: actively confirm which parameters the server accepts. For GraphQL
+    with introspection off → Clairvoyance schema recovery; otherwise → Arjun
+    (fallback: the in-house ParamMiner). Scope is enforced by the caller."""
+    ctx = _param_ctx(raw_request or "", target_base or "")
+    if ctx is None:
+        return {"ok": False, "error": "No target to probe.", "stencils": []}
+    shape = _param_shape(ctx, response_body)
+    endpoint = ctx["endpoint"]
+
+    if shape == "graphql":
+        return _verify_graphql(endpoint, ctx)
+    return _verify_rest(endpoint, ctx, budget)
+
+
+def _hdr_dict(ctx):
+    out = {}
+    for k, v in ctx["base_headers"]:
+        if k.lower() in ("host", "content-type", "accept", "content-length"):
+            continue
+        out[k] = v
+    return out
+
+
+def _verify_rest(endpoint, ctx, budget):
+    try:
+        from beatrix.core.external_tools import ArjunRunner
+        arjun = ArjunRunner()
+    except Exception:  # noqa: BLE001
+        arjun = None
+    method = "POST" if ctx["method"] not in ("GET", "POST") else ctx["method"]
+    names, tool = [], ""
+    if arjun is not None and getattr(arjun, "available", False):
+        try:
+            res = _run_async(arjun.discover(endpoint, method=method, headers=_hdr_dict(ctx)))
+            names, tool = res.get("params", []), "arjun"
+        except TypeError:
+            res = _run_async(arjun.discover(endpoint, method=method))
+            names, tool = res.get("params", []), "arjun"
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": "arjun failed: %s" % e, "stencils": []}
+    else:
+        names, tool = _paramminer_fallback(endpoint, budget), "param-miner"
+        if names is None:
+            return {"ok": False, "error": "No active param tool available. Install arjun "
+                    "(pip install arjun) for Tier-3 verification.", "stencils": []}
+    params = [_prec(n, "query" if method == "GET" else "body-json",
+                    source="probed", confidence="high",
+                    json_path=(None if method == "GET" else n),
+                    description="accepted by the server (%s)" % tool) for n in names]
+    if not params:
+        return {"ok": True, "tool": tool, "stencils": [],
+                "note": "%s found no additional accepted parameters." % tool}
+    st = _paramset_stencil(ctx, params, "probed", "probed",
+                           "%d param(s) the server accepts (%s)" % (len(params), tool))
+    return {"ok": True, "tool": tool, "stencils": [st], "params": params,
+            "note": "%s confirmed %d parameter(s)." % (tool, len(params))}
+
+
+def _paramminer_fallback(endpoint, budget):
+    """In-house active discovery when arjun isn't installed. Returns names or None."""
+    try:
+        from beatrix.scanners.param_miner import ParamMiner
+        from beatrix.scanners.base import ScanContext
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        miner = ParamMiner()
+        if budget:
+            try:
+                miner.max_params = int(budget)
+            except Exception:  # noqa: BLE001
+                pass
+        found = []
+
+        async def _go():
+            async for f in miner.scan(ScanContext.from_url(endpoint)):
+                p = getattr(f, "parameter", None)
+                if p:
+                    found.append(p)
+        _run_async(_go())
+        return sorted(set(found))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _verify_graphql(endpoint, ctx):
+    try:
+        from beatrix.core.external_tools import ClairvoyanceRunner
+        cl = ClairvoyanceRunner()
+    except Exception:  # noqa: BLE001
+        cl = None
+    if cl is None or not getattr(cl, "available", False):
+        return {"ok": False, "error": "GraphQL introspection is off and clairvoyance "
+                "isn't installed (pip install clairvoyance) — can't recover the schema.",
+                "stencils": []}
+    try:
+        res = _run_async(cl.reconstruct_schema(endpoint))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "clairvoyance failed: %s" % e, "stencils": []}
+    if not res.get("success"):
+        return {"ok": False, "error": "clairvoyance could not recover the schema.",
+                "stencils": []}
+    try:
+        schema = json.loads(res.get("schema") or "{}").get("data", {}).get("__schema")
+    except (ValueError, TypeError):
+        schema = None
+    if not schema:
+        return {"ok": True, "tool": "clairvoyance", "stencils": [],
+                "note": "clairvoyance returned a schema but it couldn't be parsed as JSON; "
+                        "see its output.", "recovered_sdl": res.get("schema", "")[:4000]}
+    model = _gql_normalize(schema)
+    headers = ctx["base_headers"]
+    stencils = []
+    for root_kind, ops in model["operations"].items():
+        for op in ops:
+            body = _gql_stencil(op, root_kind, model)["body"]
+            stencils.append({"label": "%s: %s" % (root_kind, op["name"]),
+                             "source": "probed", "confidence": "high", "location": "graphql-arg",
+                             "params": [_param_from_gql_arg(a) for a in op["args"]],
+                             "request": _build_json_request(endpoint, headers, body),
+                             "note": op["signature"]})
+    return {"ok": True, "tool": "clairvoyance", "stencils": stencils,
+            "note": "Recovered %d operation(s) despite disabled introspection." % len(stencils)}
+
+
+class _OASTStore:
+    """In-memory OAST / Collaborator state — minted canary payloads + received
+    out-of-band callbacks (blind SSRF/XXE/RCE/SQLi). Operator infra for authorized
+    testing: the receiver only RECORDS inbound hits, it never executes anything.
+    Field shape mirrors beatrix.core.poc_server.OOBCallback."""
+    _MAX_CB = 500
+    _BODY_CAP = 4096
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.payloads: Dict[str, Dict[str, Any]] = {}   # uid -> context
+        self.callbacks: List[Dict[str, Any]] = []
+        self.seq = 0
+        self.base = ""                                  # operator-set public base; "" => client uses its own origin
+
+    def mint(self, vuln_type: str, note: str, project: Any) -> Dict[str, Any]:
+        import secrets
+        uid = secrets.token_hex(4)
+        p = {"uid": uid, "vuln_type": (vuln_type or "generic"), "note": (note or ""),
+             "project": project, "created": time.time()}
+        with self._lock:
+            self.payloads[uid] = p
+        return p
+
+    def record(self, uid: str, method: str, path: str, headers: Dict[str, str],
+               body: str, ip: str) -> Dict[str, Any]:
+        with self._lock:
+            ctx = self.payloads.get(uid, {})
+            self.seq += 1
+            cb = {"seq": self.seq, "uid": uid, "ts": time.time(), "method": method,
+                  "path": path, "src_ip": ip, "body": (body or "")[:self._BODY_CAP],
+                  "ua": headers.get("User-Agent", "") if headers else "",
+                  "vuln_type": ctx.get("vuln_type", ""), "note": ctx.get("note", ""),
+                  "known": bool(ctx)}
+            self.callbacks.append(cb)
+            if len(self.callbacks) > self._MAX_CB:
+                self.callbacks = self.callbacks[-self._MAX_CB:]
+            return cb
+
+    def state(self, project: Any = None) -> Dict[str, Any]:
+        with self._lock:
+            pays = [p for p in self.payloads.values() if project is None or p.get("project") == project]
+            return {"base": self.base, "count": len(self.callbacks),
+                    "payloads": sorted(pays, key=lambda x: -x["created"]),
+                    "callbacks": list(reversed(self.callbacks))}   # newest first
+
+    def clear(self) -> None:
+        with self._lock:
+            self.payloads.clear(); self.callbacks = []; self.seq = 0
+
+    def set_base(self, base: str) -> Dict[str, Any]:
+        with self._lock:
+            self.base = (base or "").strip().rstrip("/")
+            return {"ok": True, "base": self.base}
+
+
 class _RepeaterStore:
     """Per-project Repeater tabs, persisted to ``<project>/repeater.json``.
 
@@ -15192,6 +17226,7 @@ class SuiteServer:
         self.projects: Optional[_ProjectStore] = None
         self.issues: Optional[_IssueStore] = None
         self.repeater: Optional[_RepeaterStore] = None
+        self.oast = _OASTStore()                        # OAST/Collaborator — global operator infra, session-independent
         # One ghost run + event broker PER project (keyed by str(project id)), so
         # switching projects preserves each project's live run view.
         self.ghost_brokers: Dict[str, _Broker] = {}
@@ -15396,6 +17431,142 @@ class SuiteServer:
         tab = self.repeater.record_send(project_id, tab_id, request or "",
                                         target or "", resp)
         return {"ok": True, "response": resp, "tab": tab}
+
+    def repeater_schema(self, request: str, target: str) -> Dict[str, Any]:
+        """Discover a GraphQL endpoint's parameters by introspection and return a
+        normalised schema + per-operation stencils. Like a manual send, this is a
+        single synchronous round trip, so the HTTP handler thread runs it inline.
+        Not scope-gated — a Repeater fires wherever the tester points it."""
+        return _graphql_discover(request or "", target or "")
+
+    def _param_history(self, project_id: Any, request: str, target: str) -> List[Dict[str, Any]]:
+        """Full captured transactions for the current endpoint (same host+path),
+        most-recent first-bounded — the raw material for the observed-params tier."""
+        ctx = _param_ctx(request or "", target or "")
+        if ctx is None or self.http_history_store is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            rows = self.http_history_store.list(project_id, ctx["host"]).get("rows", [])
+            want = _norm_path(ctx["path"])
+            ids = [r.get("id") for r in rows
+                   if _norm_path(r.get("url") or r.get("path") or "") == want]
+            for i in ids[-200:]:
+                tx = self.http_history_store.get(project_id, i)
+                if tx:
+                    out.append(tx)
+        except Exception:  # noqa: BLE001 — discovery degrades, never crashes
+            pass
+        return out
+
+    def _spec_fetcher(self, request: str, target: str):
+        """A bounded GET fetcher the OpenAPI source uses to pull a spec from
+        well-known paths, reusing the request's scheme + auth headers."""
+        ctx = _param_ctx(request or "", target or "")
+        if ctx is None:
+            return None
+
+        def fetch(path: str) -> Optional[str]:
+            raw = _build_raw("GET", ctx["netloc"], path, ctx["base_headers"], "")
+            resp = _exec_repeater_request(raw, ctx["endpoint"])
+            if resp.get("error") or (resp.get("status") or 0) >= 400:
+                return None
+            return resp.get("body") or ""
+        return fetch
+
+    def repeater_params(self, project_id: Any, request: str, target: str,
+                        response: str = "") -> Dict[str, Any]:
+        """Passive parameter discovery across every declared/observed source
+        (GraphQL introspection, OpenAPI/Swagger, HTML forms, captured traffic).
+        Supersedes repeater_schema; runs inline like a single send."""
+        return _param_discover(request or "", target or "",
+                               history=self._param_history(project_id, request, target),
+                               response_body=response or "",
+                               fetch=self._spec_fetcher(request, target))
+
+    def repeater_params_verify(self, project_id: Any, request: str, target: str,
+                               response: str = "", force: bool = False,
+                               budget: int = 0) -> Dict[str, Any]:
+        """Tier-3 ACTIVE verification (Arjun / ParamMiner, or Clairvoyance for a
+        GraphQL endpoint with introspection off). Scope-gated: an out-of-scope
+        target needs an explicit ``force`` (the UI confirms first)."""
+        ctx = _param_ctx(request or "", target or "")
+        if ctx is None:
+            return {"ok": False, "error": "No target to probe."}
+        allowed = self.projects.get_scope(project_id) if self.projects else []
+        denied = self.projects.get_scope_exclude(project_id) if self.projects else []
+        if not force and not _scope_allows(ctx["host"], allowed, denied):
+            return {"ok": False, "needs_confirm": True, "host": ctx["host"],
+                    "reason": "%s is outside this project's scope. Active probing "
+                    "sends many requests — confirm to proceed." % ctx["host"]}
+        return _param_active_verify(request or "", target or "", budget=budget,
+                                    response_body=response or "")
+
+    # ── JWT workbench (operator tool module) ──────────────────────────────
+    def jwt_analyze(self, project_id: Any, token: str) -> Dict[str, Any]:
+        """Run jwt_tool's full test suite over a token (availability-gated, synchronous
+        like a Repeater send). Each reported issue also lands in the Issues store."""
+        token = (token or "").strip()
+        if not token:
+            return {"available": True, "error": "No token provided.", "vulnerabilities": []}
+        try:
+            from beatrix.core.external_tools import JwtToolRunner
+            runner = JwtToolRunner()
+        except Exception:  # noqa: BLE001
+            return {"available": False}
+        if not getattr(runner, "available", False):
+            return {"available": False}
+        try:
+            res = _run_async(runner.analyze(token))
+        except Exception as e:  # noqa: BLE001
+            return {"available": True, "error": "jwt_tool failed: %s" % e, "vulnerabilities": []}
+        vulns = res.get("vulnerabilities") or []
+        if vulns and self.issues is not None:
+            try:
+                from beatrix.core.types import Finding, Severity, Confidence
+                for v in vulns:
+                    f = Finding(title="JWT: " + (v.get("type") or "issue"),
+                                severity=Severity.HIGH, confidence=Confidence.FIRM,
+                                scanner_module="jwt",
+                                evidence=(v.get("detail") or ""),
+                                description=(v.get("type") or "") + " — " + (v.get("detail") or ""))
+                    self.issues.add_finding(project_id, f, "jwt", "manual")
+            except Exception:  # noqa: BLE001
+                pass
+        return {"available": True, "vulnerabilities": vulns,
+                "output": res.get("output", ""), "error": res.get("error")}
+
+    def jwt_tamper(self, token: str, claim: str, value: str) -> Dict[str, Any]:
+        """Inject/overwrite one claim via jwt_tool and return the re-signed token."""
+        token, claim = (token or "").strip(), (claim or "").strip()
+        if not token or not claim:
+            return {"error": "A token and a claim name are required."}
+        try:
+            from beatrix.core.external_tools import JwtToolRunner
+            runner = JwtToolRunner()
+        except Exception:  # noqa: BLE001
+            return {"error": "jwt_tool is unavailable."}
+        if not getattr(runner, "available", False):
+            return {"error": "jwt_tool isn't installed."}
+        try:
+            tok = _run_async(runner.tamper(token, claim, value or ""))
+        except Exception as e:  # noqa: BLE001
+            return {"error": "jwt_tool failed: %s" % e}
+        return {"token": tok} if tok else {"error": "jwt_tool produced no token."}
+
+    # ── OAST / Collaborator (Weaponization) ───────────────────────────────
+    def oast_mint(self, project_id: Any, vuln_type: str, note: str) -> Dict[str, Any]:
+        p = self.oast.mint(vuln_type, note, project_id)
+        return {"ok": True, "uid": p["uid"], "payload": p}
+
+    def oast_state(self, project_id: Any) -> Dict[str, Any]:
+        return self.oast.state(project_id)
+
+    def oast_clear(self) -> Dict[str, Any]:
+        self.oast.clear(); return {"ok": True}
+
+    def oast_set_base(self, base: str) -> Dict[str, Any]:
+        return self.oast.set_base(base)
 
     # ── Network (nmap) scan lifecycle ─────────────────────────────────────
     def start_nmap_scan(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -17275,6 +19446,10 @@ class SuiteServer:
 
             def do_GET(self):
                 path = urlparse(self.path).path
+                if path.startswith("/cb/"):             # OAST canary hit (inbound from a target) — record, never gated
+                    suite.oast.record(path[4:].split("/", 1)[0], "GET", self.path,
+                                      {k: v for k, v in self.headers.items()}, "", self.client_address[0])
+                    self._send(200, b"ok", "text/plain"); return
                 if suite.session_dir is None and _needs_session(path):
                     self._json({"needs_session": True})
                     return
@@ -17414,6 +19589,12 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json({"count": suite.issues.count(proj)})
+                elif path == "/oast/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.oast_state(proj))
                 elif path == "/issues/detail":
                     q = parse_qs(urlparse(self.path).query)
                     proj = (q.get("project") or [None])[0]
@@ -17689,6 +19870,11 @@ class SuiteServer:
                 path = urlparse(self.path).path
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
+                if path.startswith("/cb/"):             # OAST canary hit with a body — record, never gated
+                    suite.oast.record(path[4:].split("/", 1)[0], "POST", self.path,
+                                      {k: v for k, v in self.headers.items()},
+                                      raw.decode("utf-8", "replace"), self.client_address[0])
+                    self._send(200, b"ok", "text/plain"); return
                 try:
                     payload = json.loads(raw or b"{}")
                 except Exception:
@@ -17884,6 +20070,38 @@ class SuiteServer:
                         proj = suite.projects.state().get("active")
                     self._json(suite.repeater_send(proj, payload.get("id"),
                         payload.get("request", ""), payload.get("target", "")))
+                elif path == "/repeater/schema":
+                    self._json(suite.repeater_schema(
+                        payload.get("request", ""), payload.get("target", "")))
+                elif path in ("/repeater/params", "/repeater/params/verify"):
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    if path == "/repeater/params":
+                        self._json(suite.repeater_params(proj, payload.get("request", ""),
+                            payload.get("target", ""), payload.get("response", "")))
+                    else:
+                        self._json(suite.repeater_params_verify(proj,
+                            payload.get("request", ""), payload.get("target", ""),
+                            payload.get("response", ""), bool(payload.get("force")),
+                            int(payload.get("budget") or 0)))
+                elif path == "/jwt/analyze":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.jwt_analyze(proj, payload.get("token", "")))
+                elif path == "/jwt/tamper":
+                    self._json(suite.jwt_tamper(payload.get("token", ""),
+                        payload.get("claim", ""), payload.get("value", "")))
+                elif path == "/oast/mint":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.oast_mint(proj, payload.get("vuln_type", ""), payload.get("note", "")))
+                elif path == "/oast/clear":
+                    self._json(suite.oast_clear())
+                elif path == "/oast/base":
+                    self._json(suite.oast_set_base(payload.get("base", "")))
                 elif path == "/autorepeater/run":
                     proj = payload.get("project")
                     if proj is None:
