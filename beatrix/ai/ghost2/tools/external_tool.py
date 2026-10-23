@@ -124,6 +124,54 @@ async def _crlfuzz(tk, target, o):
     return await tk.crlfuzz.scan(url=target)
 
 
+async def _httpx(tk, target, o):
+    return await tk.httpx.probe([target])
+
+
+async def _naabu(tk, target, o):
+    ports = o.get("ports")
+    return await tk.naabu.scan([target], ports=ports,
+                               top_ports=(None if ports else _opt_int(o, "top_ports", 100)))
+
+
+async def _dnsx(tk, target, o):
+    return await tk.dnsx.resolve([target])
+
+
+async def _gowitness(tk, target, o):
+    return await tk.gowitness.screenshot([target], out_dir=o.get("out_dir"))
+
+
+async def _wafw00f(tk, target, o):
+    return await tk.wafw00f.detect(target)
+
+
+async def _s3scanner(tk, target, o):
+    return await tk.s3scanner.scan([target])
+
+
+async def _wpscan(tk, target, o):
+    return await tk.wpscan.scan(target, api_token=o.get("api_token"))
+
+
+async def _trufflehog(tk, target, o):
+    if target.startswith(("http://", "https://", "git@")):
+        return await tk.trufflehog.scan_git(target, only_verified=True)
+    return await tk.trufflehog.scan_filesystem(target, only_verified=True)
+
+
+async def _interactsh(tk, target, o):
+    return await tk.interactsh.session(duration=_opt_int(o, "duration", 30))
+
+
+async def _notify(tk, target, o):
+    return await tk.notify.send(target, provider=o.get("provider"))
+
+
+async def _rea(tk, target, o):
+    return await tk.rea.analyze(target, command=o.get("command", "analyze"))
+
+
 # name → (toolkit attribute, handler, url_target?)
 _SPEC = {
     "sqlmap": ("sqlmap", _sqlmap, True),
@@ -138,6 +186,17 @@ _SPEC = {
     "dirsearch": ("dirsearch", _dirsearch, True),
     "nomore403": ("nomore403", _nomore403, True),
     "crlfuzz": ("crlfuzz", _crlfuzz, True),
+    "httpx": ("httpx", _httpx, True),
+    "naabu": ("naabu", _naabu, True),
+    "dnsx": ("dnsx", _dnsx, True),
+    "gowitness": ("gowitness", _gowitness, True),
+    "wafw00f": ("wafw00f", _wafw00f, True),
+    "wpscan": ("wpscan", _wpscan, True),
+    "s3scanner": ("s3scanner", _s3scanner, False),
+    "trufflehog": ("trufflehog", _trufflehog, False),
+    "interactsh": ("interactsh", _interactsh, False),
+    "notify": ("notify", _notify, False),
+    "rea": ("rea", _rea, False),
 }
 
 _TOOL_KEYS = ", ".join(_SPEC)
@@ -181,7 +240,8 @@ async def run_external_tool(
     command injection, arjun to discover hidden params, jwt_tool on a token.
 
     Valid tools: sqlmap, dalfox, commix, arjun, jwt_tool, katana, gau, whatweb,
-    webanalyze, dirsearch, nomore403, crlfuzz.
+    webanalyze, dirsearch, nomore403, crlfuzz, httpx, naabu, dnsx, gowitness,
+    wafw00f, s3scanner, wpscan, trufflehog, interactsh, notify, rea.
 
     Args:
         tool: Which external tool to run (see list above).
@@ -189,7 +249,9 @@ async def run_external_tool(
         options: A JSON object string of extra settings, pass only what applies.
             Supported keys: param, method, data (POST body), level, risk
             (sqlmap); claim, value (jwt_tool tamper); depth (katana);
-            extensions (dirsearch). Example: '{"param":"id","method":"POST"}'.
+            extensions (dirsearch); ports, top_ports (naabu); out_dir
+            (gowitness); duration (interactsh); provider (notify); api_token
+            (wpscan); command (rea). Example: '{"param":"id","method":"POST"}'.
     """
     tool = tool.strip().lower()
     spec = _SPEC.get(tool)

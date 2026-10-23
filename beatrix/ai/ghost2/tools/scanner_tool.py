@@ -1,5 +1,5 @@
 """
-`run_scanner` — drive any of Beatrix's 32 BaseScanner modules from the agent.
+`run_scanner` — drive any of Beatrix's BaseScanner modules from the agent.
 
 Reuses ``BeatrixEngine``'s module registry (``_load_modules``) so the agent
 has the exact same arsenal the deterministic ``beatrix hunt`` pipeline uses,
@@ -26,7 +26,7 @@ _REGISTRY: Optional[dict] = None
 
 # Module keys, surfaced in the tool description so the model picks valid ones.
 _MODULE_KEYS = (
-    "crawl, endpoint_prober, js_analysis, headers, github_recon, param_miner, "
+    "crawl, endpoint_prober, js_analysis, spa_recon, headers, github_recon, param_miner, "
     "takeover, error_disclosure, cache_poisoning, prototype_pollution, sequencer, "
     "cors, redirect, oauth_redirect, http_smuggling, websocket, "
     "backslash, injection, ssrf, idor, bac, auth, ssti, xxe, deserialization, "
@@ -64,7 +64,7 @@ async def run_scanner(ctx: RunContextWrapper[GhostSession], module: str, url: st
     This is your primary weapon — it runs the same battle-tested scanners the
     deterministic pipeline uses. Any findings are recorded automatically.
 
-    Valid module keys: crawl, endpoint_prober, js_analysis, headers,
+    Valid module keys: crawl, endpoint_prober, js_analysis, spa_recon, headers,
     github_recon, param_miner, takeover, error_disclosure, cache_poisoning,
     prototype_pollution, sequencer, cors, redirect, oauth_redirect,
     http_smuggling, websocket, backslash, injection, ssrf, idor, bac, auth,

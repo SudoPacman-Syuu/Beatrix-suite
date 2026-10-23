@@ -162,6 +162,7 @@ class ReportGenerator:
 - **MITRE ATT&CK**: {finding.mitre_technique or "N/A"}
 - **CWE**: {finding.cwe_id or "N/A"}
 {self._format_vrt_section(finding)}
+{self._format_provenance_section(finding)}
 ---
 **Program**: {program}
 **Discovered**: {finding.found_at.strftime("%Y-%m-%d %H:%M:%S")}
@@ -291,6 +292,49 @@ behalf of the user, or redirect to malicious sites."""
             f"\n### Impact Assessment\n{VRTClassifier.get_impact_statement(vrt)}\n"
         )
 
+    def _format_provenance_section(self, finding: Finding) -> str:
+        """Render the evidence-provenance record (beatrix.core.provenance).
+
+        Surfaces what was observed/derived/inferred and — critically — any
+        unresolved UNKNOWNs, which are never presented as absent/clean."""
+        prov = getattr(finding, "provenance", None)
+        if not prov:
+            return ""
+        try:
+            from beatrix.core.provenance import Provenance
+            p = Provenance.from_dict(prov)
+        except Exception:
+            return ""
+        if p is None:
+            return ""
+        lines = ["\n## Evidence Provenance",
+                 f"- **Claim**: {p.claim.label}",
+                 f"- **Method**: {p.method or 'N/A'}"]
+        if p.confidence_basis:
+            lines.append(f"- **Basis**: {p.confidence_basis}")
+        if p.evidence:
+            lines.append("\n### Evidence")
+            for e in p.evidence:
+                loc = []
+                if e.line is not None:
+                    loc.append(f"line {e.line}")
+                if e.byte_start is not None:
+                    loc.append(f"bytes {e.byte_start}-{e.byte_end}")
+                suffix = f" ({', '.join(loc)})" if loc else ""
+                lit = f" — `{e.literal}`" if e.literal else ""
+                where = e.source + (f" [{e.locator}]" if e.locator else "")
+                lines.append(f"- {where}{lit}{suffix}")
+        if p.limitations:
+            lines.append("\n### Limitations")
+            lines.extend(f"- {lim}" for lim in p.limitations)
+        if p.claim.value == "unknown" or p.unknowns:
+            lines.append("\n### Unknowns (unresolved — not treated as absent/clean)")
+            if p.unknowns:
+                lines.extend(f"- {u}" for u in p.unknowns)
+            else:
+                lines.append("- core claim could not be determined")
+        return "\n".join(lines) + "\n"
+
     def _generate_poc(self, finding: Finding) -> str:
         """Generate proof of concept code"""
 
@@ -343,6 +387,7 @@ xhr.send();
                 "url": f.url,
                 "description": f.description,
                 "evidence": f.evidence,
+                "provenance": f.provenance,
                 "request": f.request,
                 "response": f.response,
                 "remediation": f.remediation,

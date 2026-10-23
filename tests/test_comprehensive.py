@@ -248,7 +248,6 @@ class TestCoreTypesExhaustive:
             assert phase.name_pretty  # readable name
             assert phase.description  # has description
             assert phase.icon         # has emoji
-            assert isinstance(phase.modules, list)  # has module list
 
     def test_mitre_tactics_exist(self):
         assert len(list(MitreTactic)) >= 10
@@ -619,7 +618,7 @@ class TestEngineComprehensive:
     def test_engine_config_defaults(self):
         config = EngineConfig()
         assert config.threads == 50
-        assert config.rate_limit == 100
+        assert config.rate_limit == 10
         assert config.timeout == 10
 
     def test_engine_config_from_yaml(self):

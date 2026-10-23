@@ -38,6 +38,7 @@ from .idor import BACScanner, IDORScanner
 from .injection import InjectionScanner
 from .insertion import InsertionPointDetector
 from .js_bundle import JSBundleAnalyzer
+from .spa_recon import SPAReconScanner
 from .mass_assignment import MassAssignmentScanner
 from .nuclei import NucleiScanner
 from .payment_scanner import PaymentScanner
@@ -101,6 +102,7 @@ __all__ = [
     # A05: Security Misconfiguration
     "ErrorDisclosureScanner",
     "JSBundleAnalyzer",
+    "SPAReconScanner",
     "CachePoisoningScanner",
     # A07: Authentication
     "AuthScanner",

@@ -83,8 +83,9 @@ detail — real captured HTTP, not reconstructed guesses. Send one, or a whole s
 git clone https://github.com/SudoPacman-Syuu/Beatrix-suite.git && cd Beatrix-suite && ./install.sh
 ```
 
-The installer auto-detects your Python, puts `beatrix` and `beatrix-suite` on your `PATH`, and installs the
-core external tools (nuclei, nmap, sqlmap, subfinder, ffuf, and others). Remove it with `./uninstall.sh`.
+The installer auto-detects your Python, puts `beatrix`, `beatrix-suite`, and `beatrix-update` on your `PATH`,
+and installs the core external tools (nuclei, nmap, sqlmap, subfinder, ffuf, and others). Remove it with
+`./uninstall.sh`.
 
 ## Quick start
 
@@ -93,7 +94,17 @@ beatrix-suite                       # launch the web GUI (the Suite)
 beatrix                             # list every CLI command
 beatrix hunt example.com            # full scan from the terminal
 beatrix hunt 10.0.0.1 --preset full # IPs, CIDRs, and target files all work
+beatrix-update                      # pull the latest version from GitHub
 ```
+
+## Updating
+
+```bash
+beatrix-update            # pull the latest from GitHub and reinstall deps in place
+```
+
+`beatrix-update` fast-forwards your checkout and refreshes dependencies, and **never touches your
+projects, findings, or config** (it does not re-run the installer). `beatrix update` is the same command.
 
 ## The CLI
 

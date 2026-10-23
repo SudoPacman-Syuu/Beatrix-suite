@@ -1957,6 +1957,25 @@ _PAGE = r"""<!doctype html>
   #pane-scan.active { display:flex; flex-direction:row; overflow:hidden; }
   /* Passive Scan module — same two-pane layout as Active Scan */
   #pane-passive.active { display:flex; flex-direction:row; overflow:hidden; }
+  /* SPA Recon module — same two-pane layout as Passive/Active Scan */
+  #pane-sparecon.active { display:flex; flex-direction:row; overflow:hidden; }
+  #sp-added, #sp-issues { color:var(--accent); }
+  #sp-log .tline { padding:1px 0; white-space:pre-wrap; word-break:break-word; }
+  /* After a run, results are the focus: terminal keeps a modest share, results grow + scroll. */
+  #pane-sparecon .hunt-terminal-wrap { display:flex; flex-direction:column; min-height:0; }
+  #pane-sparecon .term-chrome { flex:1 1 0; min-height:150px; }
+  #sp-results { flex:2 1 0; min-height:0; overflow:auto; padding:6px 10px 14px; font-size:12.5px; border-top:1px solid var(--bevel); }
+  #sp-results[hidden] { display:none; }
+  #sp-results summary { cursor:pointer; padding:5px 2px; font-weight:600; }
+  #sp-results table { width:100%; border-collapse:collapse; margin:2px 0 8px; }
+  #sp-results th, #sp-results td { text-align:left; padding:3px 8px; border-bottom:1px solid var(--bevel); vertical-align:top; word-break:break-all; }
+  #sp-results th { color:var(--muted); font-weight:600; }
+  .sp-rep { cursor:pointer; color:var(--accent); white-space:nowrap; }
+  .sp-claim { font-size:10.5px; padding:0 5px; border:1px solid var(--bevel); border-radius:3px; color:var(--muted); }
+  .sp-claim.observation { color:var(--green); border-color:var(--green); }
+  .sp-claim.derivation { color:var(--blue); border-color:var(--blue); }
+  .sp-claim.inference { color:var(--yellow); border-color:var(--yellow); }
+  .sp-claim.unknown { color:var(--orange); border-color:var(--orange); }
   .pv-opts { display:flex; flex-direction:column; gap:5px; }
   #pv-added { color:var(--accent); }
   #pv-log .tline { padding:1px 0; white-space:pre-wrap; word-break:break-word; }
@@ -3551,6 +3570,7 @@ _PAGE = r"""<!doctype html>
           <button class="mod" data-tab="recon" role="menuitem" title="OSINT — external asset discovery (domains, subdomains, IPs, netblocks, whois)">OSINT</button>
           <button class="mod" data-tab="network" role="menuitem">Network</button>
           <button class="mod" data-tab="passive" role="menuitem">Passive Scan</button>
+          <button class="mod" data-tab="sparecon" role="menuitem">SPA Recon</button>
           <button class="mod" data-tab="sitemap" role="menuitem">Site map</button>
           <button class="mod" data-tab="packets" role="menuitem">Packets</button>
         </div>
@@ -3945,6 +3965,43 @@ _PAGE = r"""<!doctype html>
             </div>
             <div id="pv-log" class="terminal"></div>
           </div>
+        </div>
+      </section>
+
+      <section id="pane-sparecon" class="pane">
+        <aside class="hunt-controls">
+          <h2 style="margin-top:0;">SPA Recon</h2>
+          <p class="sub" style="margin:0 0 12px;">Recover the <b>client-side attack surface</b> of a single-page app: rebuild original sources from source maps, inventory routes &amp; API endpoints, and extract secrets. Endpoints feed the <b>Site map</b>; findings feed <b>Issues</b>. Keyless, passive reads only.</p>
+
+          <label>Target</label>
+          <input id="sp-target" type="text" placeholder="https://app.example.com or app.example.com">
+
+          <label class="mod-row" data-desc="Also run against every distinct in-scope host already in this project's Site map.">
+            <input type="checkbox" id="sp-usemap"> use Site map hosts</label>
+
+          <button id="sp-run" class="run" style="width:100%; margin-top:14px;">Recover SPA surface</button>
+          <button id="sp-stop" class="stop" style="width:100%; margin-top:8px;" disabled>Stop</button>
+          <div id="sp-msg" style="color:var(--muted); font-size:12px; margin-top:8px;"></div>
+        </aside>
+
+        <div class="hunt-terminal-wrap">
+          <div class="ghost-toolbar" style="margin-top:0;">
+            <span>events <b id="sp-count">0</b></span>
+            <span>sources <b id="sp-c-src">0</b></span>
+            <span>endpoints <b id="sp-c-ep">0</b></span>
+            <span>findings <b id="sp-c-find">0</b></span>
+            <span class="spacer"></span>
+            <span>&rarr; Site map <b id="sp-added">0</b></span>
+            <span>&rarr; Issues <b id="sp-issues">0</b></span>
+          </div>
+          <div class="term-chrome">
+            <div class="term-titlebar">
+              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+              <span class="term-title">beatrix@spa-recon</span>
+            </div>
+            <div id="sp-log" class="terminal"></div>
+          </div>
+          <div id="sp-results" hidden></div>
         </div>
       </section>
 
@@ -4617,6 +4674,7 @@ function activateTab(tab) {
   if (tab === "browser") loadBrowserFor(activeProject);
   if (tab === "http") loadHttpFor(activeProject);
   if (tab === "passive") loadPassiveFor(activeProject);
+  if (tab === "sparecon") loadSpaReconFor(activeProject);
   if (tab === "sitemap") loadSitemapFor(activeProject);
   if (tab === "repeater") loadRepeaterFor(activeProject);
   if (tab === "autorepeater") loadAutoRepeaterFor(activeProject);
@@ -5693,6 +5751,115 @@ async function pvPoll(pid) {
   pvTimer = setTimeout(() => pvPoll(pid), 800);
 }
 
+/* ── SPA Recon module ─────────────────────────────────────────────────────── */
+let spInited = false, spSince = 0, spTimer = null, spPollProject = null, spAutoscroll = true;
+function spInit() {
+  if (spInited) return; spInited = true;
+  $("sp-run").onclick = spRun;
+  $("sp-stop").onclick = async () => {
+    $("sp-stop").disabled = true;
+    try { await fetch("/sparecon/stop", { method: "POST", body: JSON.stringify({ project: activeProject }) }); } catch (e) {}
+  };
+  $("sp-target").addEventListener("keydown", e => { if (e.key === "Enter") spRun(); });
+}
+async function loadSpaReconFor(pid) {
+  if (pid === null) return; spInit();
+  if (!$("sp-target").value) { const t = ($("h-target") && $("h-target").value) || ""; if (t) $("sp-target").value = t; }
+  clearTimeout(spTimer); spTimer = null;
+  let d;
+  try { d = await (await fetch("/sparecon/events?since=0&project=" + pid)).json(); } catch (e) { return; }
+  if (pid !== activeProject) return;
+  $("sp-log").innerHTML = ""; spSince = 0;
+  for (const ev of d.events || []) { if (ev.seq != null) spSince = ev.seq; spLog(ev); }
+  $("sp-count").textContent = String(spSince);
+  if (!d.done) {
+    spPollProject = pid; $("sp-run").disabled = true; $("sp-stop").disabled = false; $("sp-msg").textContent = "Recovering…";
+    spPoll(pid);
+  } else {
+    $("sp-run").disabled = false; $("sp-stop").disabled = true; spLoadState(pid);
+  }
+}
+function spLog(ev) {
+  const d = document.createElement("div");
+  d.className = "tline " + (ev.type === "error" ? "l-err" : ev.type === "phase" ? "l-phase" : ev.type === "done" ? "l-done" : "");
+  d.textContent = ev.text || "";
+  $("sp-log").appendChild(d);
+  if (spAutoscroll) $("sp-log").scrollTop = $("sp-log").scrollHeight;
+}
+async function spRun() {
+  const target = $("sp-target").value.trim(); const useMap = $("sp-usemap").checked;
+  if (!target && !useMap) { $("sp-msg").textContent = "Enter a target (or tick 'use Site map hosts')."; return; }
+  $("sp-run").disabled = true; $("sp-msg").textContent = "Starting…";
+  $("sp-log").innerHTML = ""; spSince = 0; $("sp-count").textContent = "0"; $("sp-results").hidden = true;
+  spPollProject = activeProject;
+  try {
+    const r = await (await fetch("/sparecon/run", { method: "POST", body: JSON.stringify({
+      project: activeProject, target, use_sitemap: useMap,
+    }) })).json();
+    if (!r.ok) { $("sp-msg").textContent = "Error: " + (r.error || "could not start"); $("sp-run").disabled = false; return; }
+    $("sp-stop").disabled = false; $("sp-msg").textContent = "Recovering: " + (target || "Site map hosts");
+    spPoll(activeProject);
+  } catch (e) { $("sp-msg").textContent = "Error: " + e; $("sp-run").disabled = false; }
+}
+async function spPoll(pid) {
+  if (spTimer) clearTimeout(spTimer);
+  let d;
+  try { d = await (await fetch("/sparecon/events?since=" + spSince + "&project=" + pid)).json(); }
+  catch (e) { spTimer = setTimeout(() => spPoll(pid), 1000); return; }
+  if (pid !== spPollProject) return;
+  for (const ev of d.events || []) { if (ev.seq != null) spSince = ev.seq; spLog(ev); }
+  $("sp-count").textContent = String(spSince);
+  if (d.done) {
+    $("sp-run").disabled = false; $("sp-stop").disabled = true;
+    if (!/Error|failed/.test($("sp-msg").textContent)) $("sp-msg").textContent = "Done.";
+    spLoadState(pid); return;
+  }
+  spTimer = setTimeout(() => spPoll(pid), 800);
+}
+async function spLoadState(pid) {
+  let s;
+  try { s = await (await fetch("/sparecon/state?project=" + pid)).json(); } catch (e) { return; }
+  if (pid !== activeProject) return;
+  spRenderState(s);
+}
+function spEsc(x) { return String(x == null ? "" : x).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function spClaim(c) { c = (c || "").toLowerCase(); return '<span class="sp-claim ' + spEsc(c) + '">' + spEsc(c || "—") + '</span>'; }
+function spRenderState(s) {
+  if (!s || (!(s.sources || []).length && !(s.endpoints || []).length && !(s.findings || []).length)) { $("sp-results").hidden = true; return; }
+  const src = s.sources || [], eps = s.endpoints || [], rts = s.routes || [], finds = s.findings || [], secs = s.secrets || [], exps = s.exposures || [];
+  $("sp-c-src").textContent = String(src.length);
+  $("sp-c-ep").textContent = String(eps.length + rts.length);
+  $("sp-c-find").textContent = String(finds.length);
+  $("sp-added").textContent = String(s.added || 0);
+  $("sp-issues").textContent = String(s.issues || 0);
+  let h = "";
+  h += '<details open><summary>Recovered sources (' + src.length + ')</summary>';
+  if (src.length) {
+    h += '<table><tr><th>path</th><th>content</th></tr>';
+    for (const x of src.slice(0, 500)) h += '<tr><td>' + spEsc(x.path) + (x.third_party ? ' <span class="dim">(3rd-party)</span>' : '') + '</td><td>' + (x.has_content ? 'recovered' : '<span class="dim">name only</span>') + '</td></tr>';
+    h += '</table>';
+  } else h += '<p class="dim" style="padding:6px 8px;">No source maps recovered (analysis fell back to minified bundles).</p>';
+  h += '</details>';
+  h += '<details open><summary>Endpoints &amp; routes (' + (eps.length + rts.length) + ')</summary><table><tr><th>type</th><th>path / url</th><th>evidence</th><th></th></tr>';
+  for (const e of eps.slice(0, 500)) { const u = e.url || e.raw || ""; h += '<tr><td>' + spEsc(e.kind || "api") + '</td><td>' + spEsc(e.raw || u) + '</td><td>' + spClaim(e.claim) + '</td><td>' + (u && u.indexOf("http") === 0 ? '<a class="sp-rep" data-url="' + spEsc(u) + '">&rarr; Repeater</a>' : '') + '</td></tr>'; }
+  for (const r of rts.slice(0, 500)) h += '<tr><td>route</td><td>' + spEsc(r.path) + '</td><td>' + spClaim(r.claim) + '</td><td></td></tr>';
+  h += '</table></details>';
+  h += '<details open><summary>Findings (' + finds.length + ')</summary><table><tr><th>severity</th><th>title</th><th>evidence</th></tr>';
+  for (const f of finds) h += '<tr><td>' + spEsc(f.severity) + '</td><td>' + spEsc(f.title) + '</td><td>' + spClaim(f.claim) + '</td></tr>';
+  h += '</table>';
+  if (secs.length) { h += '<p class="dim" style="padding:6px 8px 0;">Secrets</p><table><tr><th>type</th><th>value</th><th>source</th><th>evidence</th></tr>'; for (const x of secs.slice(0, 200)) h += '<tr><td>' + spEsc(x.secret_type) + '</td><td>' + spEsc(x.masked) + '</td><td>' + spEsc(x.source) + (x.line ? ':' + x.line : '') + '</td><td>' + spClaim(x.claim) + '</td></tr>'; h += '</table>'; }
+  if (exps.length) { h += '<p class="dim" style="padding:6px 8px 0;">Client-side exposures</p><table><tr><th>kind</th><th>detail</th><th>source</th><th>evidence</th></tr>'; for (const x of exps.slice(0, 200)) h += '<tr><td>' + spEsc(x.kind) + '</td><td>' + spEsc(x.detail) + '</td><td>' + spEsc(x.source) + '</td><td>' + spClaim(x.claim) + '</td></tr>'; h += '</table>'; }
+  h += '</details>';
+  const box = $("sp-results"); box.innerHTML = h; box.hidden = false;
+  box.querySelectorAll(".sp-rep").forEach(a => {
+    a.onclick = async () => {
+      a.textContent = "…";
+      try { const r = await (await fetch("/sparecon/to_repeater", { method: "POST", body: JSON.stringify({ project: activeProject, url: a.getAttribute("data-url") }) })).json(); a.textContent = r.ok ? "sent" : "err"; }
+      catch (e) { a.textContent = "err"; }
+    };
+  });
+}
+
 function saveHuntHtml() {
   const projName = projectName(activeProject);
   const target = $("h-target").value || "—";
@@ -5739,6 +5906,71 @@ function saveHuntHtml() {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 $("h-save").onclick = saveHuntHtml;
+
+/* ── Run on all in-scope targets (shared across modules) ───────────────────── */
+function scopeWaitFor(pred, timeoutMs) {
+  return new Promise(res => {
+    const t0 = Date.now();
+    (function poll() {
+      try { if (pred()) return res(true); } catch (e) {}
+      if (Date.now() - t0 > timeoutMs) return res(false);
+      setTimeout(poll, 300);
+    })();
+  });
+}
+async function scopeInScopeHosts() {
+  let d;
+  try { d = await (await fetch("/scope?project=" + activeProject)).json(); } catch (e) { return []; }
+  const excl = new Set((d.exclude || []).map(x => String(x).toLowerCase()));
+  const seen = new Set(), out = [];
+  for (const h of (d.scope || [])) {
+    const host = String(h || "").trim(), k = host.toLowerCase();
+    if (host && !excl.has(k) && !seen.has(k)) { seen.add(k); out.push(host); }
+  }
+  return out;
+}
+const _scopeRun = {};   // runBtnId -> {busy, cancel}
+async function runOnAllScope(cfg, scopeBtn) {
+  const st = _scopeRun[cfg.runBtnId] || (_scopeRun[cfg.runBtnId] = { busy: false, cancel: false });
+  if (st.busy) { st.cancel = true; return; }           // a second click cancels the batch
+  const hosts = await scopeInScopeHosts();
+  const CAP = 50;
+  const list = hosts.slice(0, CAP);
+  const orig = scopeBtn.textContent;
+  if (!list.length) { scopeBtn.textContent = "No in-scope hosts — set Scope first"; setTimeout(() => scopeBtn.textContent = orig, 2200); return; }
+  st.busy = true; st.cancel = false;
+  for (let i = 0; i < list.length; i++) {
+    if (st.cancel) break;
+    scopeBtn.textContent = "Stop scope run (" + (i + 1) + "/" + list.length + ")";
+    const h = list[i];
+    const inp = $(cfg.targetInputId); if (inp) inp.value = (cfg.needsScheme === false) ? h : ("https://" + h);
+    const btn = $(cfg.runBtnId); if (btn) btn.click();
+    await scopeWaitFor(() => $(cfg.runBtnId).disabled, 5000);          // run started
+    await scopeWaitFor(() => !$(cfg.runBtnId).disabled, 30 * 60 * 1000); // run finished
+  }
+  st.busy = false; st.cancel = false;
+  scopeBtn.textContent = (hosts.length > CAP) ? ("Run on all in-scope (" + CAP + " of " + hosts.length + ")") : orig;
+}
+function attachScopeRunner(cfg) {
+  const runBtn = document.getElementById(cfg.runBtnId);
+  if (!runBtn || document.getElementById(cfg.runBtnId + "-scopeall")) return;
+  const b = document.createElement("button");
+  b.id = cfg.runBtnId + "-scopeall";
+  b.className = runBtn.className || "btn";
+  b.textContent = "Run on all in-scope";
+  b.title = "Run this module against every in-scope host from the project's Scope, one after another. Click again to stop.";
+  if (cfg.block) { b.style.width = "100%"; b.style.marginTop = "8px"; } else { b.style.marginLeft = "6px"; }
+  runBtn.insertAdjacentElement("afterend", b);
+  b.onclick = () => runOnAllScope(cfg, b);
+}
+try {
+  attachScopeRunner({ targetInputId: "h-target",   runBtnId: "h-run",    needsScheme: true,  block: true });
+  attachScopeRunner({ targetInputId: "pv-target",  runBtnId: "pv-run",   needsScheme: true,  block: true });
+  attachScopeRunner({ targetInputId: "sp-target",  runBtnId: "sp-run",   needsScheme: true,  block: true });
+  attachScopeRunner({ targetInputId: "nuc-target", runBtnId: "nuc-run",  needsScheme: true,  block: false });
+  attachScopeRunner({ targetInputId: "net-target", runBtnId: "net-scan", needsScheme: false, block: false });
+  attachScopeRunner({ targetInputId: "rc-target",  runBtnId: "rc-run",   needsScheme: false, block: false });
+} catch (e) { /* panes not present yet — harmless */ }
 
 // ── Scope: per-project list of in-scope hosts (Burp-style target scope) ──
 async function loadScopeFor(id) {
@@ -6183,6 +6415,7 @@ function reloadActiveModule() {
   else if (t === "browser") loadBrowserFor(p);
   else if (t === "http") loadHttpFor(p);
   else if (t === "passive") loadPassiveFor(p);
+  else if (t === "sparecon") loadSpaReconFor(p);
   else if (t === "sitemap") loadSitemapFor(p);
   else if (t === "repeater") loadRepeaterFor(p);
   else if (t === "autorepeater") loadAutoRepeaterFor(p);
@@ -17253,6 +17486,10 @@ class SuiteServer:
         # Passive site-map scan broker + stop-event per project.
         self.passive_brokers: Dict[str, _Broker] = {}
         self.passive_stops: Dict[str, threading.Event] = {}
+        # SPA / client-side recon broker + stop-event + last result per project.
+        self.spa_brokers: Dict[str, _Broker] = {}
+        self.spa_stops: Dict[str, threading.Event] = {}
+        self.spa_results: Dict[str, Dict[str, Any]] = {}
         # Manual-nuclei run broker + stop-event per project.
         self.nuclei_brokers: Dict[str, _Broker] = {}
         self.nuclei_stops: Dict[str, threading.Event] = {}
@@ -18483,6 +18720,216 @@ class SuiteServer:
         if s is not None:
             s.set()
         return {"ok": True}
+
+    # ── Client-side / SPA recon ──────────────────────────────────────────────
+    def spa_recon_catalog(self) -> Dict[str, Any]:
+        return {
+            "sources": [
+                {"id": "sourcemaps", "name": "Source maps",
+                 "desc": "Recover original sources from .map files + inline maps"},
+                {"id": "routes", "name": "Routes & endpoints",
+                 "desc": "Inventory fetch/axios/XHR and client-side router paths"},
+                {"id": "secrets", "name": "Secrets",
+                 "desc": "Run the shared secret-rules engine over recovered sources"},
+            ],
+        }
+
+    def start_spa_recon(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(project_id)
+        b = self.spa_brokers.get(key)
+        if b is not None and not b.since(10 ** 9)["done"]:
+            return {"ok": False, "error": "A SPA recon run is already in progress for this project."}
+        target = (payload.get("target") or "").strip()
+        use_sitemap = bool(payload.get("use_sitemap"))
+        if not target and not use_sitemap:
+            return {"ok": False, "error": "Enter a target URL (or enable 'use Site map hosts')."}
+        broker = _Broker(meta={"target": target})
+        stop = threading.Event()
+        self.spa_brokers[key] = broker
+        self.spa_stops[key] = stop
+        threading.Thread(target=self._run_spa_recon,
+                         args=(project_id, target, payload, broker, stop),
+                         daemon=True).start()
+        return {"ok": True}
+
+    def _run_spa_recon(self, project_id: Any, target: str, payload: Dict[str, Any],
+                       broker: "_Broker", stop: threading.Event) -> None:
+        import asyncio
+        import time as _time
+        from urllib.parse import urlparse as _url
+        from beatrix.scanners.spa_recon import SPAReconScanner
+        key = str(project_id)
+
+        def emit(text: str, typ: str = "log") -> None:
+            broker.emit({"type": typ, "text": text})
+
+        # Build the target list: the explicit target plus (optionally) distinct
+        # in-scope hosts already in the Site map.
+        targets: List[str] = []
+        if target:
+            targets.append(target)
+        if payload.get("use_sitemap"):
+            try:
+                hosts: List[str] = []
+                for r in self.http_history_store.list(project_id, scope_only=True, limit=100000).get("rows", []):
+                    h = r.get("host")
+                    if h and h not in hosts:
+                        hosts.append(h)
+                for h in hosts:
+                    u = "https://" + h
+                    if u not in targets:
+                        targets.append(u)
+            except Exception:  # noqa: BLE001
+                pass
+        targets = targets[:25]
+
+        # Hosts already observed live — powers the bundle-vs-live diff.
+        seen: set = set()
+        try:
+            for r in self.http_history_store.list(project_id, scope_only=False, limit=100000).get("rows", []):
+                h = r.get("host")
+                if h:
+                    seen.add(str(h).lower())
+        except Exception:  # noqa: BLE001
+            pass
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        agg: Dict[str, Any] = {"target": target, "bundles": [], "maps": [], "sources": [],
+                               "endpoints": [], "routes": [], "hosts": [], "secrets": [],
+                               "exposures": [], "findings": [], "unknowns": [], "stats": {}}
+        seen_ep: set = set()
+        findings_objs: list = []
+        try:
+            async def run_all() -> None:
+                cfg = {"rate_limit": 10, "timeout": 15}
+                async with SPAReconScanner(cfg) as s:
+                    for tgt in (targets or [target]):
+                        if stop.is_set():
+                            emit("stopped", "phase")
+                            break
+                        emit("recovering %s" % tgt, "phase")
+                        try:
+                            res = await s.recover(tgt, seen_hosts=seen)
+                        except Exception as ex:  # noqa: BLE001
+                            emit("  error on %s: %s" % (tgt, ex), "error")
+                            continue
+                        agg["bundles"].extend(res.bundles)
+                        agg["maps"].extend(res.maps)
+                        for rs in res.sources:
+                            agg["sources"].append({"path": rs.path, "third_party": rs.third_party,
+                                                   "has_content": rs.has_content, "map_url": rs.map_url})
+                        for e in res.endpoints:
+                            k = e.get("url") or e.get("raw")
+                            if k in seen_ep:
+                                continue
+                            seen_ep.add(k)
+                            agg["endpoints"].append({
+                                "url": e.get("url"), "raw": e.get("raw"), "kind": e.get("kind"),
+                                "method": e.get("method", "GET"), "source": e.get("source"),
+                                "line": e.get("line"),
+                                "claim": e["prov"].claim.label if e.get("prov") else ""})
+                        for r in res.routes:
+                            agg["routes"].append({"path": r["path"], "source": r.get("source"),
+                                                 "line": r.get("line"),
+                                                 "claim": r["prov"].claim.label if r.get("prov") else ""})
+                        agg["hosts"].extend(res.hosts)
+                        for sec in res.secrets:
+                            sev = sec["severity"]
+                            agg["secrets"].append({
+                                "secret_type": sec["secret_type"], "masked": sec["masked"],
+                                "severity": sev.value if hasattr(sev, "value") else str(sev),
+                                "source": sec.get("source"), "line": sec.get("line"),
+                                "claim": sec["prov"].claim.label if sec.get("prov") else ""})
+                        for ex in res.exposures:
+                            agg["exposures"].append({"kind": ex["kind"], "detail": ex.get("detail"),
+                                                    "source": ex.get("source"),
+                                                    "claim": ex["prov"].claim.label if ex.get("prov") else ""})
+                        agg["unknowns"].extend(res.unknowns)
+                        findings_objs.extend(res.findings)
+                        emit("  %d sources · %d endpoints · %d routes · %d secrets"
+                             % (len(res.sources), len(res.endpoints), len(res.routes), len(res.secrets)))
+            loop.run_until_complete(run_all())
+
+            # Feed discovered endpoints into the Site map (HTTP history store).
+            added = 0
+            for e in agg["endpoints"]:
+                url = e.get("url") or ""
+                if not url.startswith("http"):
+                    continue
+                host = _url(url).netloc
+                rec = {"method": e.get("method", "GET"), "url": url, "host": host,
+                       "path": _url(url).path or "/", "status": "", "mime": "", "length": 0,
+                       "ts": _time.time(), "in_scope": self._in_scope(project_id, host),
+                       "resource_type": "spa:" + (e.get("kind") or "endpoint")}
+                try:
+                    self.http_history_store.append(project_id, rec)
+                    added += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            # Feed findings into Issues.
+            fcount = 0
+            for f in findings_objs:
+                try:
+                    self.issues.add_finding(project_id, f, "spa_recon", "spa")
+                    fcount += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            # Serialize findings for the state endpoint (drop the live objects).
+            agg["findings"] = [{
+                "title": f.title,
+                "severity": f.severity.value if hasattr(f.severity, "value") else str(f.severity),
+                "confidence": f.confidence.value if hasattr(f.confidence, "value") else str(f.confidence),
+                "claim": (f.provenance or {}).get("claim", ""),
+                "description": f.description} for f in findings_objs]
+            agg["added"] = added
+            agg["issues"] = fcount
+            self.spa_results[key] = agg
+            broker.emit({"type": "done",
+                         "text": "%d endpoint(s) → Site map · %d finding(s) → Issues" % (added, fcount)})
+        except Exception as e:  # noqa: BLE001
+            broker.emit({"type": "error", "text": "SPA recon failed: %s" % e})
+            broker.emit({"type": "done", "text": "stopped"})
+        finally:
+            broker.finish()
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def spa_recon_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.spa_brokers.get(str(project_id))
+        if b is None:
+            return {"events": [], "done": True}
+        return b.since(int(since))
+
+    def spa_recon_state(self, project_id: Any) -> Dict[str, Any]:
+        return self.spa_results.get(str(project_id)) or {}
+
+    def stop_spa_recon(self, project_id: Any) -> Dict[str, Any]:
+        s = self.spa_stops.get(str(project_id))
+        if s is not None:
+            s.set()
+        return {"ok": True}
+
+    def spa_to_repeater(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from urllib.parse import urlparse as _url
+        url = (payload.get("url") or "").strip()
+        if not url:
+            return {"ok": False, "error": "no url"}
+        p = _url(url)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        method = (payload.get("method") or "GET").upper()
+        raw = ("%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: beatrix\r\nAccept: */*\r\n\r\n"
+               % (method, path, p.netloc))
+        try:
+            self.repeater.new(project_id, request=raw, target=url)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
 
     def _sitemap_seed_urls(self, project_id: Any, target: str,
                            scope_hosts: List[str]) -> List[str]:
@@ -19832,6 +20279,21 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.passive_events(since, proj))
+                elif path == "/sparecon/catalog":
+                    self._json(suite.spa_recon_catalog())
+                elif path == "/sparecon/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.spa_recon_events(since, proj))
+                elif path == "/sparecon/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.spa_recon_state(proj))
                 elif path == "/nuclei/env":
                     self._json(nuclei_runner.available())
                 elif path == "/nuclei/catalog":
@@ -20316,6 +20778,21 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.stop_passive(proj))
+                elif path == "/sparecon/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_spa_recon(proj, payload))
+                elif path == "/sparecon/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_spa_recon(proj))
+                elif path == "/sparecon/to_repeater":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.spa_to_repeater(proj, payload))
                 elif path == "/recon/import_nmap":
                     proj = payload.get("project")
                     if proj is None:

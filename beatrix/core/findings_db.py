@@ -33,7 +33,7 @@ class FindingsDB:
     queried, filtered, compared, and exported at any time.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -111,6 +111,12 @@ class FindingsDB:
             CREATE INDEX IF NOT EXISTS idx_findings_url ON findings(url);
             CREATE INDEX IF NOT EXISTS idx_hunts_target ON hunts(target);
         """)
+        # Additive migration (schema v2): provenance column for the evidence
+        # contract. Guarded so existing databases gain the column and old rows
+        # read back NULL — never a breaking change.
+        _cols = {row[1] for row in self.conn.execute("PRAGMA table_info(findings)").fetchall()}
+        if "provenance" not in _cols:
+            self.conn.execute("ALTER TABLE findings ADD COLUMN provenance TEXT")
         self.conn.commit()
 
     # ── Save ──────────────────────────────────────────────────────────────
@@ -161,6 +167,10 @@ class FindingsDB:
         elif evidence_str is None:
             evidence_str = ""
 
+        prov_str = f.provenance
+        if isinstance(prov_str, dict):
+            prov_str = json.dumps(prov_str)
+
         refs = json.dumps(f.references) if f.references else "[]"
         steps = json.dumps(f.reproduction_steps) if f.reproduction_steps else "[]"
 
@@ -175,8 +185,8 @@ class FindingsDB:
                 request, response, evidence,
                 description, impact, remediation,
                 refs, reproduction_steps, poc_curl, poc_python,
-                scanner_module, found_at, validated, reported
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                scanner_module, found_at, validated, reported, provenance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 hunt_id,
                 f.title,
@@ -204,6 +214,7 @@ class FindingsDB:
                 f.found_at.isoformat(),
                 int(f.validated),
                 int(f.reported),
+                prov_str,
             ),
         )
         return cursor.lastrowid
@@ -352,6 +363,10 @@ class FindingsDB:
                 )
             except (json.JSONDecodeError, TypeError):
                 f["reproduction_steps"] = []
+            try:
+                f["provenance"] = json.loads(f["provenance"]) if f.get("provenance") else None
+            except (json.JSONDecodeError, TypeError):
+                f["provenance"] = None
 
         return json.dumps(findings, indent=2, default=str)
 

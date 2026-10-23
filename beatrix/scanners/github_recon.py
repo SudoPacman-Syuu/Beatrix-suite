@@ -33,156 +33,19 @@ from beatrix.scanners.base import BaseScanner, ScanContext
 # SECRET PATTERNS — regex patterns for detecting leaked credentials
 # =============================================================================
 
-SECRET_PATTERNS: List[Tuple[str, str, Severity]] = [
-    # AWS
-    (r'AKIA[0-9A-Z]{16}', "AWS Access Key ID", Severity.CRITICAL),
-    (r'(?i)aws[_\-\.]?secret[_\-\.]?access[_\-\.]?key\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})', "AWS Secret Access Key", Severity.CRITICAL),
+from beatrix.scanners._secret_rules import (  # canonical secret rules (shared)
+    SECRET_PATTERNS,
+    ENTROPY_REQUIRED_TYPES,
+    MIN_SECRET_ENTROPY,
+    _shannon_entropy,
+    INTERESTING_FILES,
+    PLACEHOLDER_VALUES,
+    CI_TEST_CREDENTIALS,
+    DOCKER_SERVICE_HOSTS,
+    EXAMPLE_CONFIG_PATHS,
+    CI_TEST_PATHS,
+)
 
-    # Google
-    (r'AIza[0-9A-Za-z\-_]{35}', "Google API Key", Severity.HIGH),
-    (r'(?i)google[_\-\.]?api[_\-\.]?key\s*[=:]\s*["\']?([A-Za-z0-9\-_]{35,})', "Google API Key", Severity.HIGH),
-
-    # Generic API keys and tokens
-    (r'(?i)(?:api[_\-\.]?key|apikey|api_secret|api_token)\s*[=:]\s*["\']?([A-Za-z0-9\-_\.]{16,})["\']?', "API Key/Token", Severity.HIGH),
-    (r'(?i)(?:access[_\-\.]?token|auth[_\-\.]?token|bearer)\s*[=:]\s*["\']?([A-Za-z0-9\-_\.]{16,})["\']?', "Access/Auth Token", Severity.HIGH),
-
-    # JWT Secrets
-    (r'(?i)(?:jwt[_\-\.]?secret|jwt[_\-\.]?key|token[_\-\.]?secret)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?', "JWT Secret", Severity.HIGH),
-
-    # Database credentials
-    (r'(?i)(?:db|database|mysql|postgres|pgsql|mongo|redis)[_\-\.]?(?:pass|password|passwd|pwd)\s*[=:]\s*["\']?([^\s"\']{4,})["\']?', "Database Password", Severity.HIGH),
-    (r'(?i)mongodb(?:\+srv)?://[^\s"\']+:[^\s"\']+@[^\s"\']+', "MongoDB Connection String", Severity.CRITICAL),
-    (r'(?i)postgres(?:ql)?://[^\s"\']+:[^\s"\']+@[^\s"\']+', "PostgreSQL Connection String", Severity.CRITICAL),
-    (r'(?i)mysql://[^\s"\']+:[^\s"\']+@[^\s"\']+', "MySQL Connection String", Severity.CRITICAL),
-    (r'(?i)redis://[^\s"\']*:[^\s"\']+@[^\s"\']+', "Redis Connection String", Severity.HIGH),
-
-    # Private keys
-    (r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----', "Private Key", Severity.CRITICAL),
-    (r'-----BEGIN PGP PRIVATE KEY BLOCK-----', "PGP Private Key", Severity.CRITICAL),
-
-    # Generic passwords in config
-    (r'(?i)"password"\s*:\s*"([^"]{4,})"', "Password in JSON Config", Severity.HIGH),
-    (r'(?i)"secret"\s*:\s*"([^"]{4,})"', "Secret in JSON Config", Severity.HIGH),
-
-    # Encryption keys — require the value to look like an actual key (hex/base64), not code
-    (r'(?i)(?:aes|encryption|cipher)[_\-\.]?(?:key|secret)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,})["\']', "Encryption Key", Severity.CRITICAL),
-
-    # Slack/Discord webhooks
-    (r'https://hooks\.slack\.com/services/[A-Za-z0-9/]+', "Slack Webhook", Severity.MEDIUM),
-    (r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+', "Discord Webhook", Severity.MEDIUM),
-
-    # Stripe
-    (r'sk_live_[0-9a-zA-Z]{24,}', "Stripe Secret Key (Live)", Severity.CRITICAL),
-    (r'rk_live_[0-9a-zA-Z]{24,}', "Stripe Restricted Key (Live)", Severity.HIGH),
-
-    # Twilio
-    (r'SK[0-9a-fA-F]{32}', "Twilio API Key", Severity.HIGH),
-
-    # SendGrid
-    (r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}', "SendGrid API Key", Severity.HIGH),
-
-    # Heroku
-    (r'(?i)heroku[_\-\.]?api[_\-\.]?key\s*[=:]\s*["\']?([0-9a-f\-]{36})["\']?', "Heroku API Key", Severity.HIGH),
-
-    # GitHub tokens
-    (r'gh[pousr]_[A-Za-z0-9_]{36,}', "GitHub Token", Severity.CRITICAL),
-
-    # Generic high-entropy strings in key positions
-    (r'(?i)(?:secret|token|key|password|passwd|pwd|apikey|api_key|auth)\s*[=:]\s*["\']([A-Za-z0-9@#$%^&*!]{12,})["\']', "Hardcoded Secret", Severity.MEDIUM),
-]
-
-# Patterns whose matched VALUE requires high entropy to be a real secret.
-# Structural patterns (AWS key prefix, private key header, connection strings)
-# are always valid regardless of entropy.
-ENTROPY_REQUIRED_TYPES = {
-    "API Key/Token", "Access/Auth Token", "JWT Secret",
-    "Database Password", "Password in JSON Config", "Secret in JSON Config",
-    "Hardcoded Secret", "Encryption Key", "Heroku API Key",
-}
-
-# Minimum Shannon entropy (bits/char) for generic secret values.
-# Real secrets (hex, base64, random): 3.5-6.0
-# English words: 2.0-3.2
-# Repeated chars: <2.0
-MIN_SECRET_ENTROPY = 3.2
-
-
-def _shannon_entropy(s: str) -> float:
-    """Calculate Shannon entropy in bits per character."""
-    if not s:
-        return 0.0
-    length = len(s)
-    freq: Dict[str, int] = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
-    return -sum((count / length) * math.log2(count / length) for count in freq.values())
-
-# Files that commonly contain secrets
-INTERESTING_FILES = [
-    ".env", ".env.production", ".env.staging", ".env.local", ".env.development",
-    "config/production.json", "config/staging.json", "config/default.json",
-    "config/database.yml", "config/secrets.yml", "config/credentials.yml",
-    "appsettings.json", "appsettings.Production.json",
-    "application.properties", "application.yml", "application-prod.yml",
-    "docker-compose.yml", "docker-compose.prod.yml",
-    "Dockerfile", ".dockerenv",
-    "wp-config.php", "settings.py", "local_settings.py",
-    "firebase.json", ".firebaserc",
-    "serverless.yml", "terraform.tfvars", "terraform.tfstate",
-    ".npmrc", ".pypirc", ".gem/credentials",
-    "id_rsa", "id_ecdsa", "id_ed25519",
-    ".htpasswd", ".pgpass", ".my.cnf", ".netrc",
-]
-
-# Generic placeholder values to IGNORE (reduce false positives)
-PLACEHOLDER_VALUES = {
-    "supersecret", "supersecret!!!!!", "your-secret-here", "changeme",
-    "password", "admin", "secret", "test", "example", "placeholder",
-    "your-api-key", "your_api_key", "xxx", "TODO", "CHANGEME",
-    "replace-me", "insert-here", "your-token", "put-your-key-here",
-    "12345678", "abcdefgh", "qwerty", "password123",
-    # Common dev/example passwords that pass entropy checks
-    "passw0rd", "p@ssw0rd", "p@ssword", "p@ssword1", "password1",
-    "devpasswd", "rootpassword", "mysecretpassword", "letmein",
-    "some_random_secret_key", "some-random-secret-key",
-    "my-secret-key", "my_secret_key", "secretkey", "secret_key",
-    "testpassword", "development", "production",
-}
-
-# Common CI/test default credentials — always false positives
-CI_TEST_CREDENTIALS = {
-    "root", "root:root", "postgres", "postgres:postgres",
-    "mysql", "mysql:mysql", "redis", "redis:redis",
-    "testuser", "testpass", "testpassword", "test123",
-    "sa", "localdb", "devpassword", "devuser",
-    "db_password", "db_user", "database",
-    "passw0rd", "p@ssw0rd", "password1", "admin123",
-}
-
-# Docker/container service hostnames — connection strings to these are local dev only
-DOCKER_SERVICE_HOSTS = {
-    "mysql", "postgres", "postgresql", "redis", "mongo", "mongodb",
-    "elasticsearch", "rabbitmq", "memcached", "mariadb", "mssql",
-    "db", "database", "cache", "queue", "broker",
-    "localhost", "127.0.0.1", "0.0.0.0", "::1",
-    "host.docker.internal", "docker.internal",
-}
-
-# File paths that indicate example/demo/template context (always FP for secrets)
-EXAMPLE_CONFIG_PATHS = {
-    "example", "sample", "template", "demo", "quickstart",
-    "bundled", "skeleton", "boilerplate", "starter",
-    "getting-started", "getting_started", "tutorial",
-    "containers/", "docker/", "docker-compose",
-}
-
-# File paths that indicate CI/test context (findings here are almost always FP)
-CI_TEST_PATHS = {
-    ".github/", "github/actions/", ".circleci/", ".travis.yml",
-    "Jenkinsfile", ".gitlab-ci", "docker-compose.test",
-    "docker-compose.ci", "test/", "tests/", "spec/",
-    "fixtures/", "__tests__/", "e2e/",
-}
 
 
 @dataclass

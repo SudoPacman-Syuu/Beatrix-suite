@@ -81,6 +81,7 @@ class ReportReadinessGate:
         checks.append(self._check_impact_statement(finding))
         checks.append(self._check_poc_exists(finding))
         checks.append(self._check_evidence_concrete(finding))
+        checks.append(self._check_provenance_unknowns(finding))
         checks.append(self._check_no_theoretical_language(finding))
         checks.append(self._check_severity_justified(finding))
         checks.append(self._check_remediation(finding))
@@ -113,6 +114,29 @@ class ReportReadinessGate:
     # ====================================================================
     # CHECKS
     # ====================================================================
+
+    def _check_provenance_unknowns(self, finding: Finding) -> ReadinessCheck:
+        """Rule: an UNKNOWN is never silently treated as clean/absent.
+
+        If the finding carries an evidence-provenance record (see
+        beatrix.core.provenance) whose core claim is UNKNOWN — or whose
+        unresolved unknowns lack direct observation/derivation evidence — it
+        is not report-ready until resolved. Findings with no provenance pass
+        unchanged (fully backward compatible)."""
+        from beatrix.core.provenance import readiness
+        ok, reasons = readiness(getattr(finding, "provenance", None))
+        if ok:
+            return ReadinessCheck(
+                name="provenance_unknowns",
+                passed=True,
+                reason="No undetermined claims (or no provenance record).",
+            )
+        return ReadinessCheck(
+            name="provenance_unknowns",
+            passed=False,
+            reason="Undetermined claim(s): " + "; ".join(reasons),
+            required=True,
+        )
 
     def _check_title_quality(self, finding: Finding) -> ReadinessCheck:
         """Title must be specific and professional."""

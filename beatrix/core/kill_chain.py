@@ -674,6 +674,151 @@ class KillChainExecutor:
             merged["context"].update(r.get("context", {}))
         return merged
 
+    async def _recon_live_surface(self, domain: str, context: Dict[str, Any],
+                                  results: List[Dict[str, Any]]) -> None:
+        """Phase-1 live-surface chain: dnsx → naabu → httpx → (gowitness / s3scanner).
+
+        Each link feeds the next and writes APPEND-ONLY keys into ``context`` that
+        downstream phases already consume (``discovered_urls``, ``technologies``,
+        ``live_hosts``…). Every tool is optional and self-guards, so a missing
+        link degrades the chain instead of breaking it. Scope + CDN filtering and
+        the engine rate limit are applied before any packet leaves.
+        """
+        import fnmatch
+        tk = self.toolkit
+        rl = getattr(getattr(self.engine, "config", None), "rate_limit", 10) or 10
+        deep = not context.get("modules")  # full scan (no explicit module subset)
+        _CDN = ("cloudflare", "cloudfront", "akamai", "fastly", "edgekey", "edgesuite",
+                "azureedge", "incapdns", "cdn.", "b-cdn.", "edgecastcdn")
+        scope_pats = [str(p).lower() for p in (context.get("scope") or [f"*.{domain}", domain])]
+        deny_pats = [str(p).lower() for p in (context.get("scope_deny") or [])]
+
+        def _in_scope(host):
+            h = (host or "").lower().split(":")[0].rstrip(".")
+            if not h:
+                return False
+            if any(fnmatch.fnmatch(h, d) or h == d for d in deny_pats):
+                return False
+            return h == domain or any(fnmatch.fnmatch(h, p) or h == p for p in scope_pats)
+
+        # ── 1) dnsx: resolve in-scope hosts → live hosts, IPs, CNAMEs ─────────
+        hosts = sorted({h for h in (context.get("subdomains", []) + [domain]) if _in_scope(h)})
+        resolved_ips, cdn_hosts = set(), set()
+        if tk.dnsx.available and hosts:
+            try:
+                self._emit("info", message=f"dnsx: resolving {len(hosts)} in-scope host(s)")
+                recs = await tk.dnsx.resolve(hosts[:500], extra_flags=["-rl", str(rl * 10)])
+                context["resolved_hosts"] = recs
+                context["live_subdomains"] = [r["host"] for r in recs if r.get("a") or r.get("aaaa")]
+                context["cname_map"] = {r["host"]: r["cname"] for r in recs if r.get("cname")}
+                for r in recs:
+                    cn = " ".join(r.get("cname", [])).lower()
+                    if cn and any(m in cn for m in _CDN):
+                        cdn_hosts.add(r["host"])
+                    else:
+                        resolved_ips.update(r.get("a", []) + r.get("aaaa", []))
+                self._emit("info", message=f"dnsx: {len(context['live_subdomains'])} live, {len(resolved_ips)} IP(s)")
+            except Exception as e:
+                self._emit("scanner_error", scanner="dnsx", error=str(e))
+        live_subs = context.get("live_subdomains") or list(hosts)
+
+        # ── 2) naabu: fast port scan of resolved IPs (skip CDN edges) ─────────
+        hostports = []
+        scan_hosts = sorted(resolved_ips) or [h for h in live_subs if h not in cdn_hosts] or [domain]
+        if tk.naabu.available and scan_hosts:
+            try:
+                self._emit("info", message=f"naabu: scanning {len(scan_hosts)} target(s)")
+                if deep:
+                    ports = await tk.naabu.scan(scan_hosts[:255], top_ports=100,
+                                                extra_flags=["-rate", str(rl * 20)])
+                else:
+                    ports = await tk.naabu.scan(scan_hosts[:255],
+                                                ports="80,443,8080,8443,8000,3000,5000",
+                                                extra_flags=["-rate", str(rl * 20)])
+                context["port_scan"] = ports
+                hostports = [f'{p.get("host") or p.get("ip")}:{p["port"]}' for p in ports if p.get("port")]
+                self._emit("info", message=f"naabu: {len(ports)} open port(s)")
+            except Exception as e:
+                self._emit("scanner_error", scanner="naabu", error=str(e))
+
+        # ── 3) httpx: probe host:port + live subs → the Site-map feed ─────────
+        probe = []
+        for t in (hostports + [h for h in live_subs if h not in cdn_hosts] + [domain]):
+            if t and t not in probe:
+                probe.append(t)
+        if tk.httpx.available and probe:
+            try:
+                self._emit("info", message=f"httpx: probing {len(probe)} target(s)")
+                liveh = await tk.httpx.probe(probe[:500], extra_flags=["-rate-limit", str(rl)])
+                context["live_hosts"] = liveh
+                urls = [r["url"] for r in liveh if r.get("url")]
+                du = context.setdefault("discovered_urls", [])
+                for u in urls:
+                    if u not in du:
+                        du.append(u)
+                context["live_subdomain_urls"] = urls
+                try:
+                    techs = [t for r in liveh for t in (r.get("tech") or [])]
+                    if techs:
+                        td = context.get("technologies")
+                        td = td if isinstance(td, dict) else {}
+                        _merge_technologies(td, {t: "" for t in techs})
+                        context["technologies"] = td
+                except Exception:
+                    pass
+                context["httpx_cdn"] = next((r.get("cdn_name") for r in liveh if r.get("cdn")), "")
+                # E4: seed the crawler with live subdomain URLs when it has no seeds
+                if urls and not context.get("seed_urls"):
+                    context["seed_urls"] = urls
+                self._emit("info", message=f"httpx: {len(urls)} live URL(s) → Site map")
+            except Exception as e:
+                self._emit("scanner_error", scanner="httpx", error=str(e))
+
+        # ── 4) gowitness: screenshots of live URLs (full scans only) ──────────
+        if deep and tk.gowitness.available and context.get("live_hosts"):
+            try:
+                shot_urls = [r["url"] for r in context["live_hosts"] if r.get("url")][:50]
+                out_dir = None
+                if self.output_manager is not None:
+                    try:
+                        out_dir = str(self.output_manager._phase_dir(1) / "screenshots")
+                    except Exception:
+                        out_dir = None
+                shots = await tk.gowitness.screenshot(shot_urls, out_dir=out_dir)
+                context["screenshots"] = shots.get("screenshots", [])
+                if context["screenshots"]:
+                    self._emit("info", message=f"gowitness: {len(context['screenshots'])} screenshot(s)")
+            except Exception as e:
+                self._emit("scanner_error", scanner="gowitness", error=str(e))
+
+        # ── 5) s3scanner: bucket candidates from domain + subdomains ──────────
+        if tk.s3scanner.available:
+            try:
+                label = domain.split(".")[0]
+                affixes = ["", "-assets", "-static", "-media", "-uploads", "-backup", "-backups",
+                           "-dev", "-staging", "-prod", "-cdn", "-data", "-files", "-public", "-logs"]
+                cand = [f"{label}{a}" for a in affixes] + [f"{a.strip('-')}-{label}" for a in affixes if a]
+                cand += [s.split(".")[0] for s in context.get("subdomains", [])]
+                cand = list(dict.fromkeys(c for c in cand if c))[:50]
+                buckets = await tk.s3scanner.scan(cand)
+                context["buckets"] = buckets
+                from beatrix.core.types import Confidence, Finding, Severity
+                bf = []
+                for b in buckets:
+                    if b.get("public") or b.get("exists"):
+                        bf.append(Finding(
+                            title="Cloud storage bucket " + ("publicly accessible" if b.get("public") else "exists"),
+                            severity=Severity.HIGH if b.get("public") else Severity.INFO,
+                            confidence=Confidence.FIRM, url=domain,
+                            description=b.get("line", ""), scanner_module="s3scanner"))
+                if bf:
+                    results.append({"findings": bf, "assets": [], "context": {},
+                                    "modules": ["s3scanner"], "requests": 0})
+                    self._emit("info", message=f"s3scanner: {len(bf)} bucket finding(s)")
+            except Exception as e:
+                self._emit("scanner_error", scanner="s3scanner", error=str(e))
+
+
     async def _handle_recon(self, target: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Phase 1 — Reconnaissance: Subdomain enum → Crawl → Port scan → Analyze.
@@ -741,6 +886,13 @@ class KillChainExecutor:
                 self.output_manager.write_context_snapshot("subdomains", {"subdomains": context["subdomains"]}, phase=1)
             except Exception:
                 pass
+
+        # ── Step 0b: Live-surface chain (dnsx → naabu → httpx → gowitness/s3) ─
+        if run_deep_recon:
+            try:
+                await self._recon_live_surface(domain, context, results)
+            except Exception as e:
+                self._emit("scanner_error", scanner="recon_live_surface", error=str(e))
 
         # ── Step 1: Crawl the target ──────────────────────────────────────────
         crawler = self.engine.modules.get("crawl")
@@ -1306,22 +1458,34 @@ class KillChainExecutor:
 
                 # 1a: Full TCP SYN scan — all 65535 ports
                 scan_label = f"{scan_target} (origin IP)" if scan_target != domain else domain
-                self._emit("info", message=f"Network Phase 1a: Full TCP SYN scan on {scan_label} (all 65535 ports)")
-                full_scan = await nmap_scanner.full_tcp_scan(scan_target, timeout=600)
-
                 open_port_nums = []
                 filtered_port_nums = []
                 open_port_details = []
 
-                if full_scan and full_scan.hosts:
-                    for host in full_scan.hosts:
-                        for port in host.ports:
-                            if port.state.value == "open":
-                                svc = f" ({port.service})" if port.service else ""
-                                open_port_details.append(f"{port.port}/{port.protocol}{svc}")
-                                open_port_nums.append(port.port)
-                            elif port.state.value == "filtered":
-                                filtered_port_nums.append(port.port)
+                # E2: reuse naabu's fast port scan when it already found open ports
+                # for this exact host — skip the slow full 65535-port nmap sweep and
+                # feed the discovered ports straight to the service/version scan.
+                _naabu_ports = sorted({
+                    int(p["port"]) for p in context.get("port_scan", [])
+                    if p.get("port") and scan_target in (p.get("host"), p.get("ip"))
+                })
+                if _naabu_ports:
+                    self._emit("info", message=f"Network Phase 1a: reusing {len(_naabu_ports)} naabu port(s) on {scan_label} — skipping full sweep")
+                    open_port_nums = list(_naabu_ports)
+                    open_port_details = [f"{p}/tcp" for p in _naabu_ports]
+                    full_scan = None
+                else:
+                    self._emit("info", message=f"Network Phase 1a: Full TCP SYN scan on {scan_label} (all 65535 ports)")
+                    full_scan = await nmap_scanner.full_tcp_scan(scan_target, timeout=600)
+                    if full_scan and full_scan.hosts:
+                        for host in full_scan.hosts:
+                            for port in host.ports:
+                                if port.state.value == "open":
+                                    svc = f" ({port.service})" if port.service else ""
+                                    open_port_details.append(f"{port.port}/{port.protocol}{svc}")
+                                    open_port_nums.append(port.port)
+                                elif port.state.value == "filtered":
+                                    filtered_port_nums.append(port.port)
 
                 context["open_ports"] = open_port_details  # Legacy compat
                 context["network"]["filtered_ports"] = filtered_port_nums
@@ -1384,6 +1548,19 @@ class KillChainExecutor:
                                 })
 
                     context["network"]["open_ports"] = enriched_ports
+                    # E3: ensure naabu-discovered web ports feed exploitation's
+                    # extra_http_urls even if service detection didn't name them.
+                    _WEB = {80: "http", 8080: "http", 8000: "http", 3000: "http", 5000: "http", 8880: "http",
+                            443: "https", 8443: "https", 2053: "https", 2083: "https", 2087: "https", 2096: "https"}
+                    for _p in context.get("port_scan", []):
+                        try:
+                            _pn = int(_p.get("port"))
+                        except (TypeError, ValueError):
+                            continue
+                        if scan_target in (_p.get("host"), _p.get("ip")) and _pn in _WEB:
+                            _k = _WEB[_pn]
+                            if _pn not in services_map.get(_k, []):
+                                services_map.setdefault(_k, []).append(_pn)
                     context["network"]["services"] = services_map
                     self._emit("info", message=f"Phase 1b: Services detected: {', '.join(f'{k}:{v}' for k, v in services_map.items())}")
 
@@ -3123,8 +3300,47 @@ class KillChainExecutor:
                     "prototype_pollution", discovered_with_params[:15], context)
             return await self._run_scanner("prototype_pollution", url, context)
 
+        async def _waf():
+            tk = self.toolkit
+            if not tk.wafw00f.available:
+                return {"findings": [], "assets": [], "context": {}, "modules": [], "requests": 0}
+            from urllib.parse import urlparse as _wp
+            from beatrix.core.types import Confidence, Finding, Severity
+            targets, seen = [], set()
+            for u in ([url] + [r.get("url") for r in context.get("live_hosts", []) if r.get("url")]):
+                if not u:
+                    continue
+                k = _wp(u).netloc.lower()
+                if k and k not in seen:
+                    seen.add(k)
+                    targets.append(u)
+                if len(targets) >= 10:
+                    break
+            waf_list = []
+            for u in targets:
+                try:
+                    for d in await tk.wafw00f.detect(u):
+                        if d.get("detected"):
+                            waf_list.append(d)
+                except Exception as e:
+                    self._emit("scanner_error", scanner="wafw00f", error=str(e))
+            findings = []
+            if waf_list:
+                fw = waf_list[0].get("firewall") or "WAF"
+                net = context.setdefault("network", {})
+                net.setdefault("waf_profile", fw)
+                if not net.get("cdn_detected"):
+                    net["cdn_detected"] = fw
+                context["waf"] = waf_list
+                findings.append(Finding(
+                    title=f"WAF / reverse-proxy detected: {fw}",
+                    severity=Severity.INFO, confidence=Confidence.FIRM, url=url,
+                    description=f"wafw00f identified {fw} on {len(waf_list)} host(s); scanners encode payloads accordingly.",
+                    scanner_module="wafw00f"))
+            return {"findings": findings, "assets": [], "context": {}, "modules": ["wafw00f"], "requests": len(targets)}
+
         results = await asyncio.gather(
-            _takeover(), _error_disclosure(), _cache_poisoning(), _proto_pollution(),
+            _takeover(), _error_disclosure(), _cache_poisoning(), _proto_pollution(), _waf(),
             return_exceptions=True,
         )
         # Filter out exceptions (already logged by _run_scanner)
@@ -4247,6 +4463,38 @@ class KillChainExecutor:
         # File upload — extension bypass, polyglot uploads, path traversal in filenames
         results.append(await self._run_scanner("file_upload", url, context))
 
+        # REA — reverse-engineer any binary artifacts captured during recon
+        # (APK/JAR/EXE/WASM URLs). Opt-in via the `rea` binary; emits
+        # provenance-tagged findings. No-op on a pure web hunt.
+        try:
+            _rtk = self.toolkit
+            if _rtk.rea.available:
+                _bin_exts = (".apk", ".jar", ".exe", ".dll", ".so", ".wasm", ".ipa", ".dex", ".bin", ".elf")
+                _artifacts = [u for u in context.get("discovered_urls", [])
+                              if isinstance(u, str) and u.lower().split("?")[0].endswith(_bin_exts)]
+                if _artifacts:
+                    from beatrix.core.external_tools import RealReaRunner
+                    from beatrix.core.types import Confidence, Finding, Severity
+                    _rea_findings = []
+                    for _art in _artifacts[:5]:
+                        _res = await _rtk.rea.analyze(_art)
+                        _claims = _res if isinstance(_res, list) else ([_res] if isinstance(_res, dict) else [])
+                        for _c in _claims[:20]:
+                            if not isinstance(_c, dict):
+                                continue
+                            _rea_findings.append(Finding(
+                                title="REA: " + str(_c.get("title") or _c.get("summary") or "artifact analysis"),
+                                severity=Severity.INFO, confidence=Confidence.TENTATIVE, url=_art,
+                                description=str(_c.get("description") or _c.get("raw") or "")[:2000],
+                                scanner_module="rea",
+                                provenance=RealReaRunner.to_provenance(_c)))
+                    if _rea_findings:
+                        results.append({"findings": _rea_findings, "assets": [], "context": {},
+                                        "modules": ["rea"], "requests": 0})
+                        self._emit("info", message=f"REA analyzed {len(_artifacts)} artifact(s) → {len(_rea_findings)} finding(s)")
+        except Exception as e:
+            self._emit("scanner_error", scanner="rea", error=str(e))
+
         return await self._merge_scanner_results(results)
 
     async def _handle_c2(self, target: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -4577,6 +4825,25 @@ class KillChainExecutor:
             pass
         except Exception as e:
             self._emit("scanner_error", scanner="poc_chain_engine", error=str(e))
+
+        # notify — push a run summary to the configured channel (Slack/Discord/
+        # webhook) when the hunt finishes. A pure sink; no-op without a channel.
+        try:
+            _ntk = self.toolkit
+            if _ntk.notify.available:
+                _allf = context.get("all_findings", [])
+                _sev = {}
+                for _f in _allf:
+                    _s = getattr(getattr(_f, "severity", None), "value", None) or "info"
+                    _sev[_s] = _sev.get(_s, 0) + 1
+                if _allf:
+                    _order = ["critical", "high", "medium", "low", "info"]
+                    _summary = "Beatrix hunt complete on %s — %d finding(s): %s" % (
+                        target, len(_allf), ", ".join("%d %s" % (_sev[k], k) for k in _order if _sev.get(k)))
+                    await _ntk.notify.send(_summary)
+                    self._emit("info", message="notify: run summary sent")
+        except Exception as e:
+            self._emit("scanner_error", scanner="notify", error=str(e))
 
         return await self._merge_scanner_results(results) if results else {
             "findings": [], "assets": [], "context": {}, "modules": ["validate"], "requests": 0

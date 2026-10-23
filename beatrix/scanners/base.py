@@ -1104,6 +1104,7 @@ class BaseScanner(ABC):
         parameter: Optional[str] = None,
         payload: Optional[str] = None,
         cwe_id: Optional[str] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> Finding:
         """Helper to create a Finding with scanner metadata and all fields"""
         # Central capture net: if the scanner didn't pass the actual request/
@@ -1148,6 +1149,7 @@ class BaseScanner(ABC):
             owasp_category=self.owasp_category,
             mitre_technique=self.mitre_technique,
             found_at=datetime.now(),
+            provenance=provenance,
         )
 
     # =========================================================================

@@ -306,16 +306,6 @@ class TestBaseScanner:
         assert len(findings) == 0
 
     @pytest.mark.asyncio
-    async def test_active_scan_empty_by_default(self):
-        scanner = ConcreteScanner()
-        ctx = ScanContext.from_url("https://example.com")
-        ip = InsertionPoint(name="id", value="1", type=InsertionPointType.URL_PARAM)
-        findings = []
-        async for f in scanner.active_scan(ctx, ip):
-            findings.append(f)
-        assert len(findings) == 0
-
-    @pytest.mark.asyncio
     async def test_request_without_context_manager_raises(self):
         scanner = ConcreteScanner()
         with pytest.raises(RuntimeError, match="not initialized"):

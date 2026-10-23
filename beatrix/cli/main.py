@@ -537,6 +537,12 @@ MODULE_REFERENCE = {
         "description": "Extracts API routes, secrets, internal hostnames from JavaScript bundles",
         "payloads": "Regex pattern matching, entropy analysis for secrets",
     },
+    "spa_recon": {
+        "name": "SPA Recon",
+        "category": "Reconnaissance",
+        "description": "Recovers sourcemapped sources, routes, endpoints & secrets from client-side JS",
+        "payloads": "Source map recovery + route/endpoint inventory + shared secret rules",
+    },
     "headers": {
         "name": "Header Security Scanner",
         "category": "A02: Cryptographic Failures",
@@ -901,6 +907,22 @@ def arsenal(ctx):
         ("commix", "Automated command injection exploitation"),
         ("jwt_tool", "JSON Web Token manipulation and vulnerability testing"),
         ("msfconsole", "Metasploit Framework for advanced exploitation and post-exploitation"),
+        ("naabu", "Fast SYN/CONNECT port scanning that feeds httpx/nmap"),
+        ("dnsx", "Fast DNS resolution and record probing (A/AAAA/CNAME)"),
+        ("gowitness", "Bulk web screenshots for visual triage"),
+        ("trufflehog", "Verified secret scanning across filesystems and git history"),
+        ("s3scanner", "Cloud storage bucket enumeration and permission checks"),
+        ("wafw00f", "WAF / reverse-proxy fingerprinting"),
+        ("interactsh-client", "Public multi-protocol OAST callback catcher (DNS/HTTP/SMTP)"),
+        ("notify", "Push findings to Slack/Discord/Telegram/webhook"),
+        ("wpscan", "WordPress vulnerability scanning"),
+        ("rea", "Reverse-engineer binaries/APKs/firmware/JS (Installation stage)"),
+        ("tlsx", "TLS certificate inspection, SAN harvest, JARM fingerprint"),
+        ("crlfuzz", "CRLF injection / HTTP response-splitting detection"),
+        ("nomore403", "403/401 forbidden-bypass techniques"),
+        ("clairvoyance", "GraphQL schema reconstruction (introspection-disabled APIs)"),
+        ("kr", "kiterunner — API endpoint/route content discovery"),
+        ("waymore", "Historical URL discovery (Wayback / Common Crawl / etc.)"),
     ]
     venv_bin = Path(sys.executable).parent
     for tool_name, purpose in tools:
@@ -1062,6 +1084,9 @@ def setup_cmd(ctx, check):
         "nmap", "adb", "mitmproxy", "playwright", "amass", "whatweb",
         "webanalyze", "gospider", "hakrawler", "gau", "dirsearch",
         "dalfox", "commix", "jwt_tool", "msfconsole",
+        "naabu", "dnsx", "gowitness", "trufflehog", "s3scanner", "wafw00f",
+        "interactsh-client", "notify", "wpscan", "rea", "tlsx", "crlfuzz",
+        "nomore403", "clairvoyance", "kr", "waymore",
     ]
 
     if check:
@@ -1125,6 +1150,131 @@ def setup_cmd(ctx, check):
     except FileNotFoundError:
         console.print("[red]✗ bash not found.[/red]")
         raise SystemExit(1)
+
+
+def _find_repo_root():
+    """Locate the git checkout Beatrix runs from (for `beatrix update`)."""
+    import subprocess
+    pkg_dir = Path(__file__).resolve().parent.parent  # beatrix/
+    candidates = [pkg_dir.parent]                     # repo root candidate
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(pkg_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            candidates.insert(0, Path(r.stdout.strip()))
+    except Exception:
+        pass
+    for path in candidates:
+        if (path / ".git").exists():
+            return path
+    return None
+
+
+@cli.command("update")
+@click.option("--stash", is_flag=True, help="Stash local changes before updating, then restore them")
+@click.option("--no-deps", is_flag=True, help="Pull code only; skip the dependency refresh")
+def update_cmd(stash, no_deps):
+    """
+    Update Beatrix to the latest version from GitHub.
+
+    \b
+    Pulls the newest code into your git checkout and refreshes dependencies in
+    the ~/.beatrix environment — WITHOUT touching your data (findings, config,
+    sessions, auth). Also available as the standalone `beatrix-update` command.
+    """
+    import os
+    import re
+    import subprocess
+    import sys as _sys
+
+    root = _find_repo_root()
+    if root is None:
+        console.print("[red]✗ Beatrix isn't a git checkout here, so it can't self-update.[/red]")
+        console.print("[dim]Re-run the installer to get the latest release.[/dim]")
+        raise SystemExit(1)
+
+    def _git(*args, timeout=120):
+        return subprocess.run(["git", "-C", str(root), *args],
+                              capture_output=True, text=True, timeout=timeout)
+
+    console.print(f"[dim]Updating checkout at {root}[/dim]")
+    branch = (_git("rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip() or "main"
+    try:
+        from beatrix import __version__ as old_version
+    except Exception:
+        old_version = "?"
+
+    console.print(f"[bright_yellow]Fetching origin/{branch}…[/bright_yellow]")
+    fetched = _git("fetch", "origin", branch)
+    if fetched.returncode != 0:
+        console.print("[red]✗ Could not reach GitHub (offline?).[/red]")
+        console.print(f"[dim]{(fetched.stderr or '').strip()[:300]}[/dim]")
+        raise SystemExit(1)
+
+    dirty = (_git("status", "--porcelain").stdout or "").strip()
+    stashed = False
+    if dirty:
+        if stash:
+            console.print("[bright_yellow]Stashing local changes…[/bright_yellow]")
+            if _git("stash", "push", "-u", "-m", "beatrix-update").returncode == 0:
+                stashed = True
+            else:
+                console.print("[red]✗ Could not stash local changes; aborting.[/red]")
+                raise SystemExit(1)
+        else:
+            console.print("[red]✗ You have uncommitted local changes — not updating.[/red]")
+            console.print("[dim]Commit/stash them, or run [bold]beatrix update --stash[/bold] "
+                          "to set them aside and restore after.[/dim]")
+            console.print(f"[dim]{dirty[:500]}[/dim]")
+            raise SystemExit(1)
+
+    console.print(f"[bright_yellow]Pulling origin/{branch} (fast-forward only)…[/bright_yellow]")
+    pulled = _git("pull", "--ff-only", "origin", branch)
+    if pulled.returncode != 0:
+        console.print("[red]✗ Update failed — your branch has diverged from origin.[/red]")
+        console.print(f"[dim]{(pulled.stderr or '').strip()[:300]}[/dim]")
+        console.print("[dim]Resolve manually (e.g. [bold]git pull --rebase[/bold]).[/dim]")
+        if stashed:
+            _git("stash", "pop")
+        raise SystemExit(1)
+    last = (pulled.stdout or "").strip().splitlines()
+    console.print(f"[green]✓[/green] {last[-1] if last else 'Updated.'}")
+
+    if stashed:
+        console.print("[bright_yellow]Restoring your stashed changes…[/bright_yellow]")
+        if _git("stash", "pop").returncode != 0:
+            console.print("[yellow]⚠ Could not auto-restore; your changes are safe in `git stash list`.[/yellow]")
+
+    if not no_deps:
+        venv_py = Path.home() / ".beatrix" / "bin" / "python"
+        py = str(venv_py) if venv_py.exists() else _sys.executable
+        console.print("[bright_yellow]Refreshing dependencies…[/bright_yellow]")
+        dep = subprocess.run([py, "-m", "pip", "install", "--upgrade", "--quiet", f"{root}[extended]"],
+                             capture_output=True, text=True)
+        if dep.returncode != 0:
+            dep = subprocess.run([py, "-m", "pip", "install", "--upgrade", "--quiet", str(root)],
+                                 capture_output=True, text=True)
+        if dep.returncode == 0:
+            console.print("[green]✓[/green] Dependencies up to date.")
+        else:
+            console.print(f"[yellow]⚠ Dependency refresh had issues:[/yellow] [dim]{(dep.stderr or '').strip()[:300]}[/dim]")
+
+    new_version = old_version
+    try:
+        m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']',
+                      (root / "beatrix" / "__init__.py").read_text())
+        if m:
+            new_version = m.group(1)
+    except Exception:
+        pass
+    if new_version != old_version:
+        console.print(f"[bold green]✓ Updated Beatrix {old_version} → {new_version}[/bold green]")
+    else:
+        console.print(f"[bold green]✓ Beatrix is up to date ({new_version}).[/bold green]")
+    console.print("[dim]Restart any running beatrix-suite to load the new code.[/dim]")
+
 
 
 # =============================================================================

@@ -263,6 +263,10 @@ exec \"$venv_python\" -W ignore::RuntimeWarning -m beatrix.cli.main \"\$@\"
         "$header
 exec \"$venv_python\" -W ignore::RuntimeWarning -m beatrix.cli.main suite \"\$@\"
 "
+    _put_wrapper "$INSTALL_DIR/beatrix-update" \
+        "$header
+exec \"$venv_python\" -W ignore::RuntimeWarning -m beatrix.cli.main update \"\$@\"
+"
 }
 
 # ── Wrapper for pip --user / editable installs (no venv) ─────
@@ -302,6 +306,10 @@ exec \"$py_exe\" -W ignore::RuntimeWarning -m beatrix.cli.main \"\$@\"
     _put_wrapper "$INSTALL_DIR/beatrix-suite" \
         "$header
 exec \"$py_exe\" -W ignore::RuntimeWarning -m beatrix.cli.main suite \"\$@\"
+"
+    _put_wrapper "$INSTALL_DIR/beatrix-update" \
+        "$header
+exec \"$py_exe\" -W ignore::RuntimeWarning -m beatrix.cli.main update \"\$@\"
 "
 }
 
@@ -422,7 +430,7 @@ install_external_tools() {
     local installed=0
     local failed=0
     local skipped=0
-    local total=21
+    local total=32
 
     detect_pkg_manager
     info "Detected package manager: ${BOLD}${PKG_MGR}${RESET}"
@@ -545,9 +553,16 @@ install_external_tools() {
             [gau]="github.com/lc/gau/v2/cmd/gau@latest"
             [dalfox]="github.com/hahwul/dalfox/v2@latest"
             [amass]="github.com/owasp-amass/amass/v4/...@master"
+            [naabu]="github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+            [dnsx]="github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+            [tlsx]="github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+            [gowitness]="github.com/sensepost/gowitness@latest"
+            [interactsh-client]="github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest"
+            [notify]="github.com/projectdiscovery/notify/cmd/notify@latest"
+            [trufflehog]="github.com/trufflesecurity/trufflehog/v3@latest"
         )
 
-        for tool in nuclei httpx subfinder ffuf katana gospider hakrawler gau dalfox amass; do
+        for tool in nuclei httpx subfinder ffuf katana gospider hakrawler gau dalfox amass naabu dnsx tlsx gowitness interactsh-client notify trufflehog; do
             # httpx: the Python httpx pip package installs a CLI shim that
             # shadows ProjectDiscovery's Go httpx. Detect this by checking
             # if the found binary is a compiled Go executable vs a Python script.
@@ -703,6 +718,59 @@ WRAPPER
             warn "Failed to install dirsearch"
             ((failed++))
         fi
+    fi
+
+    # ── New recon / scan tooling (pip) ────────────────────
+    for tool in wafw00f s3scanner; do
+        if command_exists "$tool"; then
+            success "$tool (already installed)"
+            ((skipped++))
+        else
+            info "Installing $tool..."
+            if $PIP_CMD "$tool" &>/dev/null; then
+                success "$tool"
+                ((installed++))
+            else
+                warn "Failed to install $tool"
+                ((failed++))
+            fi
+        fi
+    done
+
+    # wpscan (Ruby gem) — WordPress vulnerability scanner
+    if command_exists wpscan; then
+        success "wpscan (already installed)"
+        ((skipped++))
+    elif command_exists gem; then
+        info "Installing wpscan (gem)..."
+        if gem install wpscan &>/dev/null || sudo gem install wpscan &>/dev/null; then
+            success "wpscan"
+            ((installed++))
+        else
+            warn "Failed to install wpscan"
+            ((failed++))
+        fi
+    else
+        warn "wpscan skipped (Ruby/gem not available)"
+        ((failed++))
+    fi
+
+    # rea — REA "Reverse Engineer Anything" (npm; upstream package only)
+    if command_exists rea; then
+        success "rea (already installed)"
+        ((skipped++))
+    elif command_exists npm; then
+        info "Installing rea (npm rea-agents)..."
+        if npm install -g rea-agents &>/dev/null || sudo npm install -g rea-agents &>/dev/null; then
+            success "rea"
+            ((installed++))
+        else
+            warn "Failed to install rea"
+            ((failed++))
+        fi
+    else
+        warn "rea skipped (npm not available)"
+        ((failed++))
     fi
 
     # ── 4. Playwright (browser automation) ───────────────
@@ -862,7 +930,7 @@ check_optional_tools() {
     echo ""
     echo -e "${BOLD}External tools status:${RESET}"
 
-    local tools=("nuclei" "httpx" "subfinder" "ffuf" "katana" "sqlmap" "nmap" "adb" "mitmproxy" "playwright" "amass" "whatweb" "webanalyze" "gospider" "hakrawler" "gau" "dirsearch" "dalfox" "commix" "jwt_tool" "msfconsole" "arjun" "clairvoyance")
+    local tools=("nuclei" "httpx" "subfinder" "ffuf" "katana" "sqlmap" "nmap" "adb" "mitmproxy" "playwright" "amass" "whatweb" "webanalyze" "gospider" "hakrawler" "gau" "dirsearch" "dalfox" "commix" "jwt_tool" "msfconsole" "arjun" "clairvoyance" "naabu" "dnsx" "tlsx" "gowitness" "interactsh-client" "notify" "trufflehog" "wafw00f" "s3scanner" "wpscan" "rea")
     local found=0
     local total=${#tools[@]}
 

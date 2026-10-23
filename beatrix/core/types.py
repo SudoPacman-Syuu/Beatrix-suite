@@ -235,6 +235,10 @@ class Finding:
     validated: bool = False
     reported: bool = False
 
+    # Evidence-provenance record (see beatrix.core.provenance). Optional and
+    # additive: findings without it behave exactly as before.
+    provenance: Optional[Dict[str, Any]] = None
+
     def __str__(self) -> str:
         return f"[{self.severity.value.upper()}] {self.title} @ {self.url}"
 

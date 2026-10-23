@@ -2462,3 +2462,18 @@ def test_oast_unknown_uid_still_recorded(server):
 def test_oast_base_override(server):
     _post(server, "/oast/base", {"base": "https://pub.example.com/"})
     assert json.loads(_get(server, "/oast/state")[1])["base"] == "https://pub.example.com"  # trailing slash stripped
+
+
+# ── SPA Recon module (client-side / source-map recon) ────────────────────
+def test_spa_recon_catalog(server):
+    code, body = _get(server, "/sparecon/catalog")
+    assert code == 200
+    data = json.loads(body)
+    assert "sources" in data and len(data["sources"]) >= 1
+
+
+def test_spa_recon_run_requires_target(server):
+    pid = server.projects.state().get("active")
+    code, data = _post(server, "/sparecon/run",
+                       {"project": pid, "target": "", "use_sitemap": False})
+    assert code == 200 and data.get("ok") is False

@@ -1825,6 +1825,607 @@ class TlsxRunner(ExternalTool):
         return result
 
 
+class HttpxRunner(ExternalTool):
+    """httpx (ProjectDiscovery) — fast multi-purpose HTTP prober.
+
+    Probes a list of hosts/URLs and reports, per live endpoint: status code,
+    page title, web server, detected technologies, content length, redirect
+    location, TLS details and CDN attribution. This is the backbone that turns
+    a raw host/port list (subfinder, naabu, a Site map) into a triaged,
+    fingerprinted surface.
+
+    NAME COLLISION (handled): the Python ``httpx`` HTTP-client library also
+    ships a console script named ``httpx`` that does a SINGLE request and has a
+    completely different CLI. ``_find_binary`` therefore verifies the binary is
+    actually ProjectDiscovery httpx (via ``-version``) and ignores the Python
+    one, so ``available`` is only True for the real tool.
+
+    Install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+    """
+
+    BINARY_NAME = "httpx"
+    DEFAULT_PHASE = 1
+    COMMON_PATHS = [str(Path.home() / "go" / "bin" / "httpx")]
+
+    # Cache the PD-vs-python verdict per path across instantiations (ExternalToolkit
+    # is built often; we only want to spawn the `-version` probe once per path).
+    _pd_cache: Dict[str, bool] = {}
+
+    def _find_binary(self) -> Optional[str]:
+        # Prefer go/bin (where PD httpx installs); check .local/bin LAST because
+        # that is where the colliding Python httpx CLI typically lives.
+        candidates: List[str] = []
+        for c in [
+            str(Path.home() / "go" / "bin" / "httpx"),
+            "/usr/local/bin/httpx",
+            "/usr/bin/httpx",
+            shutil.which(self.BINARY_NAME),
+            str(Path.home() / ".local" / "bin" / "httpx"),
+        ]:
+            if c and Path(c).exists() and c not in candidates:
+                candidates.append(c)
+        for c in candidates:
+            verdict = self._pd_cache.get(c)
+            if verdict is None:
+                verdict = self._is_projectdiscovery(c)
+                self._pd_cache[c] = verdict
+            if verdict:
+                return c
+        return None
+
+    @staticmethod
+    def _is_projectdiscovery(path: str) -> bool:
+        """True only if `path -version` looks like ProjectDiscovery httpx."""
+        import subprocess
+        try:
+            r = subprocess.run([path, "-version"], capture_output=True,
+                               text=True, timeout=6)
+            blob = ((r.stdout or "") + (r.stderr or "")).lower()
+            return "projectdiscovery" in blob or "httpx version" in blob
+        except Exception:
+            return False
+
+    async def probe(
+        self,
+        targets,
+        *,
+        timeout: int = 180,
+        extra_flags: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Probe one target (str) or many (list). Returns one dict per live host."""
+        if not self.available:
+            return []
+        if isinstance(targets, str):
+            targets = [targets]
+        targets = [t.strip() for t in targets if t and str(t).strip()]
+        if not targets:
+            return []
+        cmd = [
+            self.path, "-json", "-silent", "-no-color",
+            "-status-code", "-title", "-tech-detect", "-web-server",
+            "-content-length", "-location", "-tls-grab", "-cdn",
+            "-follow-redirects", "-timeout", "10",
+        ]
+        if extra_flags:
+            cmd += list(extra_flags)
+        output = await self._run(cmd, stdin="\n".join(targets), timeout=timeout) or ""
+        return self._parse(output)
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            def pick(*keys, default=None):
+                for k in keys:
+                    if k in o and o[k] not in (None, ""):
+                        return o[k]
+                return default
+
+            tech = pick("tech", "technologies", default=[]) or []
+            if isinstance(tech, str):
+                tech = [tech]
+            results.append({
+                "url": pick("url", "input", default=""),
+                "input": pick("input", default=""),
+                "host": pick("host", default=""),
+                "status_code": pick("status_code", "status-code"),
+                "title": pick("title", default=""),
+                "webserver": pick("webserver", "web_server", "web-server", default=""),
+                "tech": tech,
+                "content_length": pick("content_length", "content-length"),
+                "location": pick("location", default=""),
+                "cdn": bool(pick("cdn", default=False)),
+                "cdn_name": pick("cdn_name", "cdn-name", default=""),
+                "tls": pick("tls", "tls_grab", default={}) or {},
+                "raw": line,
+            })
+        return results
+
+
+class NaabuRunner(ExternalTool):
+    """naabu (ProjectDiscovery) — fast SYN/CONNECT port scanner.
+
+    Turns a host list into open host:port pairs to hand to httpx/nmap for the
+    deep pass. Install: go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+    """
+
+    BINARY_NAME = "naabu"
+    DEFAULT_PHASE = 1
+
+    async def scan(self, targets, *, ports=None, top_ports=None,
+                   timeout: int = 300, extra_flags=None) -> List[Dict[str, Any]]:
+        if not self.available:
+            return []
+        if isinstance(targets, str):
+            targets = [targets]
+        targets = [t.strip() for t in targets if t and str(t).strip()]
+        if not targets:
+            return []
+        cmd = [self.path, "-json", "-silent", "-no-color"]
+        if ports:
+            cmd += ["-p", ports if isinstance(ports, str) else ",".join(map(str, ports))]
+        elif top_ports:
+            cmd += ["-top-ports", str(top_ports)]
+        if extra_flags:
+            cmd += list(extra_flags)
+        out = await self._run(cmd, stdin="\n".join(targets), timeout=timeout) or ""
+        return self._parse(out)
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        res = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            res.append({"host": o.get("host", ""), "ip": o.get("ip", ""),
+                        "port": o.get("port"), "protocol": o.get("protocol", "tcp")})
+        return res
+
+
+class DnsxRunner(ExternalTool):
+    """dnsx (ProjectDiscovery) — fast DNS resolver/toolkit (A/AAAA/CNAME, brute).
+
+    Replaces the capped pure-Python resolver for high-throughput resolution.
+    Install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+    """
+
+    BINARY_NAME = "dnsx"
+    DEFAULT_PHASE = 1
+
+    async def resolve(self, hosts, *, timeout: int = 180, extra_flags=None) -> List[Dict[str, Any]]:
+        if not self.available:
+            return []
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        hosts = [h.strip() for h in hosts if h and str(h).strip()]
+        if not hosts:
+            return []
+        cmd = [self.path, "-json", "-silent", "-no-color", "-a", "-aaaa", "-cname", "-resp"]
+        if extra_flags:
+            cmd += list(extra_flags)
+        out = await self._run(cmd, stdin="\n".join(hosts), timeout=timeout) or ""
+        return self._parse(out)
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        res = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            res.append({"host": o.get("host", ""), "a": o.get("a", []) or [],
+                        "aaaa": o.get("aaaa", []) or [], "cname": o.get("cname", []) or [],
+                        "status_code": o.get("status_code", "")})
+        return res
+
+
+class TrufflehogRunner(ExternalTool):
+    """trufflehog (v3) — leaked-secret scanner over filesystem, git, GitHub, etc.
+
+    Complements the regex-based secret rules with a verified-secret engine.
+    Install: see github.com/trufflesecurity/trufflehog
+    """
+
+    BINARY_NAME = "trufflehog"
+    DEFAULT_PHASE = 1
+
+    async def scan_filesystem(self, path: str, *, only_verified: bool = False, timeout: int = 300):
+        return await self._scan(["filesystem", path], only_verified=only_verified, timeout=timeout)
+
+    async def scan_git(self, repo: str, *, only_verified: bool = False, timeout: int = 300):
+        return await self._scan(["git", repo], only_verified=only_verified, timeout=timeout)
+
+    async def _scan(self, source_args, *, only_verified: bool = False, timeout: int = 300):
+        if not self.available:
+            return []
+        cmd = [self.path, *source_args, "--json", "--no-update"]
+        if only_verified:
+            cmd.append("--only-verified")
+        out = await self._run(cmd, timeout=timeout) or ""
+        return self._parse(out)
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        res = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if "DetectorName" not in o and "SourceMetadata" not in o:
+                continue  # skip trufflehog's JSON log lines
+            res.append({"detector": o.get("DetectorName", ""),
+                        "type": o.get("DetectorType", ""),
+                        "verified": bool(o.get("Verified", False)),
+                        "redacted": o.get("Redacted", ""),
+                        "source": o.get("SourceName", "") or (o.get("SourceMetadata") or {}),
+                        "raw": line[:2000]})
+        return res
+
+
+class GowitnessRunner(ExternalTool):
+    """gowitness — bulk web screenshots for visual triage.
+
+    The CLI differs across versions; we run it against a URL list and collect the
+    PNGs it writes. (beatrix can also screenshot in-process via Playwright.)
+    Install: go install github.com/sensepost/gowitness@latest
+    """
+
+    BINARY_NAME = "gowitness"
+    DEFAULT_PHASE = 1
+
+    async def screenshot(self, urls, *, out_dir: Optional[str] = None, timeout: int = 600) -> Dict[str, Any]:
+        if not self.available:
+            return {"screenshots": [], "out_dir": out_dir}
+        import tempfile
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [u.strip() for u in urls if u and str(u).strip()]
+        if not urls:
+            return {"screenshots": [], "out_dir": out_dir}
+        out_dir = out_dir or tempfile.mkdtemp(prefix="gowitness_")
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        listfile = Path(out_dir) / "_targets.txt"
+        listfile.write_text("\n".join(urls))
+        for cmd in (
+            [self.path, "scan", "file", "--file", str(listfile), "--screenshot-path", out_dir, "--write-db=false"],
+            [self.path, "file", "-f", str(listfile), "--destination", out_dir, "--disable-db"],
+            [self.path, "file", "-f", str(listfile), "-P", out_dir],
+        ):
+            await self._run(cmd, timeout=timeout)
+            if self._collect_pngs(out_dir):
+                break
+        return {"screenshots": self._collect_pngs(out_dir), "out_dir": out_dir}
+
+    @staticmethod
+    def _collect_pngs(out_dir: str) -> List[str]:
+        try:
+            return sorted(str(p) for p in Path(out_dir).rglob("*.png"))
+        except Exception:
+            return []
+
+
+class S3ScannerRunner(ExternalTool):
+    """s3scanner — enumerate and check permissions on open cloud storage buckets.
+
+    Output format varies by version, so the parse is best-effort line matching.
+    Install: see github.com/sa7mon/S3Scanner
+    """
+
+    BINARY_NAME = "s3scanner"
+    DEFAULT_PHASE = 1
+
+    async def scan(self, buckets, *, timeout: int = 300, extra_flags=None) -> List[Dict[str, Any]]:
+        if not self.available:
+            return []
+        if isinstance(buckets, str):
+            buckets = [buckets]
+        buckets = [b.strip() for b in buckets if b and str(b).strip()]
+        if not buckets:
+            return []
+        import tempfile
+        f = Path(tempfile.mkdtemp()) / "buckets.txt"
+        f.write_text("\n".join(buckets))
+        out = await self._run([self.path, "scan", "-bucket-file", str(f)], timeout=timeout)
+        if out is None:
+            out = await self._run([self.path, "-bucket-file", str(f)], timeout=timeout) or ""
+        return self._parse(out or "")
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        res = []
+        for line in (output or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if any(k in low for k in ("exists", "public", "open", "permission")) or "| " in s:
+                res.append({"line": s,
+                            "public": any(k in low for k in ("public", "open", "read", "write")),
+                            "exists": any(k in low for k in ("exists", "found", "public"))})
+        return res
+
+
+class Wafw00fRunner(ExternalTool):
+    """wafw00f — WAF / reverse-proxy fingerprinting (the Weaponization stage
+    advertises this). Install: pip install wafw00f
+    """
+
+    BINARY_NAME = "wafw00f"
+    DEFAULT_PHASE = 2
+
+    async def detect(self, url: str, *, timeout: int = 60, find_all: bool = True) -> List[Dict[str, Any]]:
+        if not self.available:
+            return []
+        cmd = [self.path, url, "-f", "json", "-o", "-"]
+        if find_all:
+            cmd.append("-a")
+        out = await self._run(cmd, timeout=timeout) or ""
+        return self._parse(out)
+
+    def _parse(self, output: str) -> List[Dict[str, Any]]:
+        text = output or ""
+        dec = json.JSONDecoder()
+        data = None
+        for i, ch in enumerate(text):
+            if ch in "[{":
+                try:
+                    data, _ = dec.raw_decode(text[i:])
+                    break
+                except ValueError:
+                    continue
+        if data is None:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        res = []
+        for o in data:
+            if not isinstance(o, dict):
+                continue
+            res.append({"url": o.get("url", ""), "detected": bool(o.get("detected", False)),
+                        "firewall": o.get("firewall", "") or "", "manufacturer": o.get("manufacturer", "") or ""})
+        return res
+
+
+class InteractshRunner(ExternalTool):
+    """interactsh-client — public multi-protocol OAST (DNS/HTTP/SMTP) callback
+    catcher; a public alternative to the suite's self-hosted collaborator.
+    Install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+    """
+
+    BINARY_NAME = "interactsh-client"
+    DEFAULT_PHASE = 2
+
+    async def session(self, *, duration: int = 30) -> Dict[str, Any]:
+        """Register a session, listen for `duration` seconds, return payload URL + interactions."""
+        if not self.available:
+            return {"payload_url": "", "interactions": []}
+        import asyncio as _a
+        try:
+            proc = await _a.create_subprocess_exec(
+                self.path, "-json", "-v",
+                stdout=_a.subprocess.PIPE, stderr=_a.subprocess.STDOUT)
+        except Exception:
+            return {"payload_url": "", "interactions": []}
+        lines: List[str] = []
+
+        async def _read():
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                lines.append(raw.decode("utf-8", "replace").rstrip())
+        try:
+            await _a.wait_for(_read(), timeout=duration)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return self._parse_session(lines)
+
+    @staticmethod
+    def _parse_session(lines) -> Dict[str, Any]:
+        import re as _re
+        payload = ""
+        interactions = []
+        oast = _re.compile(
+            r'\b([a-z0-9]{8,}\.(?:oast\.(?:pro|live|site|online|fun|me)|interact\.sh|interactsh\.com))\b', _re.I)
+        for ln in lines or []:
+            s = str(ln).strip()
+            if s.startswith("{"):
+                try:
+                    o = json.loads(s)
+                    if o.get("protocol"):
+                        interactions.append({
+                            "protocol": o.get("protocol"),
+                            "unique_id": o.get("unique-id") or o.get("unique_id", ""),
+                            "remote_address": o.get("remote-address") or o.get("remote_address", ""),
+                            "timestamp": o.get("timestamp", "")})
+                        continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if not payload:
+                m = oast.search(s)
+                if m:
+                    payload = m.group(1)
+        return {"payload_url": payload, "interactions": interactions}
+
+
+class NotifyRunner(ExternalTool):
+    """notify (ProjectDiscovery) — push findings to Slack/Discord/Telegram/webhook.
+    Reads provider-config.yaml. Install: go install github.com/projectdiscovery/notify/cmd/notify@latest
+    """
+
+    BINARY_NAME = "notify"
+    DEFAULT_PHASE = 7
+
+    async def send(self, message: str, *, provider_config: Optional[str] = None,
+                   provider: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
+        if not self.available:
+            return {"sent": False, "reason": "notify not installed"}
+        cmd = [self.path, "-silent"]
+        if provider_config:
+            cmd += ["-provider-config", provider_config]
+        if provider:
+            cmd += ["-provider", provider]
+        out = await self._run(cmd, stdin=str(message), timeout=timeout)
+        return {"sent": out is not None, "output": out or ""}
+
+
+class WpscanRunner(ExternalTool):
+    """wpscan — WordPress vulnerability scanner. Full vuln data needs a free
+    WPScan API token (--api-token); enumeration works without one.
+    Install: gem install wpscan
+    """
+
+    BINARY_NAME = "wpscan"
+    DEFAULT_PHASE = 4
+
+    async def scan(self, url: str, *, api_token: Optional[str] = None,
+                   enumerate: str = "vp,vt,u", timeout: int = 600) -> Dict[str, Any]:
+        if not self.available:
+            return {}
+        cmd = [self.path, "--url", url, "--format", "json", "--no-banner",
+               "--random-user-agent", "--enumerate", enumerate]
+        if api_token:
+            cmd += ["--api-token", api_token]
+        out = await self._run(cmd, timeout=timeout)
+        return self._parse(out or "")
+
+    def _parse(self, output: str) -> Dict[str, Any]:
+        text = (output or "").strip()
+        start = text.find("{")
+        if start == -1:
+            return {}
+        try:
+            o = json.loads(text[start:])
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        version = (o.get("version") or {})
+        plugins = o.get("plugins") or {}
+        plugin_vulns = sum(len((p or {}).get("vulnerabilities") or []) for p in plugins.values())
+        version_vulns = len(version.get("vulnerabilities") or [])
+        return {
+            "url": o.get("target_url", "") or o.get("url", ""),
+            "wp_version": version.get("number", ""),
+            "version_vulns": version_vulns,
+            "plugins": list(plugins.keys()),
+            "plugin_vulns": plugin_vulns,
+            "total_vulns": plugin_vulns + version_vulns,
+            "interesting_findings": [f.get("to_s", "") for f in (o.get("interesting_findings") or [])],
+            "users": list((o.get("users") or {}).keys()),
+        }
+
+
+
+class RealReaRunner(ExternalTool):
+    """REA ("Reverse Engineer Anything") — wraps the real ``rea`` CLI to reverse
+    engineer captured artifacts: native binaries, APKs, JS/Electron bundles,
+    firmware, pcaps. This is what populates the kill chain's Installation stage
+    with a binary-analysis capability the suite otherwise lacks.
+
+    It maps REA's own evidence-provenance output onto beatrix's Provenance
+    contract (observation / derivation / inference / unknown) via
+    :meth:`to_provenance`, so RE findings carry the same epistemic record as
+    every other scanner.
+
+    SECURITY: install ONLY from upstream — github.com/morluto/rea or the npm
+    package ``rea-agents``. Impostor/malware clones of REA circulate (a fake
+    "REA.exe"); a similar repo name or copied README does not make a build
+    official. This wrapper never auto-downloads; it only runs a ``rea`` binary
+    already on PATH, so nothing is fetched implicitly.
+    """
+
+    BINARY_NAME = "rea"
+    DEFAULT_PHASE = 5  # Installation
+
+    async def analyze(self, target: str, *, command: str = "analyze",
+                      json_out: bool = True, timeout: int = 600, extra=None):
+        """Run a REA command against *target*. Returns parsed JSON (object or
+        list of line-objects) or {"raw": <text>}; {} when REA is unavailable."""
+        if not self.available:
+            return {}
+        cmd = [self.path, command, target]
+        if json_out:
+            cmd.append("--json")
+        if extra:
+            cmd += list(extra)
+        out = await self._run(cmd, timeout=timeout)
+        if out is None:
+            return {}
+        return self._parse(out)
+
+    def _parse(self, output: str):
+        text = (output or "").strip()
+        if not text:
+            return {}
+        # whole-document JSON first
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # else JSON-lines
+        objs = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    objs.append(json.loads(line))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return objs if objs else {"raw": text}
+
+    @staticmethod
+    def to_provenance(rea_claim) -> Dict[str, Any]:
+        """Map one REA claim dict onto a beatrix Provenance dict.
+
+        REA tags each conclusion observation / derivation / inference / unknown
+        and carries its evidence + limitations; we translate that 1:1 so a
+        decompiled string becomes an OBSERVATION, a resolved call target a
+        DERIVATION, a heuristic guess an INFERENCE, and an undetermined fact an
+        explicit UNKNOWN (never silently clean)."""
+        from beatrix.core.provenance import Provenance
+        c = rea_claim or {}
+        kind = str(c.get("claim") or c.get("type") or "inference").lower()
+        method = str(c.get("method") or c.get("tool") or "rea")
+        if kind == "unknown":
+            return Provenance.unknown(str(c.get("what") or "rea: undetermined"),
+                                      method=method).to_dict()
+        ctor = {"observation": Provenance.observation,
+                "derivation": Provenance.derivation,
+                "inference": Provenance.inference}.get(kind, Provenance.inference)
+        ev = c.get("evidence") or {}
+        if isinstance(ev, list):
+            ev = ev[0] if ev else {}
+        return ctor(
+            method,
+            source=str(ev.get("source") or c.get("source") or ""),
+            locator=str(ev.get("locator") or ""),
+            literal=str(ev.get("literal") or ""),
+            limitations=list(c.get("limitations") or []),
+            confidence_basis=str(c.get("confidence_basis") or ""),
+        ).to_dict()
+
+
 # =============================================================================
 # CONVENIENCE: ALL TOOLS
 # =============================================================================
@@ -1855,6 +2456,17 @@ class ExternalToolkit:
         self.nomore403 = Nomore403Runner()
         self.crlfuzz = CrlfuzzRunner()
         self.tlsx = TlsxRunner()
+        self.httpx = HttpxRunner()
+        self.naabu = NaabuRunner()
+        self.dnsx = DnsxRunner()
+        self.trufflehog = TrufflehogRunner()
+        self.gowitness = GowitnessRunner()
+        self.s3scanner = S3ScannerRunner()
+        self.wafw00f = Wafw00fRunner()
+        self.interactsh = InteractshRunner()
+        self.notify = NotifyRunner()
+        self.wpscan = WpscanRunner()
+        self.rea = RealReaRunner()
         self.sqlmap = SqlmapRunner(timeout=300)
         self.dalfox = DalfoxRunner()
         self.commix = CommixRunner()
@@ -1879,6 +2491,17 @@ class ExternalToolkit:
             "nomore403": self.nomore403.available,
             "crlfuzz": self.crlfuzz.available,
             "tlsx": self.tlsx.available,
+            "httpx": self.httpx.available,
+            "naabu": self.naabu.available,
+            "dnsx": self.dnsx.available,
+            "trufflehog": self.trufflehog.available,
+            "gowitness": self.gowitness.available,
+            "s3scanner": self.s3scanner.available,
+            "wafw00f": self.wafw00f.available,
+            "interactsh": self.interactsh.available,
+            "notify": self.notify.available,
+            "wpscan": self.wpscan.available,
+            "rea": self.rea.available,
             "sqlmap": self.sqlmap.available,
             "dalfox": self.dalfox.available,
             "commix": self.commix.available,
