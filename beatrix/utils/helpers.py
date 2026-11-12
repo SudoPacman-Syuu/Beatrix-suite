@@ -2,7 +2,10 @@
 
 import asyncio
 import ipaddress
-from typing import List, Optional
+import subprocess
+import threading
+import time
+from typing import Callable, List, Optional
 
 # Handle optional imports gracefully
 try:
@@ -84,6 +87,18 @@ def extract_domain(target: str) -> str:
     return target
 
 
+def in_domain(host: str, domain: str) -> bool:
+    """True if ``host`` is ``domain`` itself or a subdomain of it.
+
+    Use this, not ``host.endswith(domain)``: the bare suffix test also accepts unrelated
+    lookalike domains ("m.testexample.com", "evilexample.com" for "example.com"), which
+    recon then treated as in scope and actively probed. Case- and trailing-dot-insensitive.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    d = (domain or "").strip().lower().rstrip(".")
+    return bool(h and d) and (h == d or h.endswith("." + d))
+
+
 def is_ip_address(target: str) -> bool:
     """
     Check if a target string is an IP address (v4 or v6).
@@ -99,3 +114,45 @@ def is_ip_address(target: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def kill_on_stop(proc: "subprocess.Popen", stop_event: Optional[threading.Event] = None,
+                 deadline: Optional[float] = None, on_deadline: Optional[Callable[[], None]] = None,
+                 poll: float = 0.25) -> threading.Thread:
+    """Terminate ``proc`` as soon as ``stop_event`` is set or ``deadline`` (a ``time.time()``
+    value) passes, independently of its output.
+
+    Runners used to check Stop (and their timeout) only between output lines, so a quiet
+    process (no findings, no -v) ignored both until it exited on its own; for a slow nmap
+    that can be hours. SIGTERM first, then SIGKILL if it hasn't exited within 5 s.
+    """
+    def watch() -> None:
+        while proc.poll() is None:
+            if stop_event is not None:
+                fired = stop_event.wait(poll)
+            else:
+                time.sleep(poll)
+                fired = False
+            late = deadline is not None and time.time() > deadline
+            if not (fired or late) or proc.poll() is not None:
+                continue
+            if late and not fired and on_deadline is not None:
+                try:
+                    on_deadline()
+                except Exception:  # noqa: BLE001 — a callback must never keep the process alive
+                    pass
+            try:
+                proc.terminate()
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+            return
+
+    t = threading.Thread(target=watch, daemon=True, name="kill-on-stop")
+    t.start()
+    return t

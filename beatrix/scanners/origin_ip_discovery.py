@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 
+from beatrix.utils.helpers import in_domain
+
 # CDN/WAF IP ranges (partial - for detection)
 CLOUDFLARE_IP_RANGES = [
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -764,7 +766,7 @@ class OriginIPDiscovery:
                             ip = (rec.get('address') or '').strip()
                             host = (rec.get('hostname') or '').lower().rstrip('.')
                             if (self._is_valid_ip(ip) and ':' not in ip and ip not in seen
-                                    and host.endswith(domain) and not self._is_cdn_ip(ip)):
+                                    and in_domain(host, domain) and not self._is_cdn_ip(ip)):
                                 seen.add(ip)
                                 tp = self._is_third_party_subdomain(host, domain)
                                 result['ips'].append({'ip': ip, 'source': f'OTX passive-DNS ({host})',
@@ -790,7 +792,7 @@ class OriginIPDiscovery:
                             if len(parts) == 2:
                                 host, ip = parts[0].strip().lower(), parts[1].strip()
                                 if (self._is_valid_ip(ip) and ip not in seen
-                                        and host.endswith(domain) and not self._is_cdn_ip(ip)):
+                                        and in_domain(host, domain) and not self._is_cdn_ip(ip)):
                                     seen.add(ip)
                                     tp = self._is_third_party_subdomain(host, domain)
                                     result['ips'].append({'ip': ip, 'source': f'HackerTarget ({host})',
@@ -814,7 +816,7 @@ class OriginIPDiscovery:
                             ip = (page.get('ip') or '').strip()
                             pd = (page.get('domain') or '').lower()
                             if (self._is_valid_ip(ip) and ':' not in ip and ip not in seen
-                                    and pd.endswith(domain) and not self._is_cdn_ip(ip)):
+                                    and in_domain(pd, domain) and not self._is_cdn_ip(ip)):
                                 seen.add(ip)
                                 result['ips'].append({'ip': ip, 'source': f'urlscan.io ({pd})',
                                                       'confidence': 0.5})

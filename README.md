@@ -83,9 +83,25 @@ detail — real captured HTTP, not reconstructed guesses. Send one, or a whole s
 git clone https://github.com/SudoPacman-Syuu/Beatrix-suite.git && cd Beatrix-suite && ./install.sh
 ```
 
-The installer auto-detects your Python, puts `beatrix`, `beatrix-suite`, and `beatrix-update` on your `PATH`,
-and installs the core external tools (nuclei, nmap, sqlmap, subfinder, ffuf, and others). Remove it with
-`./uninstall.sh`.
+The installer creates a Python environment in `~/.beatrix/venv` (your checkout is installed editable, so
+`beatrix-update` takes effect immediately), puts `beatrix`, `beatrix-suite`, and `beatrix-update` on your
+`PATH`, installs the external tools (nuclei, nmap, sqlmap, subfinder, ffuf, kiterunner, trufflehog, and
+the rest), and finishes with a check of everything it set up — it exits non-zero if a required part is
+missing. Your data in `~/.beatrix` (findings, sessions, config, keys) is never touched.
+
+Optional extras:
+
+```bash
+./install.sh --with-sudo-rules   # packet capture + raw-socket nmap without a password prompt (root-equivalent)
+./install.sh --with-docker       # Docker + the GHOST v2 sandbox image
+./install.sh --with-android      # Android SDK + emulator for the mobile interceptor
+```
+
+Repair or add tools later with `beatrix setup`; remove Beatrix with `./uninstall.sh` (it asks before
+deleting your data).
+
+`beatrix-suite` prints a link containing an access token (also stored in `~/.beatrix/suite.token`); open
+that link — the Suite's API refuses requests without the token. `beatrix-suite --new-token` replaces it.
 
 ## Quick start
 

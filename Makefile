@@ -1,20 +1,20 @@
 # ═══════════════════════════════════════════════════════════
-#  BEATRIX CLI — The Black Mamba
+#  BEATRIX — The Black Mamba
 #  Makefile for install/uninstall/dev
 # ═══════════════════════════════════════════════════════════
 
-PYTHON   ?= python3
-VENV_DIR ?= $(HOME)/.beatrix
-BIN_DIR  ?= /usr/local/bin
+# The venv install.sh creates. ~/.beatrix itself holds your data — never point this at it.
+VENV_DIR ?= $(HOME)/.beatrix/venv
+PY       := $(VENV_DIR)/bin/python
 SHELL    := /bin/bash
 
-.PHONY: help install uninstall install-dev install-venv clean test lint
+.PHONY: help install install-core install-dev setup uninstall clean test lint check
 
 # ── Default ──────────────────────────────────────────────
 
 help: ## Show this help
 	@echo ""
-	@echo "  ⚔️  BEATRIX CLI — Makefile"
+	@echo "  ⚔️  BEATRIX — Makefile"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -22,70 +22,33 @@ help: ## Show this help
 
 # ── Install ──────────────────────────────────────────────
 
-install: ## Install globally (tries pipx → pip --user → system pip → venv)
+install: ## Full install: Beatrix (editable) + every external tool, with a post-install check
 	@chmod +x install.sh && ./install.sh
 
-install-pipx: ## Install via pipx (recommended)
-	pipx install --force .
+install-core: ## Beatrix only, no external tools (add them later with: make setup)
+	@chmod +x install.sh && ./install.sh --no-tools
 
-install-user: ## Install to ~/.local/bin via pip (+ sudo wrapper)
-	$(PYTHON) -m pip install --user --break-system-packages . 2>/dev/null || \
-		$(PYTHON) -m pip install --user .
-	@$(MAKE) _sudo-wrapper
-
-install-system: ## Install system-wide (requires sudo)
-	sudo $(PYTHON) -m pip install --break-system-packages . 2>/dev/null || \
-		sudo $(PYTHON) -m pip install .
-
-install-venv: ## Install in dedicated venv at ~/.beatrix + symlink to /usr/local/bin
-	$(PYTHON) -m venv $(VENV_DIR)
-	$(VENV_DIR)/bin/pip install --upgrade pip
-	$(VENV_DIR)/bin/pip install .
-	@if [ -w "$(BIN_DIR)" ]; then \
-		ln -sf $(VENV_DIR)/bin/beatrix $(BIN_DIR)/beatrix; \
-	else \
-		sudo ln -sf $(VENV_DIR)/bin/beatrix $(BIN_DIR)/beatrix; \
-	fi
-	@echo "✓ Installed to $(VENV_DIR), linked at $(BIN_DIR)/beatrix"
-
-install-dev: ## Install in editable mode for development (+ sudo wrapper)
-	$(PYTHON) -m pip install -e ".[dev]" --break-system-packages 2>/dev/null || \
-		$(PYTHON) -m pip install -e ".[dev]"
-	@$(MAKE) _sudo-wrapper
+install-dev: ## Add the dev tools (pytest, ruff, black) to the install.sh venv
+	@test -x "$(PY)" || { echo "No venv at $(VENV_DIR) — run 'make install' first"; exit 1; }
+	@if command -v uv >/dev/null; then uv pip install --python "$(PY)" -e ".[dev,extended,agent]"; \
+	 else "$(PY)" -m pip install -e ".[dev,extended,agent]"; fi
 	@echo "✓ Dev install complete"
 
-setup: ## Install all 21 external security tools (nuclei, nmap, sqlmap, etc.)
-	@chmod +x install.sh && bash -c 'source install.sh && install_external_tools'
-
-# ── Sudo Wrapper ─────────────────────────────────────────
-
-_sudo-wrapper: ## (internal) Create /usr/local/bin/beatrix wrapper for sudo compat
-	@SITE_PKGS=$$($(PYTHON) -c "import site; print(site.getusersitepackages())"); \
-	PROJECT_DIR=$$(cd "$(CURDIR)" && pwd); \
-	PYBIN=$$(which $(PYTHON)); \
-	WRAPPER='#!/usr/bin/env bash\nif [ -n "$$SUDO_USER" ]; then\n    export HOME=$$(getent passwd "$$SUDO_USER" | cut -d: -f6)\nfi\nexport PYTHONPATH="'"$$PROJECT_DIR"':'"$$SITE_PKGS"'"\nexec '"$$PYBIN"' -W ignore::RuntimeWarning -m beatrix.cli.main "$$@"'; \
-	echo "$$WRAPPER" | sudo tee $(BIN_DIR)/beatrix >/dev/null && \
-	sudo chmod +x $(BIN_DIR)/beatrix && \
-	echo "✓ sudo wrapper installed at $(BIN_DIR)/beatrix"
+setup: ## Install or repair the external tool arsenal (same as: beatrix setup)
+	@chmod +x install.sh && BEATRIX_VENV="$(VENV_DIR)" bash -c 'source ./install.sh && install_external_tools'
 
 # ── Uninstall ────────────────────────────────────────────
 
-uninstall: ## Uninstall beatrix from everywhere
-	@echo "Removing beatrix..."
-	-pipx uninstall beatrix-cli 2>/dev/null || true
-	-$(PYTHON) -m pip uninstall -y beatrix-cli 2>/dev/null || true
-	-sudo $(PYTHON) -m pip uninstall -y beatrix-cli 2>/dev/null || true
-	-rm -f $(BIN_DIR)/beatrix 2>/dev/null || true
-	-rm -rf $(VENV_DIR) 2>/dev/null || true
-	@echo "✓ Uninstalled"
+uninstall: ## Remove Beatrix (asks before touching your data in ~/.beatrix)
+	@chmod +x uninstall.sh && ./uninstall.sh
 
 # ── Dev ──────────────────────────────────────────────────
 
-test: ## Run tests
-	$(PYTHON) -m pytest tests/ -v
+test: ## Run tests (needs: make install-dev)
+	"$(PY)" -m pytest tests/ --ignore=tests/live_integration.py
 
 lint: ## Run linter
-	$(PYTHON) -m ruff check beatrix/
+	"$(PY)" -m ruff check beatrix/
 
 clean: ## Clean build artifacts
 	rm -rf build/ dist/ *.egg-info .eggs __pycache__

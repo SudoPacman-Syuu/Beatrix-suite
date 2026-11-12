@@ -320,6 +320,11 @@ async def extract_ssl_sans(hostname: str, port: int = 443, *, timeout: int = 10)
 
     Returns list of hostnames from the certificate's SAN extension.
     Wildcard entries (*.example.com) are included as-is.
+
+    Verification is deliberately off — self-signed, expired and mismatched certs on
+    forgotten hosts are prime recon — so the names are parsed from the raw DER
+    certificate. (With CERT_NONE, ``getpeercert()`` returns an empty dict, which is
+    why this used to come back empty for every host.)
     """
     sans: List[str] = []
     try:
@@ -327,23 +332,30 @@ async def extract_ssl_sans(hostname: str, port: int = 443, *, timeout: int = 10)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _get_cert():
             import socket
             with socket.create_connection((hostname, port), timeout=timeout) as sock:
                 with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    cert = ssock.getpeercert(binary_form=False)
-                    if not cert:
-                        # Fall back to binary cert parsing
-                        return []
-                    san_entries = cert.get("subjectAltName", ())
-                    return [v for t, v in san_entries if t.lower() == "dns"]
+                    der = ssock.getpeercert(binary_form=True)
+            return _dns_sans_from_der(der) if der else []
 
         sans = await loop.run_in_executor(None, _get_cert)
     except Exception:
         pass
     return sans
+
+
+def _dns_sans_from_der(der: bytes) -> List[str]:
+    """DNS names in a DER certificate's subjectAltName extension ([] if it has none)."""
+    from cryptography import x509
+    cert = x509.load_der_x509_certificate(der)
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    except x509.ExtensionNotFound:
+        return []
+    return ext.value.get_values_for_type(x509.DNSName)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -821,19 +833,27 @@ async def whois_asn_lookup(domain: str, ip: str = "", *, timeout: int = 10) -> D
         def _asn_lookup():
             reversed_ip = ".".join(reversed(ip.split(".")))
             query = f"{reversed_ip}.origin.asn.cymru.com"
-            answers = socket.getaddrinfo(query, None)
-            # Actually need TXT record — try via dnspython
             try:
                 import dns.resolver
                 txt = dns.resolver.resolve(query, 'TXT')
                 for r in txt:
-                    parts = str(r).strip('"').split("|")
+                    # "ASN | prefix | CC | registry | allocated" — the 5th field is the
+                    # allocation DATE, not the network's owner (it used to be stored as
+                    # asn_org). The AS name comes from AS<n>.asn.cymru.com instead:
+                    # "ASN | CC | registry | allocated | AS name".
+                    parts = [p.strip() for p in str(r).strip('"').split("|")]
                     if len(parts) >= 3:
-                        return {
-                            "asn": parts[0].strip(),
-                            "prefix": parts[1].strip(),
-                            "asn_org": parts[4].strip() if len(parts) > 4 else "",
-                        }
+                        org = ""
+                        try:
+                            first_asn = parts[0].split()[0]   # multi-origin prefixes list several
+                            for a in dns.resolver.resolve(f"AS{first_asn}.asn.cymru.com", 'TXT'):
+                                ap = [p.strip() for p in str(a).strip('"').split("|")]
+                                if len(ap) >= 5:
+                                    org = ap[4]
+                                    break
+                        except Exception:
+                            pass
+                        return {"asn": parts[0], "prefix": parts[1], "asn_org": org}
             except Exception:
                 pass
             return {}

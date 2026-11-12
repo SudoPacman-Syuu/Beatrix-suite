@@ -23,9 +23,6 @@ venv/
 .idea/
 .vscode/
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
-tests/
-
 # ── Scan output — directories created by ScanOutputManager in cwd ─────────────
 # Pattern: {target}-scan-{timestamp}/  e.g. airbnb.com-scan-30-Jun-2026_14-17-43/
 *-scan-*/

@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import importlib
 import itertools
 import json
 import os
@@ -36,12 +37,14 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, parse_qsl, quote, urlparse
 
 # Reuse the auth GUI wholesale: its self-contained page + the exact backend
@@ -59,14 +62,27 @@ from beatrix.cli.auth_gui import (
 )
 # Reuse the ghost dashboard's thread-safe event ring buffer.
 from beatrix.cli.ghost_web import _Broker
+from beatrix.cli import _webauth
 from beatrix.core import nmap_runner
 from beatrix.core import packet_engine
 from beatrix.core import browser_driver
 from beatrix.core import recon_engine
 from beatrix.core import nuclei_runner
+from beatrix.utils.helpers import in_domain
 
 DEFAULT_PORT = 8790
 DEFAULT_STATE_DIR = Path.home() / ".beatrix" / "suite"
+
+# Request bodies are capped before they are read (413 beyond the cap). A few routes carry
+# whole files: a base64 pcap upload, a HAR import into the auth tool.
+_BODY_CAP = 16 << 20
+_BODY_CAPS = {"/packets/upload": 256 << 20, "/api/save": 128 << 20}
+_CB_BODY_CAP = 64 << 10             # OAST callbacks: the first 64 KiB is recorded, the rest dropped
+_WS_FRAME_CAP = 1 << 20             # browser input events are tiny JSON
+# Reachable without the access token: the HTML shells (each loads the token shim, then
+# calls the gated API), the static banner, and OAST callbacks, which come from targets.
+_OPEN_PATHS = ("/", "/index.html", "/auth", "/browser/popout", "/msf/recon/popout")
+_OPEN_PREFIXES = ("/assets/", "/cb/")
 
 # Auth route -> backend fn, mirroring auth_gui._Handler exactly.
 _AUTH_GET = {
@@ -360,6 +376,7 @@ class _ProjectStore:
         self.root = Path(state_dir)
         self.file = self.root / "projects.json"
         self._lock = threading.Lock()
+        self._deleted: set = set()          # ids deleted this run — workspace_dir won't recreate them
         self.root.mkdir(parents=True, exist_ok=True)
         self._data = self._read()
         if not self._data["projects"]:
@@ -407,15 +424,32 @@ class _ProjectStore:
         except Exception:
             pass
 
-    def _proj_dir(self, pid: int) -> Path:
-        return self.root / "projects" / str(pid)
+    @staticmethod
+    def _pid_key(pid: Any) -> Optional[str]:
+        """The folder name for a project id, or None when it isn't one. Ids are non-negative
+        integers; route handlers take them straight from query strings and JSON bodies."""
+        try:
+            n = int(str(pid).strip())
+        except (TypeError, ValueError):
+            return None
+        return str(n) if n >= 0 else None
+
+    def _proj_dir(self, pid: Any) -> Path:
+        # Anything that isn't an id maps to one placeholder folder that workspace_dir never
+        # creates, so "?project=../../x" can't steer a read or write outside the session.
+        return self.root / "projects" / (self._pid_key(pid) or "_invalid")
 
     def workspace_dir(self, pid: Any) -> Path:
         """Public accessor: the on-disk directory a project's scan output
         lives under, so tools (e.g. Hunt) can root their output there and
-        keep projects' data separated."""
+        keep projects' data separated. A deleted project's folder is never
+        recreated: a run still finishing up after the delete used to write into
+        it and resurrect an orphaned folder the UI can't see (ids aren't reused,
+        so the write just fails and is dropped)."""
         d = self._proj_dir(pid)
-        d.mkdir(parents=True, exist_ok=True)
+        key = self._pid_key(pid)
+        if key is not None and key not in self._deleted:
+            d.mkdir(parents=True, exist_ok=True)
         return d
 
     def _next_label_locked(self) -> int:
@@ -473,6 +507,7 @@ class _ProjectStore:
             self._data["projects"] = [p for p in self._data["projects"] if p["id"] != pid]
             if len(self._data["projects"]) == before:
                 return {"ok": False, "error": "no such project"}
+            self._deleted.add(self._pid_key(pid) or str(pid))
             shutil.rmtree(self._proj_dir(pid), ignore_errors=True)
             # Keep at least one project, and keep `active` valid.
             if not self._data["projects"]:
@@ -1802,18 +1837,36 @@ _PAGE = r"""<!doctype html>
     box-shadow:0 0 7px color-mix(in srgb, var(--green) 75%, transparent);
     animation:dotpulse 2.4s ease-in-out infinite; }
   @keyframes dotpulse { 0%,100%{ opacity:1; } 50%{ opacity:.45; } }
-  /* Radioactive glow — marks a project tab / nav module with a live scan running. */
+  /* Radioactive glow — marks a project tab / nav module with a live scan running.
+     --scan-fg/--scan-edge are the atomic-green label/edge colors; the light theme gets a
+     deeper green so the label stays readable on the pale bar (the halo stays lime). */
+  :root { --scan-fg:#c6ff8e; --scan-edge:#7fe61a; }
+  @media (prefers-color-scheme: light) { :root { --scan-fg:#2f7d00; --scan-edge:#3f9a00; } }
   @keyframes radioactive {
     0%,100% { box-shadow:0 0 3px #6ee600, 0 0 6px rgba(126,255,26,.35); }
     50%     { box-shadow:0 0 9px #9dff3a, 0 0 18px rgba(126,255,26,.70); }
   }
   .proj.scanning, .stage-menu .mod.scanning, nav .mod.scanning {
     animation:radioactive 1.6s ease-in-out infinite;
-    border-color:#7fe61a !important; color:#c6ff8e !important;
+    border-color:var(--scan-edge) !important; color:var(--scan-fg) !important;
     text-shadow:0 0 6px rgba(126,255,26,.6); }
+  /* The kill-chain STAGE button glows while any module in its dropdown is scanning. This is
+     the indicator you actually see: the .mod buttons live in a .stage-menu that stays
+     display:none until opened, so on their own they only glowed with that menu open. The
+     glow is inset because the nav strip is overflow-y:hidden — an outer box-shadow would be
+     sliced flat at the bar's top and bottom edges. */
+  @keyframes radioactive-stage {
+    0%,100% { box-shadow:inset 0 -10px 12px -10px rgba(126,255,26,.45); text-shadow:0 0 4px rgba(126,255,26,.45); }
+    50%     { box-shadow:inset 0 -16px 18px -11px rgba(126,255,26,.80); text-shadow:0 0 10px rgba(157,255,58,.9); }
+  }
+  nav .stage.scanning {
+    animation:radioactive-stage 1.6s ease-in-out infinite;
+    color:var(--scan-fg) !important; border-bottom-color:var(--scan-edge) !important; }
   @media (prefers-reduced-motion: reduce) {
     .proj.scanning, .stage-menu .mod.scanning, nav .mod.scanning {
-      animation:none; box-shadow:0 0 10px #7fe61a; } }
+      animation:none; box-shadow:0 0 10px #7fe61a; }
+    nav .stage.scanning { animation:none; text-shadow:0 0 6px rgba(126,255,26,.6);
+      box-shadow:inset 0 -14px 16px -11px rgba(126,255,26,.6); } }
 
   .body { flex:1; min-height:0; min-width:0; max-width:100%; display:flex; }
 
@@ -4627,7 +4680,7 @@ _PAGE = r"""<!doctype html>
 const TAGS = { thinking:"[thinking]", system_prompt:"[system]", prompt:"[prompt]",
   reasoning:"[reasoning]", tool_start:"[tool]", tool_end:"[result]", agent_start:"[agent]",
   agent_end:"[/agent]", finding:"[finding]", verdict:"[verdict]", done:"[done]" };
-const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const $ = id => document.getElementById(id);
 // Current global UI zoom (set on <html> by BeatrixUI). getBoundingClientRect() and
 // mouse clientX/Y report VISUAL coordinates; dividing them by this maps back into the
@@ -6375,6 +6428,7 @@ function renderProjects() {
   const ap = projects.find(p => p.id === activeProject);
   $("proj-label").textContent = ap ? ap.name : "—";
   $("dash-project").textContent = ap ? ap.name : "—";
+  applyActivity();   // the rail was just rebuilt without .scanning; re-apply the cached glow
 }
 function applyState(d) { projects = d.projects || []; activeProject = d.active; renderProjects(); }
 async function loadProjects() { applyState(await (await fetch("/projects")).json()); }
@@ -6427,25 +6481,38 @@ function reloadActiveModule() {
 }
 
 // Cross-project scan-activity indicators: a radioactive glow on any project tab
-// that has a live run, and on the running nav module(s) of the active project.
-// Cheap low-frequency poll of /activity (reads broker done-flags server-side).
-let actTimer = null;
-async function refreshActivity() {
-  let d;
-  try { d = await (await fetch("/activity")).json(); } catch (e) { return; }
-  const byProj = d.projects || {};
+// that has a live run, and — for the active project — on each running nav module AND
+// on the kill-chain stage button that holds it. The stage button is the one you can
+// actually see: module buttons sit in a dropdown that is display:none until opened.
+// Cheap poll of /activity (reads broker done-flags server-side). The last result is
+// cached so a project-rail re-render or a project switch re-applies it immediately
+// instead of dropping the glow until the next tick.
+let actTimer = null, actByProj = {};
+function applyActivity() {
   document.querySelectorAll("#projects .proj[data-pid]").forEach(b => {
-    b.classList.toggle("scanning", (byProj[b.dataset.pid] || []).length > 0);
+    b.classList.toggle("scanning", (actByProj[b.dataset.pid] || []).length > 0);
   });
-  const activeMods = byProj[String(activeProject)] || [];
+  const activeMods = actByProj[String(activeProject)] || [];
   document.querySelectorAll("nav .mod[data-tab]").forEach(m => {
     m.classList.toggle("scanning", activeMods.indexOf(m.dataset.tab) >= 0);
   });
+  document.querySelectorAll("nav .stage-wrap").forEach(w => {
+    const st = w.querySelector(".stage");
+    if (st) st.classList.toggle("scanning", !!w.querySelector(".mod.scanning"));
+  });
+}
+async function refreshActivity() {
+  let d;
+  try { d = await (await fetch("/activity")).json(); } catch (e) { return; }
+  actByProj = d.projects || {};
+  applyActivity();
 }
 function startActivityPolling() {
   if (actTimer) return;
   refreshActivity();
-  actTimer = setInterval(refreshActivity, 4000);
+  // 1.5 s, not 4 s: runs lasting a few seconds used to start and finish between ticks
+  // and never glow at all.
+  actTimer = setInterval(refreshActivity, 1500);
 }
 
 // Stop EVERY module's UI poller and reset its transient single-project view state,
@@ -10187,7 +10254,7 @@ function brSetStream(on) {
   $("br-screen").hidden = false; $("br-screen-img").hidden = true;
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   let ws;
-  try { ws = new WebSocket(scheme + "//" + location.host + "/browser/ws?project=" + encodeURIComponent(activeProject)); }
+  try { ws = new WebSocket(scheme + "//" + location.host + __bxUrl("/browser/ws?project=" + encodeURIComponent(activeProject))); }
   catch (e) { brUseMjpeg(); return; }
   ws.binaryType = "arraybuffer";
   brWS = ws;
@@ -10218,9 +10285,9 @@ function brUseMjpeg() {
   img.onload = () => { if (hint) hint.style.display = "none"; };
   img.onerror = () => {
     if (brRunning && onBrowserTab() && brTransport === "mjpeg")
-      setTimeout(() => { if (brRunning && brTransport === "mjpeg") img.src = "/browser/stream?project=" + encodeURIComponent(activeProject) + "&t=" + Date.now(); }, 800);
+      setTimeout(() => { if (brRunning && brTransport === "mjpeg") img.src = __bxUrl("/browser/stream?project=" + encodeURIComponent(activeProject)) + "&t=" + Date.now(); }, 800);
   };
-  img.src = "/browser/stream?project=" + encodeURIComponent(activeProject) + "&t=" + Date.now();
+  img.src = __bxUrl("/browser/stream?project=" + encodeURIComponent(activeProject)) + "&t=" + Date.now();
 }
 function brRenderFrame(buf) {
   const c = $("br-screen");
@@ -13951,13 +14018,27 @@ async function doMakeFolder() {
   if (r.ok) fsBrowse(r.path); else $("sess-msg").textContent = r.error || "Could not create folder.";
 }
 
+// Switching sessions stops the scans running in this one (their results so far stay with it),
+// so say so first instead of silently ending them.
+async function confirmSessionSwitch() {
+  if (!sessionActive) return true;
+  let d;
+  try { d = await (await fetch("/activity")).json(); } catch (e) { return true; }
+  const n = Object.values(d.projects || {}).reduce((a, mods) => a + mods.length, 0);
+  if (!n) return true;
+  return confirmDialog({ title: "Stop running scans?", danger: true, confirmLabel: "Stop and switch",
+    body: n + " scan" + (n === 1 ? " is" : "s are") + " running in this session. Switching stops " +
+          (n === 1 ? "it" : "them") + " first; results found so far stay in this session." });
+}
 async function doCreateSession(parent, name) {
   $("sess-msg").textContent = "";
+  if (!(await confirmSessionSwitch())) return;
   const r = await (await fetch("/session/new", { method: "POST", body: JSON.stringify({ parent, name }) })).json();
   if (r.ok) location.reload(); else $("sess-msg").textContent = r.error || "Could not create session.";
 }
 async function doOpenSession(path) {
   $("sess-msg").textContent = "";
+  if (!(await confirmSessionSwitch())) return;
   const r = await (await fetch("/session/open", { method: "POST", body: JSON.stringify({ path }) })).json();
   if (r.ok) location.reload(); else $("sess-msg").textContent = r.error || "Could not open session.";
 }
@@ -16296,6 +16377,12 @@ class _ReconStore(_UndoableStore):
             data = self._read(pid)
             return list((data["entities"].get(kind) or {}).keys())
 
+    def entities_of(self, pid: Any, kind: str) -> Dict[str, Dict[str, Any]]:
+        """Every entity of one kind with its fields, keyed by entity key."""
+        with self._lock:
+            data = self._read(pid)
+            return {k: dict(v) for k, v in (data["entities"].get(kind) or {}).items()}
+
     def workspace(self, pid: Any) -> Dict[str, Any]:
         with self._lock:
             data = self._read(pid)
@@ -16985,10 +17072,19 @@ class _NucleiStore:
         return {"run": None, "findings": []}
 
 
+def _js_pid(proj: Any) -> str:
+    """A project id as a JS literal for the popout pages. Ids are integers; anything else (it
+    comes from the query string) becomes null — json.dumps alone leaves "</script>" intact."""
+    try:
+        return json.dumps(str(int(str(proj).strip())))
+    except (TypeError, ValueError):
+        return "null"
+
+
 def _msf_recon_popout_page(proj: Any) -> str:
     """Standalone reference window for the deduped recon targets — open on a second
     monitor while you work in the main Metasploit window. Polls /msf/import, read-only."""
-    pid = json.dumps(str(proj))
+    pid = _js_pid(proj)
     return r"""<!doctype html><html><head><meta charset="utf-8"><title>Beatrix · Recon Targets</title>
 <style>
  html,body{margin:0;height:100%;background:#0a0f0c;color:#d3ddd2;font:13px ui-monospace,Menlo,Consolas,monospace;}
@@ -17013,7 +17109,7 @@ def _msf_recon_popout_page(proj: Any) -> str:
  <div id="t"></div>
 <script>
 const PID=__PID__; let ROWS=[];
-function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function render(){
  const q=document.getElementById('f').value.trim().toLowerCase();
  let rows=ROWS; if(q) rows=ROWS.filter(h=>JSON.stringify(h).toLowerCase().indexOf(q)>=0);
@@ -17067,7 +17163,7 @@ def _browser_popout_page(proj: Any) -> str:
     input — opened in its own OS window so the operator can browse here while the
     main dashboard shows the HTTP traffic. Same-origin, so it drives the same
     `/browser/*` routes."""
-    pid = json.dumps(str(proj))
+    pid = _js_pid(proj)
     return """<!doctype html><html><head><meta charset="utf-8"><title>Beatrix Browser</title>
 <style>
  html,body{margin:0;height:100%;background:#0b0f14;color:#cdd6e4;font:13px ui-monospace,Menlo,monospace;}
@@ -17087,8 +17183,8 @@ const PID=__PID__; let VP={width:1280,height:800}; let ws=null, transport=null, 
 const q=(p)=>p+(p.includes('?')?'&':'?')+'project='+encodeURIComponent(PID);
 const c=document.getElementById('s'), im=document.getElementById('s2'), w=document.getElementById('w');
 function render(buf){createImageBitmap(new Blob([buf],{type:'image/jpeg'})).then(b=>{if(c.width!==b.width||c.height!==b.height){c.width=b.width;c.height=b.height;}c.getContext('2d').drawImage(b,0,0);if(b.close)b.close();}).catch(()=>{});}
-function useMjpeg(){transport='mjpeg';if(ws){try{ws.onclose=null;ws.close();}catch(e){}ws=null;}if(fb){clearTimeout(fb);fb=null;}c.hidden=true;im.hidden=false;im.onerror=()=>{if(transport==='mjpeg')setTimeout(()=>{if(transport==='mjpeg')im.src=q('/browser/stream')+'&t='+Date.now();},800);};im.src=q('/browser/stream')+'&t='+Date.now();}
-function connect(){transport='ws';got=false;c.hidden=false;im.hidden=true;const sch=location.protocol==='https:'?'wss:':'ws:';try{ws=new WebSocket(sch+'//'+location.host+'/browser/ws?project='+encodeURIComponent(PID));}catch(e){useMjpeg();return;}ws.binaryType='arraybuffer';ws.onmessage=(e)=>{if(typeof e.data==='string'||transport!=='ws')return;got=true;if(fb){clearTimeout(fb);fb=null;}render(e.data);};ws.onerror=()=>{try{ws.close();}catch(e){}};ws.onclose=()=>{ws=null;if(transport!=='ws')return;if(!got){useMjpeg();return;}setTimeout(()=>{if(transport==='ws'&&!ws)connect();},700);};fb=setTimeout(()=>{if(!got)useMjpeg();},2500);}
+function useMjpeg(){transport='mjpeg';if(ws){try{ws.onclose=null;ws.close();}catch(e){}ws=null;}if(fb){clearTimeout(fb);fb=null;}c.hidden=true;im.hidden=false;im.onerror=()=>{if(transport==='mjpeg')setTimeout(()=>{if(transport==='mjpeg')im.src=__bxUrl(q('/browser/stream'))+'&t='+Date.now();},800);};im.src=__bxUrl(q('/browser/stream'))+'&t='+Date.now();}
+function connect(){transport='ws';got=false;c.hidden=false;im.hidden=true;const sch=location.protocol==='https:'?'wss:':'ws:';try{ws=new WebSocket(sch+'//'+location.host+__bxUrl('/browser/ws?project='+encodeURIComponent(PID)));}catch(e){useMjpeg();return;}ws.binaryType='arraybuffer';ws.onmessage=(e)=>{if(typeof e.data==='string'||transport!=='ws')return;got=true;if(fb){clearTimeout(fb);fb=null;}render(e.data);};ws.onerror=()=>{try{ws.close();}catch(e){}};ws.onclose=()=>{ws=null;if(transport!=='ws')return;if(!got){useMjpeg();return;}setTimeout(()=>{if(transport==='ws'&&!ws)connect();},700);};fb=setTimeout(()=>{if(!got)useMjpeg();},2500);}
 connect();
 fetch(q('/browser/state')).then(r=>r.json()).then(s=>{if(s.viewport)VP=s.viewport;}).catch(()=>{});
 function post(p,b){return fetch(p,{method:'POST',body:JSON.stringify(Object.assign({project:PID},b))}).catch(()=>{});}
@@ -17441,17 +17537,57 @@ class _MsfManager:
                 pass
 
 
+# Engine packages the suite would otherwise first import from request/worker threads.
+_PRELOAD = ("beatrix.scanners", "beatrix.scanners.origin_ip_discovery", "beatrix.recon.passive_mapper",
+            "beatrix.core.engine", "beatrix.core.external_tools", "beatrix.core.scan_output",
+            "beatrix.core.findings_db", "beatrix.core.recon_helpers")
+
+
+def _preload_engines() -> None:
+    """Import the engine packages once, on the launching thread, before serving.
+
+    They used to be imported lazily from request and worker threads. ``beatrix.scanners``'
+    ``__init__`` imports its submodules, so when two threads imported it for the first time at
+    once (e.g. SPA Recon and Nuclei started together on a fresh suite) Python's per-module
+    import locks deadlocked: one import raised ``_DeadlockError``, the other a KeyError or a
+    partially-initialised module, killing one run and stranding the other as "running"."""
+    for name in _PRELOAD:
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 — a broken optional engine still fails visibly when used
+            pass
+
+
+class _SuiteHTTPServer(ThreadingHTTPServer):
+    """The suite's HTTP server, with a real listen backlog. The stdlib default is 5, and every
+    poll is a fresh connection (HTTP/1.0), so a few busy tabs overflowed it: the kernel dropped
+    connections and TCP retransmit backoff turned them into 1–11 s stalls. Under the same load,
+    128 took the worst request from 4.1 s to 38 ms."""
+    request_queue_size = 128
+
+
 class SuiteServer:
     """The single central-dashboard server. One port, all tools + projects."""
 
     def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PORT,
                  state_dir: Optional[Path] = None,
-                 sessions_registry: Optional[Path] = None):
+                 sessions_registry: Optional[Path] = None,
+                 token: Optional[str] = None, new_token: bool = False,
+                 require_auth: bool = True):
         self.host = host
         self.port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
-        self.url: str = ""
+        self.url: str = ""                       # bare base URL (tests build request URLs from it)
         self.public_url: Optional[str] = None
+        # Access token every API request must carry (see beatrix/cli/_webauth.py). Loaded from
+        # ~/.beatrix/suite.token at start() unless given; ``new_token`` rotates it.
+        # ``require_auth=False`` exists for tests that aim the Repeater at the suite itself;
+        # it is never exposed on the command line.
+        self.token: Optional[str] = token
+        self._new_token = new_token
+        self.require_auth = require_auth
+        self.launch_url: str = ""                # url + #token=… — what we open and print
+        self.public_launch_url: Optional[str] = None
         # The active session and its stores. When no session is mounted the suite
         # shows the picker instead of a dashboard; passing ``state_dir`` mounts one
         # up front (the back-compatible path the tests use).
@@ -17536,13 +17672,13 @@ class SuiteServer:
         listener or subprocess open for a project that no longer exists. Each step
         is idempotent and no-ops when that tool was never used."""
         key = str(project_id)
-        for stopper in (self.stop_hunt_run, self.stop_ghost_run, self.stop_nmap_scan,
-                        self.stop_nuclei, self.stop_recon, self.stop_passive,
-                        self.stop_capture, self.stop_autorepeater_run, self.browser_stop):
-            try:
-                stopper(project_id)
-            except Exception:  # noqa: BLE001
-                pass
+        # Stop every run (SPA Recon used to be missed) and let each finish writing before the
+        # folder goes, so nothing lands in a project that no longer exists.
+        self._stop_and_drain([key], timeout=10.0)
+        try:
+            self.browser_stop(project_id)
+        except Exception:  # noqa: BLE001
+            pass
         m = self.msf_mgrs.pop(key, None)
         if m is not None:
             try:
@@ -17586,6 +17722,7 @@ class SuiteServer:
             if live(self.nmap_brokers, key): mods.append("network")
             if live(self.nuclei_brokers, key): mods.append("nuclei")
             if live(self.recon_brokers, key): mods.append("recon")
+            if live(self.spa_brokers, key): mods.append("sparecon")
             if live(self.ghost_brokers, key): mods.append("ghost")
             if live(self.capture_brokers, key): mods.append("packets")
             a = self.ar_attacks.get(key)
@@ -17595,12 +17732,93 @@ class SuiteServer:
                 out[key] = mods
         return {"active": st.get("active"), "projects": out}
 
+    # ── Run lifecycle ────────────────────────────────────────────────────
+    def _stores(self) -> SimpleNamespace:
+        """The current session's stores as one snapshot. A background run takes this when it
+        starts and writes only through it, never through ``self.<store>``: mount_session swaps
+        those attributes, and runs that looked them up at write time dropped their findings into
+        whichever session happened to be open (and lost them from their own)."""
+        with self._lock:
+            return SimpleNamespace(
+                projects=self.projects, issues=self.issues, scan_checkpoints=self.scan_checkpoints,
+                nmap=self.nmap, nmap_sweeps=self.nmap_sweeps, captures=self.captures,
+                http_history_store=self.http_history_store, recon=self.recon,
+                recon_sweeps=self.recon_sweeps, nuclei=self.nuclei)
+
+    _RUN_BROKERS = ("hunt_brokers", "ghost_brokers", "nmap_brokers", "recon_brokers",
+                    "passive_brokers", "spa_brokers", "nuclei_brokers", "capture_brokers")
+
+    def _live_runs(self, keys: Optional[Iterable[str]] = None) -> List[str]:
+        """'<module>:<project>' for every run still in progress (optionally only these projects)."""
+        keys = None if keys is None else {str(k) for k in keys}
+        out: List[str] = []
+        for attr in self._RUN_BROKERS:
+            for k, b in list(getattr(self, attr).items()):
+                if keys is not None and k not in keys:
+                    continue
+                try:
+                    if not b.since(10 ** 9)["done"]:
+                        out.append("%s:%s" % (attr[:-len("_brokers")], k))
+                except Exception:  # noqa: BLE001
+                    pass
+        for k, a in list(self.ar_attacks.items()):
+            if (keys is None or k in keys) and getattr(a, "running", False):
+                out.append("autorepeater:%s" % k)
+        return out
+
+    def _stop_and_drain(self, keys: Optional[Iterable[Any]], timeout: float = 15.0) -> List[str]:
+        """Stop every run of these projects (all projects when ``keys`` is None) and wait, up to
+        ``timeout`` s, until each has finished writing. Returns the runs still live at the
+        timeout (empty when everything stopped in time)."""
+        live = self._live_runs(keys)
+        for k in sorted({entry.split(":", 1)[1] for entry in live} | {str(x) for x in (keys or [])}):
+            for stopper in (self.stop_hunt_run, self.stop_ghost_run, self.stop_nmap_scan,
+                            self.stop_nuclei, self.stop_recon, self.stop_passive, self.stop_spa_recon,
+                            self.stop_capture, self.stop_autorepeater_run):
+                try:
+                    stopper(k)
+                except Exception:  # noqa: BLE001
+                    pass
+        deadline = time.time() + timeout
+        while live and time.time() < deadline:
+            time.sleep(0.05)
+            live = self._live_runs(keys)
+        if live:
+            sys.stderr.write("[beatrix-suite] still running after stop: %s\n" % ", ".join(live))
+        return live
+
+    def _settle(self, broker: Any, stop: Optional[threading.Event], timeout: float = 8.0) -> bool:
+        """True when no run is live. A run whose Stop was already requested gets ``timeout`` s
+        to wind down first, so Stop → Start works instead of failing with "already running"
+        while the old run is still unwinding."""
+        def done() -> bool:
+            try:
+                return broker is None or broker.since(10 ** 9)["done"]
+            except Exception:  # noqa: BLE001
+                return True
+        if done():
+            return True
+        if stop is None or not stop.is_set():
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.05)
+            if done():
+                return True
+        return False
+
     # ── Session lifecycle ────────────────────────────────────────────────
     def mount_session(self, session_dir: Any, register: bool = True) -> Dict[str, Any]:
         """Point the suite at ``session_dir`` — (re)create the per-session stores
         and clear any prior session's live run state."""
         d = Path(session_dir).expanduser()
         d.mkdir(parents=True, exist_ok=True)
+        if self.session_dir is not None:
+            # A run belongs to its session. Stop the outgoing session's runs and let them finish
+            # writing before the stores are swapped. Every run also writes only through the store
+            # snapshot it took at start (_stores), so even a late write lands in its own session:
+            # runs used to keep going after a switch and drop their findings into the new one.
+            self._stop_and_drain(None, timeout=15.0)
         with self._lock:
             self.session_dir = d
             self.projects = _ProjectStore(d)
@@ -17645,6 +17863,9 @@ class SuiteServer:
             self.passive_stops.clear()
             self.nuclei_brokers.clear()
             self.nuclei_stops.clear()
+            self.spa_brokers.clear()
+            self.spa_stops.clear()
+            self.spa_results.clear()
         if register:
             self.sessions.register(str(d), d.name)
         return self.session_info()
@@ -17812,7 +18033,7 @@ class SuiteServer:
         Mirrors the Ghost/AutoRepeater per-project background pattern."""
         key = str(project_id)
         b = self.nmap_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.nmap_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A scan is already running for this project."}
         if not nmap_runner.nmap_available():
             return {"ok": False, "error": "nmap is not installed on this host."}
@@ -17839,24 +18060,30 @@ class SuiteServer:
 
     def _run_nmap(self, project_id: Any, scan_id: int, target: str, args: str,
                   ports: str, broker: "_Broker", stop: threading.Event) -> None:
+        st = self._stores()     # this run's own session stores — see _stores()
         try:
-            xmlp = str(self.projects.workspace_dir(project_id) / f"nmap-{scan_id}.xml")
-        except Exception:  # noqa: BLE001
-            xmlp = f"/tmp/beatrix-nmap-{scan_id}.xml"
-        priv = nmap_runner.needs_root(args)
-        broker.emit({"type": "log", "text": "Scanning %s%s …" % (
-            target, " (root via sudo)" if priv else "")})
-        res = nmap_runner.run_scan(
-            target, args, ports, xmlp,
-            on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
-            on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
-            stop_event=stop)
-        self.nmap.complete_scan(project_id, scan_id, res)
-        if res.get("error"):
-            broker.emit({"type": "error", "text": res["error"]})
-        broker.emit({"type": "done", "text": res.get("summary") or "scan complete",
-                     "detail": str(scan_id)})
-        broker.finish()
+            try:
+                xmlp = str(st.projects.workspace_dir(project_id) / f"nmap-{scan_id}.xml")
+            except Exception:  # noqa: BLE001
+                xmlp = f"/tmp/beatrix-nmap-{scan_id}.xml"
+            priv = nmap_runner.needs_root(args)
+            broker.emit({"type": "log", "text": "Scanning %s%s …" % (
+                target, " (root via sudo)" if priv else "")})
+            res = nmap_runner.run_scan(
+                target, args, ports, xmlp,
+                on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
+                on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
+                stop_event=stop)
+            st.nmap.complete_scan(project_id, scan_id, res)
+            if res.get("error"):
+                broker.emit({"type": "error", "text": res["error"]})
+            broker.emit({"type": "done", "text": res.get("summary") or "scan complete",
+                         "detail": str(scan_id)})
+            broker.finish()
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "nmap scan failed: %s: %s" % (type(e).__name__, e)})
+        finally:
+            broker.finish()
 
     def nmap_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.nmap_brokers.get(str(project_id))
@@ -17881,7 +18108,7 @@ class SuiteServer:
         and the Network view re-attaches on load."""
         key = str(project_id)
         b = self.nmap_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.nmap_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A scan or sweep is already running for this project."}
         if not nmap_runner.nmap_available():
             return {"ok": False, "error": "nmap is not installed on this host."}
@@ -17919,71 +18146,77 @@ class SuiteServer:
                         steps: List[Dict[str, Any]], completed: List[str],
                         interrupted: Optional[Dict[str, Any]], broker: "_Broker",
                         stop: threading.Event) -> None:
-        total = len(steps)
-        done = set(completed or [])
-        resuming = bool(completed or interrupted)
-        broker.emit({"type": "phase", "text": (
-            ("── Resumed sweep ── " if resuming else "── Full sweep ── ")
-            + target + "  (" + mode + ", " + str(total) + " steps)")})
-        if resuming:
-            broker.emit({"type": "log", "text": "Resuming — %d of %d step(s) already complete."
-                         % (len(done), total)})
+        st = self._stores()     # this run's own session stores — see _stores()
         try:
-            for idx, step in enumerate(steps, 1):
-                skey = step.get("key")
-                if skey in done:
-                    continue
-                if stop.is_set():
-                    break
-                label = step.get("label") or skey
-                broker.emit({"type": "phase", "text": "── Step %d/%d: %s ──" % (idx, total, label)})
-                args, ports = step.get("args", ""), step.get("ports", "")
-                display = nmap_runner.display_command(target, args, ports)
-                scan_id = self.nmap.new_scan(project_id, {
-                    "target": target, "profile": "Full sweep \u00b7 " + label,
-                    "command": display, "args": args, "ports": ports})
-                try:
-                    base = str(self.projects.workspace_dir(project_id) / ("nmap-sweep-%d" % scan_id))
-                except Exception:  # noqa: BLE001
-                    base = "/tmp/beatrix-nmap-sweep-%d" % scan_id
-                resume_base = None
-                if interrupted and interrupted.get("key") == skey and interrupted.get("resume_base"):
-                    resume_base = interrupted.get("resume_base")
-                    broker.emit({"type": "log", "text": "Resuming this step from %s \u2026" % resume_base})
-                res = nmap_runner.run_scan(
-                    target, args, ports, base + ".xml",
-                    on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
-                    on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
-                    stop_event=stop, oa_base=(None if resume_base else base),
-                    resume_base=resume_base)
-                # A resume that can't continue (single host / nothing left) → run fresh.
-                if resume_base and res.get("error") and not stop.is_set():
-                    broker.emit({"type": "log", "text": "Resume not applicable — re-running this step from the start."})
+            total = len(steps)
+            done = set(completed or [])
+            resuming = bool(completed or interrupted)
+            broker.emit({"type": "phase", "text": (
+                ("── Resumed sweep ── " if resuming else "── Full sweep ── ")
+                + target + "  (" + mode + ", " + str(total) + " steps)")})
+            if resuming:
+                broker.emit({"type": "log", "text": "Resuming — %d of %d step(s) already complete."
+                             % (len(done), total)})
+            try:
+                for idx, step in enumerate(steps, 1):
+                    skey = step.get("key")
+                    if skey in done:
+                        continue
+                    if stop.is_set():
+                        break
+                    label = step.get("label") or skey
+                    broker.emit({"type": "phase", "text": "── Step %d/%d: %s ──" % (idx, total, label)})
+                    args, ports = step.get("args", ""), step.get("ports", "")
+                    display = nmap_runner.display_command(target, args, ports)
+                    scan_id = st.nmap.new_scan(project_id, {
+                        "target": target, "profile": "Full sweep \u00b7 " + label,
+                        "command": display, "args": args, "ports": ports})
+                    try:
+                        base = str(st.projects.workspace_dir(project_id) / ("nmap-sweep-%d" % scan_id))
+                    except Exception:  # noqa: BLE001
+                        base = "/tmp/beatrix-nmap-sweep-%d" % scan_id
+                    resume_base = None
+                    if interrupted and interrupted.get("key") == skey and interrupted.get("resume_base"):
+                        resume_base = interrupted.get("resume_base")
+                        broker.emit({"type": "log", "text": "Resuming this step from %s \u2026" % resume_base})
                     res = nmap_runner.run_scan(
                         target, args, ports, base + ".xml",
                         on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
                         on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
-                        stop_event=stop, oa_base=base)
-                self.nmap.complete_scan(project_id, scan_id, res)
-                interrupted = None
-                if stop.is_set():
-                    self.nmap_sweeps.set_interrupted(project_id, skey, base)
-                    broker.emit({"type": "error",
-                                 "text": "Sweep stopped — step '%s' can be resumed." % label})
-                    break
-                self.nmap_sweeps.mark_step_done(project_id, skey)
-                done.add(skey)
-            else:
-                self.nmap_sweeps.set_status(project_id, "done")
-                broker.emit({"type": "done", "text": "Full sweep complete (%d steps)." % total})
-                broker.finish()
-                return
-        except Exception as e:  # noqa: BLE001
-            broker.emit({"type": "error", "text": "sweep error: %s" % e})
-        # Break (stopped) or exception: mark interrupted so the UI offers Resume.
-        self.nmap_sweeps.set_status(project_id, "interrupted")
-        broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
-        broker.finish()
+                        stop_event=stop, oa_base=(None if resume_base else base),
+                        resume_base=resume_base)
+                    # A resume that can't continue (single host / nothing left) → run fresh.
+                    if resume_base and res.get("error") and not stop.is_set():
+                        broker.emit({"type": "log", "text": "Resume not applicable — re-running this step from the start."})
+                        res = nmap_runner.run_scan(
+                            target, args, ports, base + ".xml",
+                            on_line=lambda ln: broker.emit({"type": "log", "text": ln}),
+                            on_hosts=lambda hs: broker.emit({"type": "hosts", "detail": hs}),
+                            stop_event=stop, oa_base=base)
+                    st.nmap.complete_scan(project_id, scan_id, res)
+                    interrupted = None
+                    if stop.is_set():
+                        st.nmap_sweeps.set_interrupted(project_id, skey, base)
+                        broker.emit({"type": "error",
+                                     "text": "Sweep stopped — step '%s' can be resumed." % label})
+                        break
+                    st.nmap_sweeps.mark_step_done(project_id, skey)
+                    done.add(skey)
+                else:
+                    st.nmap_sweeps.set_status(project_id, "done")
+                    broker.emit({"type": "done", "text": "Full sweep complete (%d steps)." % total})
+                    broker.finish()
+                    return
+            except Exception as e:  # noqa: BLE001
+                broker.emit({"type": "error", "text": "sweep error: %s" % e})
+            # Break (stopped) or exception: mark interrupted so the UI offers Resume.
+            st.nmap_sweeps.set_status(project_id, "interrupted")
+            broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
+            broker.finish()
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "nmap sweep failed: %s: %s" % (type(e).__name__, e)})
+        finally:
+            broker.finish()
 
     def nmap_sweep_state(self, project_id: Any) -> Dict[str, Any]:
         cp = self.nmap_sweeps.get(project_id)
@@ -18041,14 +18274,16 @@ class SuiteServer:
         return {"ok": False, "error": "unknown format: " + fmt}
 
     # ── Native-capture browser + HTTP history ─────────────────────────────
-    def _in_scope(self, project_id: Any, host: str) -> bool:
-        allowed = self.projects.get_scope(project_id)
-        denied = self.projects.get_scope_exclude(project_id)
+    def _in_scope(self, project_id: Any, host: str, projects: Any = None) -> bool:
+        projects = projects or self.projects          # a run passes its own session's store
+        allowed = projects.get_scope(project_id)
+        denied = projects.get_scope_exclude(project_id)
         return _scope_allows(host, allowed, denied)
 
     def _browser_for(self, project_id: Any) -> Any:
         """The project's BrowserController, created (with its transaction sink
         wired to the HTTP-history store + broker) on first use."""
+        st = self._stores()     # this run's own session stores — see _stores()
         key = str(project_id)
         broker = self.browser_brokers.get(key)
         if broker is None:
@@ -18066,7 +18301,7 @@ class SuiteServer:
             def sink(ev: Dict[str, Any], _pid: Any = project_id, _broker: "_Broker" = broker) -> None:
                 if ev.get("type") == "transaction":
                     tx = ev["detail"]
-                    txid = self.http_history_store.append(_pid, tx)
+                    txid = st.http_history_store.append(_pid, tx)
                     _broker.emit({"type": "transaction",
                                   "detail": _HttpHistoryStore._row(dict(tx, id=txid))})
                 elif ev.get("type") == "held":
@@ -18189,7 +18424,7 @@ class SuiteServer:
         """What the Packets pane needs to configure itself: interfaces, whether
         live capture is possible here, and the stored captures for this project."""
         return {"interfaces": self._interfaces(),
-                "can_capture": nmap_runner.sudo_available(),
+                "can_capture": nmap_runner.sudo_available(sys.executable, "-m", "beatrix.core.scapy_worker"),
                 "tshark": shutil.which("tshark") is not None,
                 "captures": self.captures.state(project_id).get("captures", [])}
 
@@ -18412,7 +18647,7 @@ class SuiteServer:
     def start_recon_component(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = str(project_id)
         b = self.recon_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.recon_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A recon component is already running for this project."}
         name = payload.get("component")
         target = (payload.get("target") or "").strip()
@@ -18431,21 +18666,30 @@ class SuiteServer:
 
     def _run_recon(self, project_id: Any, name: str, target: str, opts: Dict[str, Any],
                    broker: "_Broker", stop: threading.Event) -> None:
-        label = recon_engine.COMPONENTS[name]["label"]
-        broker.emit({"type": "log", "text": "▶ %s — %s" % (label, target)})
-        res = recon_engine.run_component(
-            name, target, opts,
-            on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}))
-        added = self.recon.merge(project_id, res.get("entities") or [])
-        self.recon.add_run(project_id, {"component": name, "label": label, "target": target,
-                                        "when": time.time(), "added": sum(added.values())})
-        for m in res.get("log") or []:
-            broker.emit({"type": "log", "text": m})
-        if res.get("error"):
-            broker.emit({"type": "error", "text": res["error"]})
-        summary = ", ".join("+%d %s" % (n, k) for k, n in added.items() if n) or "no new entities"
-        broker.emit({"type": "done", "text": summary})
-        broker.finish()
+        st = self._stores()     # this run's own session stores — see _stores()
+        try:
+            label = recon_engine.COMPONENTS[name]["label"]
+            broker.emit({"type": "log", "text": "▶ %s — %s" % (label, target)})
+            res = recon_engine.run_component(
+                name, target, opts,
+                on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}),
+                stop=stop)
+            added = st.recon.merge(project_id, res.get("entities") or [])
+            st.recon.add_run(project_id, {"component": name, "label": label, "target": target,
+                                            "when": time.time(), "added": sum(added.values())})
+            for m in res.get("log") or []:
+                broker.emit({"type": "log", "text": m})
+            if res.get("error"):
+                broker.emit({"type": "error", "text": res["error"]})
+            if res.get("interrupted"):
+                broker.emit({"type": "log", "text": "⏹ stopped — partial results kept"})
+            summary = ", ".join("+%d %s" % (n, k) for k, n in added.items() if n) or "no new entities"
+            broker.emit({"type": "done", "text": summary})
+            broker.finish()
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "recon run failed: %s: %s" % (type(e).__name__, e)})
+        finally:
+            broker.finish()
 
     def recon_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.recon_brokers.get(str(project_id))
@@ -18469,7 +18713,7 @@ class SuiteServer:
         resume, and entities discovered since are picked up."""
         key = str(project_id)
         b = self.recon_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.recon_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A recon component or sweep is already running for this project."}
         if resume:
             cp = self.recon_sweeps.resume(project_id)
@@ -18498,10 +18742,12 @@ class SuiteServer:
         return {"ok": True, "mode": mode, "target": target, "total": len(stages),
                 "completed_ops": len(completed)}
 
-    def _recon_sweep_targets(self, project_id: Any, scope: str, target: str) -> List[str]:
+    def _recon_sweep_targets(self, project_id: Any, scope: str, target: str,
+                             recon: Any = None) -> List[str]:
         """The fan-out targets for a stage's scope, from the current store state
         (de-duped, insertion-ordered). domain → target + domain entities; host → target +
         subdomains; ip → IPs + origin candidates; cidr → netblocks."""
+        recon = recon or self.recon                   # a sweep passes its own session's store
         out: List[str] = []
         seen: set = set()
 
@@ -18513,81 +18759,131 @@ class SuiteServer:
 
         if scope == "domain":
             add(target)
-            for d in self.recon.values_of(project_id, "domain"):
+            for d in recon.values_of(project_id, "domain"):
                 add(d)
         elif scope == "host":
             add(target)
-            for s in self.recon.values_of(project_id, "subdomain"):
+            for s in recon.values_of(project_id, "subdomain"):
                 add(s)
         elif scope == "ip":
-            for ip in self.recon.values_of(project_id, "ip"):
+            for ip in recon.values_of(project_id, "ip"):
                 add(ip)
-            for ip in self.recon.values_of(project_id, "origin"):
+            for ip in recon.values_of(project_id, "origin"):
                 add(ip)
         elif scope == "cidr":
-            for c in self.recon.values_of(project_id, "netblock"):
+            for c in recon.values_of(project_id, "netblock"):
                 add(c)
         return out
 
     def _run_recon_sweep(self, project_id: Any, target: str, mode: str,
                          stages: List[Dict[str, Any]], completed: List[str],
                          broker: "_Broker", stop: threading.Event) -> None:
-        total = len(stages)
-        done = set(completed or [])
-        resuming = bool(completed)
-        broker.emit({"type": "phase", "text": (
-            ("── Resumed OSINT sweep ── " if resuming else "── OSINT full sweep ── ")
-            + target + "  (" + mode + ", " + str(total) + " stages)")})
-        if resuming:
-            broker.emit({"type": "log", "text": "Resuming — %d operation(s) already complete." % len(done)})
+        st = self._stores()     # this run's own session stores — see _stores()
         try:
-            for idx, stage in enumerate(stages, 1):
-                if stop.is_set():
-                    break
-                comp, scope = stage["component"], stage["scope"]
-                label = stage.get("label") or comp
-                self.recon_sweeps.set_stage(project_id, idx, label)
-                tgts = self._recon_sweep_targets(project_id, scope, target)
-                capped = tgts[:_RECON_SWEEP_FANOUT_CAP]
-                extra = ("" if len(tgts) <= _RECON_SWEEP_FANOUT_CAP
-                         else "  (capped %d of %d)" % (_RECON_SWEEP_FANOUT_CAP, len(tgts)))
-                if not capped:
-                    broker.emit({"type": "phase", "text":
-                                 "── Stage %d/%d: %s — no %s targets yet ──" % (idx, total, label, scope)})
-                    continue
-                for t in capped:
+            total = len(stages)
+            done = set(completed or [])
+            resuming = bool(completed)
+            broker.emit({"type": "phase", "text": (
+                ("── Resumed OSINT sweep ── " if resuming else "── OSINT full sweep ── ")
+                + target + "  (" + mode + ", " + str(total) + " stages)")})
+            if resuming:
+                broker.emit({"type": "log", "text": "Resuming — %d operation(s) already complete." % len(done)})
+            try:
+                for idx, stage in enumerate(stages, 1):
                     if stop.is_set():
                         break
-                    op_key = comp + "\x00" + t
-                    if op_key in done:
+                    comp, scope = stage["component"], stage["scope"]
+                    label = stage.get("label") or comp
+                    st.recon_sweeps.set_stage(project_id, idx, label)
+                    tgts = self._recon_sweep_targets(project_id, scope, target, st.recon)
+                    if scope == "host" and recon_engine.COMPONENTS.get(comp, {}).get("contacts_host"):
+                        # This stage connects to each host itself, so only hosts inside the
+                        # sweep's domains (the target + any domain entity) — never the NS / MX /
+                        # PTR / Shodan / SAN names of other organisations. Those stay recorded;
+                        # they just aren't contacted. Filtered before the fan-out cap, so they
+                        # can't crowd in-scope hosts out of it either.
+                        doms = self._recon_sweep_targets(project_id, "domain", target, st.recon)
+                        outside = [t for t in tgts if not any(in_domain(t, d) for d in doms)]
+                        if outside:
+                            skip = set(outside)
+                            tgts = [t for t in tgts if t not in skip]
+                            broker.emit({"type": "log", "text":
+                                         "  %s: not contacting %d host(s) outside %s (still recorded): %s%s"
+                                         % (label, len(outside), ", ".join(doms), ", ".join(outside[:8]),
+                                            " …" if len(outside) > 8 else "")})
+                    if scope == "cidr":
+                        # A CDN / cloud provider's netblock is shared by countless unrelated
+                        # customers: sweeping it only enumerates the provider's own infrastructure,
+                        # never the target's (whose IPs in it already get per-IP reverse lookups in
+                        # the IP stages). Skip those — unless the provider IS what's being tested,
+                        # e.g. a sweep of cloudflare.com keeps Cloudflare's own netblocks.
+                        labels = {lab for d in self._recon_sweep_targets(project_id, "domain", target, st.recon)
+                                  for lab in d.lower().split(".")}
+                        orgs = {k: str(v.get("org") or "")
+                                for k, v in st.recon.entities_of(project_id, "netblock").items()}
+                        shared = {t: orgs.get(t, "") for t in tgts
+                                  if recon_engine.shared_provider(orgs.get(t, "")) not in (None, *labels)}
+                        if shared:
+                            tgts = [t for t in tgts if t not in shared]
+                            broker.emit({"type": "log", "text":
+                                         "  %s: skipping %d CDN / cloud-provider netblock(s) — shared address "
+                                         "space, not the target's: %s%s"
+                                         % (label, len(shared),
+                                            ", ".join("%s (%s)" % kv for kv in list(shared.items())[:6]),
+                                            " …" if len(shared) > 6 else "")})
+                    capped = tgts[:_RECON_SWEEP_FANOUT_CAP]
+                    extra = ("" if len(tgts) <= _RECON_SWEEP_FANOUT_CAP
+                             else "  (capped %d of %d)" % (_RECON_SWEEP_FANOUT_CAP, len(tgts)))
+                    if not capped:
+                        broker.emit({"type": "phase", "text":
+                                     "── Stage %d/%d: %s — no %s targets yet ──" % (idx, total, label, scope)})
                         continue
-                    broker.emit({"type": "phase", "text":
-                                 "── Stage %d/%d: %s · %s ──%s" % (idx, total, label, t, extra)})
-                    res = recon_engine.run_component(
-                        comp, t, {},
-                        on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}))
-                    added = self.recon.merge(project_id, res.get("entities") or [])
-                    self.recon.add_run(project_id, {
-                        "component": comp, "label": label, "target": t,
-                        "when": time.time(), "added": sum(added.values()), "sweep": True})
-                    for m in res.get("log") or []:
-                        broker.emit({"type": "log", "text": m})
-                    if res.get("error"):
-                        broker.emit({"type": "log", "text": "  (%s: %s)" % (comp, res["error"])})
-                    self.recon_sweeps.mark_op_done(project_id, op_key)
-                    done.add(op_key)
-                if stop.is_set():
-                    break
-            else:
-                self.recon_sweeps.set_status(project_id, "done")
-                broker.emit({"type": "done", "text": "OSINT full sweep complete (%d stages)." % total})
-                broker.finish()
-                return
-        except Exception as e:  # noqa: BLE001
-            broker.emit({"type": "error", "text": "sweep error: %s" % e})
-        self.recon_sweeps.set_status(project_id, "interrupted")
-        broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
-        broker.finish()
+                    for t in capped:
+                        if stop.is_set():
+                            break
+                        op_key = comp + "\x00" + t
+                        if op_key in done:
+                            continue
+                        broker.emit({"type": "phase", "text":
+                                     "── Stage %d/%d: %s · %s ──%s" % (idx, total, label, t, extra)})
+                        res = recon_engine.run_component(
+                            comp, t, {},
+                            on_log=lambda m: None if stop.is_set() else broker.emit({"type": "log", "text": m}),
+                            stop=stop)
+                        added = st.recon.merge(project_id, res.get("entities") or [])
+                        st.recon.add_run(project_id, {
+                            "component": comp, "label": label, "target": t,
+                            "when": time.time(), "added": sum(added.values()), "sweep": True})
+                        for m in res.get("log") or []:
+                            broker.emit({"type": "log", "text": m})
+                        if res.get("error"):
+                            broker.emit({"type": "log", "text": "  (%s: %s)" % (comp, res["error"])})
+                        if res.get("interrupted"):
+                            # Stopped mid-operation: its partial results are merged above, but it
+                            # is NOT checkpointed — Resume runs it again in full rather than
+                            # skipping a half-swept netblock.
+                            broker.emit({"type": "log", "text":
+                                         "  ⏹ stopped partway through %s · %s — partial results kept; "
+                                         "Resume re-runs it" % (label, t)})
+                            break
+                        st.recon_sweeps.mark_op_done(project_id, op_key)
+                        done.add(op_key)
+                    if stop.is_set():
+                        break
+                else:
+                    st.recon_sweeps.set_status(project_id, "done")
+                    broker.emit({"type": "done", "text": "OSINT full sweep complete (%d stages)." % total})
+                    broker.finish()
+                    return
+            except Exception as e:  # noqa: BLE001
+                broker.emit({"type": "error", "text": "sweep error: %s" % e})
+            st.recon_sweeps.set_status(project_id, "interrupted")
+            broker.emit({"type": "done", "text": "sweep paused — resume to continue"})
+            broker.finish()
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "OSINT sweep failed: %s: %s" % (type(e).__name__, e)})
+        finally:
+            broker.finish()
 
     def recon_sweep_state(self, project_id: Any) -> Dict[str, Any]:
         cp = self.recon_sweeps.get(project_id)
@@ -18641,7 +18937,7 @@ class SuiteServer:
     def start_passive_scan(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = str(project_id)
         b = self.passive_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.passive_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A passive scan is already running for this project."}
         target = (payload.get("target") or "").strip()
         if not target:
@@ -18662,52 +18958,58 @@ class SuiteServer:
 
     def _run_passive(self, project_id: Any, target: str, sources: List[str],
                      opts: Dict[str, Any], broker: "_Broker", stop: threading.Event) -> None:
-        import asyncio
-        from beatrix.recon.passive_mapper import PassiveMapper
-        count = [0]
-
-        def emit(kind: str, **kw) -> None:
-            if stop.is_set() and kind not in ("phase",):
-                return
-            t = {"phase": "phase", "scanner_error": "error"}.get(kind, "log")
-            broker.emit({"type": t, "text": kw.get("text", "")})
-
-        def on_endpoint(rec: Dict[str, Any]) -> None:
-            try:
-                rec = dict(rec)
-                rec["in_scope"] = self._in_scope(project_id, rec.get("host") or "")
-                self.http_history_store.append(project_id, rec)
-                count[0] += 1
-            except Exception:  # noqa: BLE001
-                pass
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        st = self._stores()     # this run's own session stores — see _stores()
         try:
-            pm = PassiveMapper(
-                target, sources=sources,
-                probe=bool(opts.get("probe", True)),
-                scope_only=bool(opts.get("scope_only", False)),
-                same_host_only=bool(opts.get("same_host_only", False)),
-                max_urls=int(opts.get("max_urls", 3000) or 3000),
-                concurrency=int(opts.get("concurrency", 12) or 12),
-                emit=emit, on_endpoint=on_endpoint,
-                should_stop=stop.is_set,
-                scope_check=lambda host: self._in_scope(project_id, host))
-            summary = loop.run_until_complete(pm.run())
-            by = summary.get("by_source") or {}
-            detail = ", ".join("+%d %s" % (n, s) for s, n in by.items() if n) or "nothing new"
-            broker.emit({"type": "done",
-                         "text": "%d endpoint(s) → Site map  (%s)" % (count[0], detail)})
-        except Exception as e:  # noqa: BLE001
-            broker.emit({"type": "error", "text": "passive scan failed: %s" % e})
-            broker.emit({"type": "done", "text": "stopped"})
+            import asyncio
+            from beatrix.recon.passive_mapper import PassiveMapper
+            count = [0]
+
+            def emit(kind: str, **kw) -> None:
+                if stop.is_set() and kind not in ("phase",):
+                    return
+                t = {"phase": "phase", "scanner_error": "error"}.get(kind, "log")
+                broker.emit({"type": t, "text": kw.get("text", "")})
+
+            def on_endpoint(rec: Dict[str, Any]) -> None:
+                try:
+                    rec = dict(rec)
+                    rec["in_scope"] = self._in_scope(project_id, rec.get("host") or "", st.projects)
+                    st.http_history_store.append(project_id, rec)
+                    count[0] += 1
+                except Exception:  # noqa: BLE001
+                    pass
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                pm = PassiveMapper(
+                    target, sources=sources,
+                    probe=bool(opts.get("probe", True)),
+                    scope_only=bool(opts.get("scope_only", False)),
+                    same_host_only=bool(opts.get("same_host_only", False)),
+                    max_urls=int(opts.get("max_urls", 3000) or 3000),
+                    concurrency=int(opts.get("concurrency", 12) or 12),
+                    emit=emit, on_endpoint=on_endpoint,
+                    should_stop=stop.is_set,
+                    scope_check=lambda host: self._in_scope(project_id, host, st.projects))
+                summary = loop.run_until_complete(pm.run())
+                by = summary.get("by_source") or {}
+                detail = ", ".join("+%d %s" % (n, s) for s, n in by.items() if n) or "nothing new"
+                broker.emit({"type": "done",
+                             "text": "%d endpoint(s) → Site map  (%s)" % (count[0], detail)})
+            except Exception as e:  # noqa: BLE001
+                broker.emit({"type": "error", "text": "passive scan failed: %s" % e})
+                broker.emit({"type": "done", "text": "stopped"})
+            finally:
+                broker.finish()
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "passive scan failed: %s: %s" % (type(e).__name__, e)})
         finally:
             broker.finish()
-            try:
-                loop.close()
-            except Exception:
-                pass
 
     def passive_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.passive_brokers.get(str(project_id))
@@ -18737,7 +19039,7 @@ class SuiteServer:
     def start_spa_recon(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = str(project_id)
         b = self.spa_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.spa_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A SPA recon run is already in progress for this project."}
         target = (payload.get("target") or "").strip()
         use_sitemap = bool(payload.get("use_sitemap"))
@@ -18754,148 +19056,154 @@ class SuiteServer:
 
     def _run_spa_recon(self, project_id: Any, target: str, payload: Dict[str, Any],
                        broker: "_Broker", stop: threading.Event) -> None:
-        import asyncio
-        import time as _time
-        from urllib.parse import urlparse as _url
-        from beatrix.scanners.spa_recon import SPAReconScanner
-        key = str(project_id)
+        st = self._stores()     # this run's own session stores — see _stores()
+        try:
+            import asyncio
+            import time as _time
+            from urllib.parse import urlparse as _url
+            from beatrix.scanners.spa_recon import SPAReconScanner
+            key = str(project_id)
 
-        def emit(text: str, typ: str = "log") -> None:
-            broker.emit({"type": typ, "text": text})
+            def emit(text: str, typ: str = "log") -> None:
+                broker.emit({"type": typ, "text": text})
 
-        # Build the target list: the explicit target plus (optionally) distinct
-        # in-scope hosts already in the Site map.
-        targets: List[str] = []
-        if target:
-            targets.append(target)
-        if payload.get("use_sitemap"):
+            # Build the target list: the explicit target plus (optionally) distinct
+            # in-scope hosts already in the Site map.
+            targets: List[str] = []
+            if target:
+                targets.append(target)
+            if payload.get("use_sitemap"):
+                try:
+                    hosts: List[str] = []
+                    for r in st.http_history_store.list(project_id, scope_only=True, limit=100000).get("rows", []):
+                        h = r.get("host")
+                        if h and h not in hosts:
+                            hosts.append(h)
+                    for h in hosts:
+                        u = "https://" + h
+                        if u not in targets:
+                            targets.append(u)
+                except Exception:  # noqa: BLE001
+                    pass
+            targets = targets[:25]
+
+            # Hosts already observed live — powers the bundle-vs-live diff.
+            seen: set = set()
             try:
-                hosts: List[str] = []
-                for r in self.http_history_store.list(project_id, scope_only=True, limit=100000).get("rows", []):
+                for r in st.http_history_store.list(project_id, scope_only=False, limit=100000).get("rows", []):
                     h = r.get("host")
-                    if h and h not in hosts:
-                        hosts.append(h)
-                for h in hosts:
-                    u = "https://" + h
-                    if u not in targets:
-                        targets.append(u)
+                    if h:
+                        seen.add(str(h).lower())
             except Exception:  # noqa: BLE001
                 pass
-        targets = targets[:25]
 
-        # Hosts already observed live — powers the bundle-vs-live diff.
-        seen: set = set()
-        try:
-            for r in self.http_history_store.list(project_id, scope_only=False, limit=100000).get("rows", []):
-                h = r.get("host")
-                if h:
-                    seen.add(str(h).lower())
-        except Exception:  # noqa: BLE001
-            pass
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        agg: Dict[str, Any] = {"target": target, "bundles": [], "maps": [], "sources": [],
-                               "endpoints": [], "routes": [], "hosts": [], "secrets": [],
-                               "exposures": [], "findings": [], "unknowns": [], "stats": {}}
-        seen_ep: set = set()
-        findings_objs: list = []
-        try:
-            async def run_all() -> None:
-                cfg = {"rate_limit": 10, "timeout": 15}
-                async with SPAReconScanner(cfg) as s:
-                    for tgt in (targets or [target]):
-                        if stop.is_set():
-                            emit("stopped", "phase")
-                            break
-                        emit("recovering %s" % tgt, "phase")
-                        try:
-                            res = await s.recover(tgt, seen_hosts=seen)
-                        except Exception as ex:  # noqa: BLE001
-                            emit("  error on %s: %s" % (tgt, ex), "error")
-                            continue
-                        agg["bundles"].extend(res.bundles)
-                        agg["maps"].extend(res.maps)
-                        for rs in res.sources:
-                            agg["sources"].append({"path": rs.path, "third_party": rs.third_party,
-                                                   "has_content": rs.has_content, "map_url": rs.map_url})
-                        for e in res.endpoints:
-                            k = e.get("url") or e.get("raw")
-                            if k in seen_ep:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            agg: Dict[str, Any] = {"target": target, "bundles": [], "maps": [], "sources": [],
+                                   "endpoints": [], "routes": [], "hosts": [], "secrets": [],
+                                   "exposures": [], "findings": [], "unknowns": [], "stats": {}}
+            seen_ep: set = set()
+            findings_objs: list = []
+            try:
+                async def run_all() -> None:
+                    cfg = {"rate_limit": 10, "timeout": 15}
+                    async with SPAReconScanner(cfg) as s:
+                        for tgt in (targets or [target]):
+                            if stop.is_set():
+                                emit("stopped", "phase")
+                                break
+                            emit("recovering %s" % tgt, "phase")
+                            try:
+                                res = await s.recover(tgt, seen_hosts=seen)
+                            except Exception as ex:  # noqa: BLE001
+                                emit("  error on %s: %s" % (tgt, ex), "error")
                                 continue
-                            seen_ep.add(k)
-                            agg["endpoints"].append({
-                                "url": e.get("url"), "raw": e.get("raw"), "kind": e.get("kind"),
-                                "method": e.get("method", "GET"), "source": e.get("source"),
-                                "line": e.get("line"),
-                                "claim": e["prov"].claim.label if e.get("prov") else ""})
-                        for r in res.routes:
-                            agg["routes"].append({"path": r["path"], "source": r.get("source"),
-                                                 "line": r.get("line"),
-                                                 "claim": r["prov"].claim.label if r.get("prov") else ""})
-                        agg["hosts"].extend(res.hosts)
-                        for sec in res.secrets:
-                            sev = sec["severity"]
-                            agg["secrets"].append({
-                                "secret_type": sec["secret_type"], "masked": sec["masked"],
-                                "severity": sev.value if hasattr(sev, "value") else str(sev),
-                                "source": sec.get("source"), "line": sec.get("line"),
-                                "claim": sec["prov"].claim.label if sec.get("prov") else ""})
-                        for ex in res.exposures:
-                            agg["exposures"].append({"kind": ex["kind"], "detail": ex.get("detail"),
-                                                    "source": ex.get("source"),
-                                                    "claim": ex["prov"].claim.label if ex.get("prov") else ""})
-                        agg["unknowns"].extend(res.unknowns)
-                        findings_objs.extend(res.findings)
-                        emit("  %d sources · %d endpoints · %d routes · %d secrets"
-                             % (len(res.sources), len(res.endpoints), len(res.routes), len(res.secrets)))
-            loop.run_until_complete(run_all())
+                            agg["bundles"].extend(res.bundles)
+                            agg["maps"].extend(res.maps)
+                            for rs in res.sources:
+                                agg["sources"].append({"path": rs.path, "third_party": rs.third_party,
+                                                       "has_content": rs.has_content, "map_url": rs.map_url})
+                            for e in res.endpoints:
+                                k = e.get("url") or e.get("raw")
+                                if k in seen_ep:
+                                    continue
+                                seen_ep.add(k)
+                                agg["endpoints"].append({
+                                    "url": e.get("url"), "raw": e.get("raw"), "kind": e.get("kind"),
+                                    "method": e.get("method", "GET"), "source": e.get("source"),
+                                    "line": e.get("line"),
+                                    "claim": e["prov"].claim.label if e.get("prov") else ""})
+                            for r in res.routes:
+                                agg["routes"].append({"path": r["path"], "source": r.get("source"),
+                                                     "line": r.get("line"),
+                                                     "claim": r["prov"].claim.label if r.get("prov") else ""})
+                            agg["hosts"].extend(res.hosts)
+                            for sec in res.secrets:
+                                sev = sec["severity"]
+                                agg["secrets"].append({
+                                    "secret_type": sec["secret_type"], "masked": sec["masked"],
+                                    "severity": sev.value if hasattr(sev, "value") else str(sev),
+                                    "source": sec.get("source"), "line": sec.get("line"),
+                                    "claim": sec["prov"].claim.label if sec.get("prov") else ""})
+                            for ex in res.exposures:
+                                agg["exposures"].append({"kind": ex["kind"], "detail": ex.get("detail"),
+                                                        "source": ex.get("source"),
+                                                        "claim": ex["prov"].claim.label if ex.get("prov") else ""})
+                            agg["unknowns"].extend(res.unknowns)
+                            findings_objs.extend(res.findings)
+                            emit("  %d sources · %d endpoints · %d routes · %d secrets"
+                                 % (len(res.sources), len(res.endpoints), len(res.routes), len(res.secrets)))
+                loop.run_until_complete(run_all())
 
-            # Feed discovered endpoints into the Site map (HTTP history store).
-            added = 0
-            for e in agg["endpoints"]:
-                url = e.get("url") or ""
-                if not url.startswith("http"):
-                    continue
-                host = _url(url).netloc
-                rec = {"method": e.get("method", "GET"), "url": url, "host": host,
-                       "path": _url(url).path or "/", "status": "", "mime": "", "length": 0,
-                       "ts": _time.time(), "in_scope": self._in_scope(project_id, host),
-                       "resource_type": "spa:" + (e.get("kind") or "endpoint")}
+                # Feed discovered endpoints into the Site map (HTTP history store).
+                added = 0
+                for e in agg["endpoints"]:
+                    url = e.get("url") or ""
+                    if not url.startswith("http"):
+                        continue
+                    host = _url(url).netloc
+                    rec = {"method": e.get("method", "GET"), "url": url, "host": host,
+                           "path": _url(url).path or "/", "status": "", "mime": "", "length": 0,
+                           "ts": _time.time(), "in_scope": self._in_scope(project_id, host, st.projects),
+                           "resource_type": "spa:" + (e.get("kind") or "endpoint")}
+                    try:
+                        st.http_history_store.append(project_id, rec)
+                        added += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Feed findings into Issues.
+                fcount = 0
+                for f in findings_objs:
+                    try:
+                        st.issues.add_finding(project_id, f, "spa_recon", "spa")
+                        fcount += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Serialize findings for the state endpoint (drop the live objects).
+                agg["findings"] = [{
+                    "title": f.title,
+                    "severity": f.severity.value if hasattr(f.severity, "value") else str(f.severity),
+                    "confidence": f.confidence.value if hasattr(f.confidence, "value") else str(f.confidence),
+                    "claim": (f.provenance or {}).get("claim", ""),
+                    "description": f.description} for f in findings_objs]
+                agg["added"] = added
+                agg["issues"] = fcount
+                self.spa_results[key] = agg
+                broker.emit({"type": "done",
+                             "text": "%d endpoint(s) → Site map · %d finding(s) → Issues" % (added, fcount)})
+            except Exception as e:  # noqa: BLE001
+                broker.emit({"type": "error", "text": "SPA recon failed: %s" % e})
+                broker.emit({"type": "done", "text": "stopped"})
+            finally:
+                broker.finish()
                 try:
-                    self.http_history_store.append(project_id, rec)
-                    added += 1
+                    loop.close()
                 except Exception:  # noqa: BLE001
                     pass
-            # Feed findings into Issues.
-            fcount = 0
-            for f in findings_objs:
-                try:
-                    self.issues.add_finding(project_id, f, "spa_recon", "spa")
-                    fcount += 1
-                except Exception:  # noqa: BLE001
-                    pass
-            # Serialize findings for the state endpoint (drop the live objects).
-            agg["findings"] = [{
-                "title": f.title,
-                "severity": f.severity.value if hasattr(f.severity, "value") else str(f.severity),
-                "confidence": f.confidence.value if hasattr(f.confidence, "value") else str(f.confidence),
-                "claim": (f.provenance or {}).get("claim", ""),
-                "description": f.description} for f in findings_objs]
-            agg["added"] = added
-            agg["issues"] = fcount
-            self.spa_results[key] = agg
-            broker.emit({"type": "done",
-                         "text": "%d endpoint(s) → Site map · %d finding(s) → Issues" % (added, fcount)})
-        except Exception as e:  # noqa: BLE001
-            broker.emit({"type": "error", "text": "SPA recon failed: %s" % e})
-            broker.emit({"type": "done", "text": "stopped"})
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "SPA recon failed: %s: %s" % (type(e).__name__, e)})
         finally:
             broker.finish()
-            try:
-                loop.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     def spa_recon_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.spa_brokers.get(str(project_id))
@@ -18974,7 +19282,7 @@ class SuiteServer:
     def start_nuclei_run(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = str(project_id)
         b = self.nuclei_brokers.get(key)
-        if b is not None and not b.since(10 ** 9)["done"]:
+        if not self._settle(b, self.nuclei_stops.get(key)):   # Stop → Start: wait out the unwind
             return {"ok": False, "error": "A nuclei run is already in progress for this project."}
         target = (payload.get("target") or "").strip()
         if not target:
@@ -18994,29 +19302,35 @@ class SuiteServer:
 
     def _run_nuclei(self, project_id: Any, run_id: int, target: str, opts: Dict[str, Any],
                     broker: "_Broker", stop: threading.Event) -> None:
-        broker.emit({"type": "log", "text": "▶ nuclei — %s" % target})
+        st = self._stores()     # this run's own session stores — see _stores()
+        try:
+            broker.emit({"type": "log", "text": "▶ nuclei — %s" % target})
 
-        def on_line(s: str) -> None:
-            if not stop.is_set():
-                broker.emit({"type": "log", "text": s})
+            def on_line(s: str) -> None:
+                if not stop.is_set():
+                    broker.emit({"type": "log", "text": s})
 
-        def on_finding(finding: Any, raw: Dict[str, Any]) -> None:
-            d = _nuclei_finding_dict(finding, raw)
-            self.nuclei.add_finding(project_id, run_id, d)
-            try:                                   # also land it in the shared Issues store (deduped)
-                self.issues.add_finding(project_id, finding, "nuclei", "manual")
-            except Exception:  # noqa: BLE001
-                pass
-            broker.emit({"type": "finding", "detail": d})
+            def on_finding(finding: Any, raw: Dict[str, Any]) -> None:
+                d = _nuclei_finding_dict(finding, raw)
+                st.nuclei.add_finding(project_id, run_id, d)
+                try:                                   # also land it in the shared Issues store (deduped)
+                    st.issues.add_finding(project_id, finding, "nuclei", "manual")
+                except Exception:  # noqa: BLE001
+                    pass
+                broker.emit({"type": "finding", "detail": d})
 
-        res = nuclei_runner.run(target, opts, on_line=on_line, on_finding=on_finding, stop_event=stop)
-        status = "stopped" if stop.is_set() else ("done" if res.get("ok") else "error")
-        self.nuclei.complete_run(project_id, run_id, status, int(res.get("count") or 0),
-                                 res.get("command", ""))
-        if res.get("error"):
-            broker.emit({"type": "error", "text": res["error"]})
-        broker.emit({"type": "done", "text": "%s — %d finding(s)" % (status, int(res.get("count") or 0))})
-        broker.finish()
+            res = nuclei_runner.run(target, opts, on_line=on_line, on_finding=on_finding, stop_event=stop)
+            status = "stopped" if stop.is_set() else ("done" if res.get("ok") else "error")
+            st.nuclei.complete_run(project_id, run_id, status, int(res.get("count") or 0),
+                                     res.get("command", ""))
+            if res.get("error"):
+                broker.emit({"type": "error", "text": res["error"]})
+            broker.emit({"type": "done", "text": "%s — %d finding(s)" % (status, int(res.get("count") or 0))})
+            broker.finish()
+        except Exception as e:  # noqa: BLE001 — never strand the run as "running"
+            broker.emit({"type": "error", "text": "nuclei run failed: %s: %s" % (type(e).__name__, e)})
+        finally:
+            broker.finish()
 
     def nuclei_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.nuclei_brokers.get(str(project_id))
@@ -19174,6 +19488,7 @@ class SuiteServer:
         Returns an ack dict; run output is streamed via that project's broker.
         Guards the ``[agent]`` extra + missing-API-key the same way the CLI does.
         """
+        st = self._stores()     # this run's own session stores — see _stores()
         target = (target or "").strip()
         if not target:
             return {"ok": False, "error": "target required"}
@@ -19190,8 +19505,8 @@ class SuiteServer:
             from beatrix.ai.ghost2.config import GhostV2Config
             from beatrix.ai.ghost2.core.runner import run_investigation
         except ImportError:
-            return {"ok": False, "error": "GHOST v2 needs the 'agent' extra "
-                    "(pip install 'beatrix-cli[agent]')."}
+            from beatrix.ai.ghost2 import agent_extra_hint
+            return {"ok": False, "error": "GHOST v2 needs the 'agent' extra: " + agent_extra_hint()}
 
         cfg = GhostV2Config.load()
         key_hint = cfg.missing_key_message()
@@ -19199,8 +19514,8 @@ class SuiteServer:
             return {"ok": False, "error": key_hint}
 
         objective = (objective or "").strip() or "Find and validate security vulnerabilities."
-        allowed_hosts = self.projects.get_scope(project_id)
-        denied_hosts = self.projects.get_scope_exclude(project_id)
+        allowed_hosts = st.projects.get_scope(project_id)
+        denied_hosts = st.projects.get_scope_exclude(project_id)
         broker = _Broker(meta={"target": target, "model": cfg.model,
                                "objective": objective, "auth": "none",
                                "scope": allowed_hosts})
@@ -19211,7 +19526,7 @@ class SuiteServer:
         # subagent) streams into this project's issue log with full detail.
         def _capture(finding: Any) -> None:
             try:
-                self.issues.add_finding(project_id, finding,
+                st.issues.add_finding(project_id, finding,
                                         getattr(finding, "scanner_module", "") or "ghost2", "ghost")
             except Exception:
                 pass
@@ -19323,9 +19638,10 @@ class SuiteServer:
         timeout, manual stop, or crash) picks up where it left off instead of
         restarting from Phase 1.
         """
+        st = self._stores()     # this run's own session stores — see _stores()
         completed_modules: List[str] = []
         if resume:
-            cp = self.scan_checkpoints.resume(project_id)
+            cp = st.scan_checkpoints.resume(project_id)
             if not cp:
                 return {"ok": False, "error": "No interrupted scan to resume for this project."}
             target = cp.get("target") or target
@@ -19350,13 +19666,13 @@ class SuiteServer:
 
         # Empty scope == unrestricted (same convention as everywhere else in
         # the suite): scan/report on whatever the target and its crawl turn up.
-        scope_hosts = self.projects.get_scope(project_id)
-        scope_exclude = self.projects.get_scope_exclude(project_id)
+        scope_hosts = st.projects.get_scope(project_id)
+        scope_exclude = st.projects.get_scope_exclude(project_id)
 
         # Fresh runs reset the checkpoint; a resumed run keeps its completed set
         # (scan_checkpoints.resume already flipped its status back to running).
         if not resume:
-            self.scan_checkpoints.start(project_id, target, modules, preset_label, ai, debug)
+            st.scan_checkpoints.start(project_id, target, modules, preset_label, ai, debug)
 
         # Disk-backed event log: survives a new run AND an ungraceful Codespace
         # timeout. Seed the new broker with the prior transcript so history isn't
@@ -19418,14 +19734,14 @@ class SuiteServer:
                 f = data.get("finding")
                 if f is not None:
                     try:
-                        self.issues.add_finding(project_id, f, data.get("scanner", "") or "", "hunt")
+                        st.issues.add_finding(project_id, f, data.get("scanner", "") or "", "hunt")
                     except Exception:
                         pass
             # Resume checkpoint: mark each scanner done as it finishes, so an
             # interruption can skip it on the next run.
             if event == "scanner_done":
                 try:
-                    self.scan_checkpoints.mark_module_done(project_id, data.get("scanner"))
+                    st.scan_checkpoints.mark_module_done(project_id, data.get("scanner"))
                 except Exception:
                     pass
             line = _hunt_event_to_line(event, data, debug=debug)
@@ -19442,7 +19758,7 @@ class SuiteServer:
             output_mgr = None
             try:
                 output_mgr = ScanOutputManager(
-                    target, base_dir=self.projects.workspace_dir(project_id))
+                    target, base_dir=st.projects.workspace_dir(project_id))
             except Exception:
                 pass
 
@@ -19507,17 +19823,17 @@ class SuiteServer:
                 broker.emit({"type": "verdict",
                              "text": f"Hunt complete — {n} finding{'s' if n != 1 else ''}",
                              "detail": detail})
-                self.scan_checkpoints.set_status(project_id, "complete")
+                st.scan_checkpoints.set_status(project_id, "complete")
             except asyncio.CancelledError:
                 n = len(engine.findings)
                 broker.emit({"type": "verdict", "text": "stopped",
                              "detail": f"Scan stopped by user — {n} finding{'s' if n != 1 else ''} "
                                        "recorded before stop. Resume to continue where it left off."})
-                self.scan_checkpoints.set_status(project_id, "interrupted")
+                st.scan_checkpoints.set_status(project_id, "interrupted")
             except Exception as e:  # noqa: BLE001 — surface any failure to the pane
                 broker.emit({"type": "verdict", "text": "error",
                              "detail": f"{type(e).__name__}: {e}"})
-                self.scan_checkpoints.set_status(project_id, "interrupted")
+                st.scan_checkpoints.set_status(project_id, "interrupted")
             finally:
                 _shutdown_loop(loop)
                 with self._lock:
@@ -19614,6 +19930,10 @@ class SuiteServer:
     def start_autorepeater_run(self, project_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = str(project_id)
         existing = self.ar_attacks.get(key)
+        if existing is not None and existing.running and existing.stop_event.is_set():
+            deadline = time.time() + 8.0         # Stop → Start: let the stopped attack unwind first
+            while existing.running and time.time() < deadline:
+                time.sleep(0.05)
         if existing is not None and existing.running:
             return {"ok": False, "error": "An attack is already running for this project."}
         attack_type = payload.get("attack_type", "sniper")
@@ -19732,8 +20052,17 @@ class SuiteServer:
     # ── HTTP ─────────────────────────────────────────────────────────────
     def start(self, open_browser: bool = True) -> str:
         suite = self
+        _preload_engines()          # single-threaded, before any request or run can import them
+        if self.token is None:
+            self.token = _webauth.load_or_create_token(rotate=self._new_token)
+        page_html = _webauth.inject_shim(_PAGE).encode("utf-8")
+        auth_html = _webauth.inject_shim(_AUTH_PAGE).encode("utf-8")
 
         class _H(BaseHTTPRequestHandler):
+            # A client that stops sending mid-request (or never sends one) releases its thread
+            # after this long. The WebSocket and MJPEG streams clear it — they idle by design.
+            timeout = 120
+
             def log_message(self, *a):  # quiet
                 pass
 
@@ -19808,6 +20137,8 @@ class SuiteServer:
                     ln = int.from_bytes(self.rfile.read(2), "big")
                 elif ln == 127:
                     ln = int.from_bytes(self.rfile.read(8), "big")
+                if ln > _WS_FRAME_CAP:
+                    return None                  # not an input event; drop the connection
                 mask = self.rfile.read(4) if masked else b""
                 payload = self.rfile.read(ln) if ln else b""
                 if masked:
@@ -19817,6 +20148,7 @@ class SuiteServer:
             def _ws(self, bc: Any, proj: Any):
                 if not self._ws_handshake():
                     return
+                self.connection.settimeout(None)     # a viewer may send no input for hours
                 if bc is None:
                     return          # nothing to stream yet; client retries after launch
                 stop = threading.Event()
@@ -19868,6 +20200,7 @@ class SuiteServer:
                 if bc is None or not getattr(bc, "running", False):
                     self._send(503, b"browser not running", "text/plain")
                     return
+                self.connection.settimeout(None)
                 boundary = "beatrixframe"
                 try:
                     self.wfile.write(
@@ -19891,7 +20224,62 @@ class SuiteServer:
                 except Exception:  # noqa: BLE001
                     pass
 
+            # Routes that write their own raw status line and then stream: never JSON-wrapped.
+            _STREAMS = ("/browser/stream", "/browser/ws", "/packets/stream")
+
+            def send_response(self, *a, **kw):
+                self._responded = True
+                return super().send_response(*a, **kw)
+
+            def _authorized(self, path: str) -> bool:
+                if not suite.require_auth or path in _OPEN_PATHS or path.startswith(_OPEN_PREFIXES):
+                    return True
+                return _webauth.token_ok(suite.token, self)
+
+            def _deny(self) -> None:
+                # Read a small body first: closing with unread data makes the kernel send an RST,
+                # and the client then reports a reset instead of the 401.
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = 0
+                if 0 < n <= 65536:
+                    try:
+                        self.rfile.read(n)
+                    except OSError:
+                        pass
+                self.close_connection = True
+                self._send(401, json.dumps({"ok": False, "auth_required": True,
+                                            "error": "missing or invalid access token — open the link "
+                                                     "beatrix-suite printed"}).encode(), "application/json")
+
+            def _guard(self, route) -> None:
+                """Run a route. An unexpected exception becomes a JSON 500 (and a traceback on the
+                console) instead of a dropped connection: the client used to get no response at
+                all, so the UI silently stalled on malformed or unexpected input."""
+                self._responded = False
+                if not self._authorized(urlparse(self.path).path):
+                    self._deny()
+                    return
+                try:
+                    route()
+                except Exception as e:  # noqa: BLE001
+                    sys.stderr.write(f"[beatrix-suite] {self.command} {self.path}\n")
+                    traceback.print_exc()
+                    if not self._responded and urlparse(self.path).path not in self._STREAMS:
+                        try:
+                            self._send(500, json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}).encode(),
+                                       "application/json")
+                        except Exception:  # noqa: BLE001
+                            pass
+
             def do_GET(self):
+                self._guard(self._route_get)
+
+            def do_POST(self):
+                self._guard(self._route_post)
+
+            def _route_get(self):
                 path = urlparse(self.path).path
                 if path.startswith("/cb/"):             # OAST canary hit (inbound from a target) — record, never gated
                     suite.oast.record(path[4:].split("/", 1)[0], "GET", self.path,
@@ -19901,7 +20289,7 @@ class SuiteServer:
                     self._json({"needs_session": True})
                     return
                 if path in ("/", "/index.html"):
-                    self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(200, page_html, "text/html; charset=utf-8")
                 elif path == "/assets/beatrix-banner.png":
                     # Packaged brand asset for the opening splash. 404s gracefully if the
                     # file isn't shipped, so the splash still renders (just without the logo).
@@ -19922,7 +20310,7 @@ class SuiteServer:
                 elif path == "/auth":
                     # Existing auth GUI, verbatim, same origin (its /api/* calls
                     # resolve to the handlers below).
-                    self._send(200, _AUTH_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(200, auth_html, "text/html; charset=utf-8")
                 elif path == "/projects":
                     self._json(suite.projects.state())
                 elif path == "/activity":
@@ -19987,7 +20375,8 @@ class SuiteServer:
                 elif path == "/msf/recon/popout":
                     q = parse_qs(urlparse(self.path).query)
                     proj = (q.get("project") or [None])[0] or suite.projects.state().get("active")
-                    self._send(200, _msf_recon_popout_page(proj).encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(200, _webauth.inject_shim(_msf_recon_popout_page(proj)).encode("utf-8"),
+                               "text/html; charset=utf-8")
                 elif path == "/msf/globals":
                     q = parse_qs(urlparse(self.path).query)
                     out = {}
@@ -20167,7 +20556,7 @@ class SuiteServer:
                     proj = (q.get("project") or [None])[0]
                     if proj is None:
                         proj = suite.projects.state().get("active")
-                    self._send(200, _browser_popout_page(proj).encode("utf-8"),
+                    self._send(200, _webauth.inject_shim(_browser_popout_page(proj)).encode("utf-8"),
                                "text/html; charset=utf-8")
                 elif path == "/http/search":
                     q = parse_qs(urlparse(self.path).query)
@@ -20328,19 +20717,37 @@ class SuiteServer:
                 else:
                     self._send(404, b"not found", "text/plain")
 
-            def do_POST(self):
+            def _route_post(self):
                 path = urlparse(self.path).path
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    length = max(0, int(self.headers.get("Content-Length") or 0))
+                except ValueError:
+                    self._send(400, b'{"ok": false, "error": "invalid Content-Length"}', "application/json")
+                    return
                 if path.startswith("/cb/"):             # OAST canary hit with a body — record, never gated
+                    # A hit is worth recording whatever its size: keep the first 64 KiB.
+                    raw = self.rfile.read(min(length, _CB_BODY_CAP)) if length else b""
+                    if length > _CB_BODY_CAP:
+                        self.close_connection = True     # the unread rest is discarded with the socket
                     suite.oast.record(path[4:].split("/", 1)[0], "POST", self.path,
                                       {k: v for k, v in self.headers.items()},
                                       raw.decode("utf-8", "replace"), self.client_address[0])
                     self._send(200, b"ok", "text/plain"); return
+                cap = _BODY_CAPS.get(path, _BODY_CAP)
+                if length > cap:
+                    self.close_connection = True
+                    self._send(413, json.dumps({"ok": False, "error": "request body too large (limit %d MiB)"
+                                                % (cap >> 20)}).encode(), "application/json")
+                    return
+                raw = self.rfile.read(length) if length else b"{}"
                 try:
                     payload = json.loads(raw or b"{}")
                 except Exception:
                     payload = {}
+                if not isinstance(payload, dict):     # [], null, "x" … used to crash every route
+                    self._send(400, b'{"ok": false, "error": "request body must be a JSON object"}',
+                               "application/json")
+                    return
 
                 if suite.session_dir is None and _needs_session(path):
                     self._json({"needs_session": True})
@@ -20819,22 +21226,24 @@ class SuiteServer:
                     self._send(404, b"not found", "text/plain")
 
         try:
-            self._httpd = ThreadingHTTPServer((self.host, self.port), _H)
+            self._httpd = _SuiteHTTPServer((self.host, self.port), _H)
         except OSError:
             # Port busy — fall back to an ephemeral free port rather than fail.
-            self._httpd = ThreadingHTTPServer((self.host, 0), _H)
+            self._httpd = _SuiteHTTPServer((self.host, 0), _H)
         self.port = self._httpd.server_address[1]
         display_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
         self.url = f"http://{display_host}:{self.port}/"
+        self.launch_url = _webauth.launch_url(self.url, self.token)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
         codespace = os.environ.get("CODESPACE_NAME")
         fwd = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
         if codespace and fwd:
             self.public_url = f"https://{codespace}-{self.port}.{fwd}/"
+            self.public_launch_url = _webauth.launch_url(self.public_url, self.token)
 
         if open_browser:
-            threading.Thread(target=lambda: webbrowser.open(self.url), daemon=True).start()
+            threading.Thread(target=lambda: webbrowser.open(self.launch_url), daemon=True).start()
         return self.url
 
     def stop(self) -> None:
@@ -20861,7 +21270,7 @@ class SuiteServer:
 
 
 def main(host: Optional[str] = None, port: Optional[int] = None,
-         open_browser: Optional[bool] = None) -> None:
+         open_browser: Optional[bool] = None, new_token: bool = False) -> None:
     """Launch the Beatrix Suite dashboard and block until Ctrl-C.
 
     Reachable two ways, and it behaves correctly for both:
@@ -20892,8 +21301,12 @@ def main(host: Optional[str] = None, port: Optional[int] = None,
                             help=f"Port to serve on (default: {DEFAULT_PORT})")
         parser.add_argument("--no-browser", action="store_true",
                             help="Do not open a browser tab automatically")
+        parser.add_argument("--new-token", action="store_true",
+                            help="Replace the access token (~/.beatrix/suite.token); "
+                                 "links opened with the old one stop working")
         args = parser.parse_args()
         host, port, open_browser = args.host, args.port, not args.no_browser
+        new_token = args.new_token
 
     host = "0.0.0.0" if host is None else host
     port = DEFAULT_PORT if port is None else port
@@ -20907,11 +21320,13 @@ def main(host: Optional[str] = None, port: Optional[int] = None,
     except Exception:
         pass
 
-    server = SuiteServer(host=host, port=port)
+    server = SuiteServer(host=host, port=port, new_token=new_token)
     server.start(open_browser=open_browser)
-    print(f"Beatrix Suite → {server.url}", flush=True)
-    if server.public_url:
-        print(f"   Codespaces → {server.public_url}", flush=True)
+    print(f"Beatrix Suite → {server.launch_url}", flush=True)
+    if server.public_launch_url:
+        print(f"   Codespaces → {server.public_launch_url}", flush=True)
+    print(f"Open the link above: it carries the access token (also in {_webauth.TOKEN_FILE}).",
+          flush=True)
     print("Press Ctrl-C to stop.", flush=True)
     try:
         while True:

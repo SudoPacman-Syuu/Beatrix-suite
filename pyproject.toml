@@ -36,11 +36,17 @@ dependencies = [
 
     # Security / Scanning
     "PyJWT>=2.8.0",
+    "cryptography>=3.3",   # TLS SAN recon parses raw DER certs (already pulled in by paramiko)
     "dnspython>=2.4.0",
     "python-nmap>=0.7.1",
     "paramiko>=3.4.0",
     "scapy>=2.5.0",
     "playwright>=1.40.0",
+
+    # Suite
+    "msgpack>=1.0.0",      # Metasploit console: msfrpcd speaks msgpack-RPC
+    "mmh3>=4.0.0",         # favicon hashes (Shodan-style) in OSINT recon
+    "zstandard>=0.22.0",   # decoding zstd-compressed responses in Repeater / HTTP history
 ]
 
 [project.optional-dependencies]

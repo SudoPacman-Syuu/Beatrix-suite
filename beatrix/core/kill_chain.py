@@ -280,6 +280,23 @@ class KillChainState:
                 self.context[key] = value
 
 
+def module_requested(requested_modules: Any, *names: str) -> bool:
+    """Whether a scan should run the stage that belongs to module(s) ``names``: a full scan (no
+    explicit modules) runs everything, otherwise only what was selected — the rule _run_scanner
+    applies to every scanner. Stages that fetched their engine or tool directly skipped it, so a
+    Quick/Stealth/Recon scan still ran nuclei, DOM XSS, SmartFuzzer, clairvoyance and the
+    injection sweeps."""
+    requested = set(requested_modules or [])
+    return not requested or bool(requested & set(names))
+
+
+def proactive_sweeps_allowed(requested_modules: Any) -> "tuple[bool, bool]":
+    """(dalfox XSS sweep allowed, sqlmap/crlfuzz injection sweeps allowed) for a scan:
+    XSS needs ``injection`` or ``dom_xss``; SQLi/CRLF need ``injection``."""
+    return (module_requested(requested_modules, "injection", "dom_xss"),
+            module_requested(requested_modules, "injection"))
+
+
 class KillChainExecutor:
     """
     Executes the kill chain against a target.
@@ -704,7 +721,7 @@ class KillChainExecutor:
         # ── 1) dnsx: resolve in-scope hosts → live hosts, IPs, CNAMEs ─────────
         hosts = sorted({h for h in (context.get("subdomains", []) + [domain]) if _in_scope(h)})
         resolved_ips, cdn_hosts = set(), set()
-        if tk.dnsx.available and hosts:
+        if module_requested(context.get("modules"), "crawl") and tk.dnsx.available and hosts:
             try:
                 self._emit("info", message=f"dnsx: resolving {len(hosts)} in-scope host(s)")
                 recs = await tk.dnsx.resolve(hosts[:500], extra_flags=["-rl", str(rl * 10)])
@@ -725,7 +742,7 @@ class KillChainExecutor:
         # ── 2) naabu: fast port scan of resolved IPs (skip CDN edges) ─────────
         hostports = []
         scan_hosts = sorted(resolved_ips) or [h for h in live_subs if h not in cdn_hosts] or [domain]
-        if tk.naabu.available and scan_hosts:
+        if deep and tk.naabu.available and scan_hosts:     # port scan: no module covers it → full scans only
             try:
                 self._emit("info", message=f"naabu: scanning {len(scan_hosts)} target(s)")
                 if deep:
@@ -746,7 +763,7 @@ class KillChainExecutor:
         for t in (hostports + [h for h in live_subs if h not in cdn_hosts] + [domain]):
             if t and t not in probe:
                 probe.append(t)
-        if tk.httpx.available and probe:
+        if module_requested(context.get("modules"), "crawl") and tk.httpx.available and probe:
             try:
                 self._emit("info", message=f"httpx: probing {len(probe)} target(s)")
                 liveh = await tk.httpx.probe(probe[:500], extra_flags=["-rate-limit", str(rl)])
@@ -792,7 +809,7 @@ class KillChainExecutor:
                 self._emit("scanner_error", scanner="gowitness", error=str(e))
 
         # ── 5) s3scanner: bucket candidates from domain + subdomains ──────────
-        if tk.s3scanner.available:
+        if module_requested(context.get("modules"), "takeover") and tk.s3scanner.available:
             try:
                 label = domain.split(".")[0]
                 affixes = ["", "-assets", "-static", "-media", "-uploads", "-backup", "-backups",
@@ -1964,7 +1981,8 @@ class KillChainExecutor:
             # ── Nuclei Network Scan — protocol-specific checks on non-HTTP ports ──
             # Feeds discovered services (Redis, MongoDB, FTP, SMTP, etc.) to nuclei's
             # network templates for unauthenticated access, default creds, CVEs.
-            nuclei_net = self.engine.modules.get("nuclei")
+            nuclei_net = (self.engine.modules.get("nuclei")
+                          if module_requested(context.get("modules"), "nuclei") else None)
             if nuclei_net and hasattr(nuclei_net, 'available') and nuclei_net.available:
                 services = net.get("services", {})
                 http_ports = set(services.get("http", []) + services.get("https", []))
@@ -2094,7 +2112,7 @@ class KillChainExecutor:
                 urls_with_params = set(context.get("urls_with_params", []))
 
                 # GAU — historical URLs from Wayback Machine, OTX, Common Crawl
-                if toolkit.gau.available:
+                if module_requested(context.get("modules"), "crawl") and toolkit.gau.available:
                     self._emit("info", message=f"Running gau on {domain} (historical URL discovery)")
                     try:
                         gau_urls = await toolkit.gau.fetch_urls(domain, subs=True)
@@ -2110,7 +2128,7 @@ class KillChainExecutor:
                 # Waymore — deeper historical URL mining beyond gau
                 # Covers URLscan.io and VirusTotal sources gau omits,
                 # exposing legacy /api/v1/ paths and forgotten upload endpoints.
-                if toolkit.waymore.available:
+                if module_requested(context.get("modules"), "crawl") and toolkit.waymore.available:
                     self._emit("info", message=f"Running waymore on {domain} (extended historical URL discovery)")
                     try:
                         wm_urls = await toolkit.waymore.fetch_urls(domain)
@@ -2152,7 +2170,7 @@ class KillChainExecutor:
                         self._emit("scanner_error", scanner="katana", error=str(e))
 
                 # Gospider — web spidering
-                if toolkit.gospider.available:
+                if module_requested(context.get("modules"), "crawl") and toolkit.gospider.available:
                     self._emit("info", message=f"Running gospider on {url}")
                     try:
                         spider_result = await toolkit.gospider.spider(
@@ -2180,7 +2198,7 @@ class KillChainExecutor:
                         self._emit("scanner_error", scanner="gospider", error=str(e))
 
                 # Hakrawler — endpoint crawler
-                if toolkit.hakrawler.available:
+                if module_requested(context.get("modules"), "crawl") and toolkit.hakrawler.available:
                     self._emit("info", message=f"Running hakrawler on {url}")
                     try:
                         hak_urls = await toolkit.hakrawler.crawl(url, depth=2)
@@ -2194,7 +2212,7 @@ class KillChainExecutor:
 
                 # Kiterunner — API route brute-forcing with real-world wordlists
                 # Discovers /api/v1/*, /graphql, /internal/* endpoints that crawlers miss.
-                if toolkit.kiterunner.available:
+                if module_requested(context.get("modules"), "endpoint_prober") and toolkit.kiterunner.available:
                     self._emit("info", message=f"Running kiterunner on {url} (API route discovery)")
                     try:
                         kr_result = await toolkit.kiterunner.scan(url)
@@ -2215,7 +2233,7 @@ class KillChainExecutor:
 
                 # Arjun — hidden parameter discovery on high-value endpoints
                 # Finds undocumented GET/POST params that open injection surfaces.
-                if toolkit.arjun.available:
+                if module_requested(context.get("modules"), "param_miner") and toolkit.arjun.available:
                     # Run on the base URL + any API/form endpoints discovered
                     arjun_targets = [url]
                     for u in list(discovered_urls)[:20]:  # cap to avoid runaway
@@ -2456,7 +2474,7 @@ class KillChainExecutor:
                         self._emit("scanner_error", scanner="whatweb", error=str(e))
 
                 # Webanalyze — Wappalyzer fingerprint database
-                if toolkit.webanalyze.available:
+                if module_requested(context.get("modules"), "crawl") and toolkit.webanalyze.available:
                     self._emit("info", message=f"Running webanalyze on {url} (Wappalyzer fingerprinting)")
                     try:
                         wa_techs = await toolkit.webanalyze.fingerprint(url)
@@ -2659,7 +2677,8 @@ class KillChainExecutor:
         # ── Nuclei Recon — fast tech/panel/WAF detection ──────────────────
         # Runs scan_recon() in parallel with other recon scanners.
         # Feeds technology fingerprints and exposed panels back for Phase 4.
-        nuclei = self.engine.modules.get("nuclei")
+        nuclei = (self.engine.modules.get("nuclei")
+                  if module_requested(context.get("modules"), "nuclei") else None)
         if nuclei and hasattr(nuclei, 'available') and nuclei.available:
             async def _nuclei_recon_task():
                 """Run nuclei recon pass and return structured result."""
@@ -3302,7 +3321,7 @@ class KillChainExecutor:
 
         async def _waf():
             tk = self.toolkit
-            if not tk.wafw00f.available:
+            if not (tk.wafw00f.available and module_requested(context.get("modules"), "injection", "ssti", "xxe", "ssrf", "dom_xss", "deserialization")):   # WAF fingerprint only feeds payload choice
                 return {"findings": [], "assets": [], "context": {}, "modules": [], "requests": 0}
             from urllib.parse import urlparse as _wp
             from beatrix.core.types import Confidence, Finding, Severity
@@ -3700,7 +3719,7 @@ class KillChainExecutor:
         # Recovers hidden/unexposed types and mutations from GraphQL endpoints
         # that disable introspection, giving a fuller attack surface picture.
         toolkit = getattr(self.engine, "external_toolkit", None)
-        if toolkit and toolkit.clairvoyance.available:
+        if toolkit and toolkit.clairvoyance.available and module_requested(context.get("modules"), "graphql"):
             graphql_endpoints = [
                 u for u in context.get("discovered_urls", [])
                 if any(seg in u.lower() for seg in ("/graphql", "/api/graphql", "/gql", "/query"))
@@ -3730,7 +3749,8 @@ class KillChainExecutor:
         # (innerHTML, eval, document.write) that server-side scanners miss.
         # Feed it ALL discovered URLs, not just those with query params —
         # DOM sources include hash fragments, postMessage, cookies, etc.
-        dom_xss = self.engine.modules.get("dom_xss")
+        dom_xss = (self.engine.modules.get("dom_xss")
+                   if module_requested(context.get("modules"), "dom_xss") else None)
         if dom_xss:
             from urllib.parse import urlparse as _up_dom
             discovered = context.get("discovered_urls", [])
@@ -3763,7 +3783,8 @@ class KillChainExecutor:
         # ── Nuclei Exploit — full CVE/exploit scan with workflows ─────────
         # Multi-mode nuclei: exploit pass + headless DOM checks + authenticated
         # Replaces the old single scan() call with intelligent split-phase execution.
-        nuclei = self.engine.modules.get("nuclei")
+        nuclei = (self.engine.modules.get("nuclei")
+                  if module_requested(context.get("modules"), "nuclei") else None)
         if nuclei and hasattr(nuclei, 'available') and nuclei.available:
             # Feed nuclei ALL discovered URLs for comprehensive coverage
             all_urls = list(set(
@@ -3875,13 +3896,13 @@ class KillChainExecutor:
                     results.append(headless_result)
             except Exception as e:
                 self._emit("scanner_error", scanner="nuclei_headless", error=str(e))
-        else:
+        elif module_requested(context.get("modules"), "nuclei"):     # selected but not installed
             self._emit("info", message="Nuclei not available — install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
 
         # ── SmartFuzzer — verified, deduplicated fuzzing with ffuf backend ─────
         # Runs on parameterized URLs to discover additional vulns that scanners
         # miss, then verifies and deduplicates so only confirmed findings survive.
-        if urls_with_params:
+        if urls_with_params and module_requested(context.get("modules"), "injection"):
             try:
                 from beatrix.core.smart_fuzzer import SmartFuzzer, VerifiedFinding as _VF
                 from beatrix.core.types import Finding as _F, Severity as _S, Confidence as _C
@@ -4065,13 +4086,20 @@ class KillChainExecutor:
             except Exception as e:
                 self._emit("scanner_error", scanner="smart_fuzzer", error=str(e))
 
+        # The proactive sweeps below (dalfox, sqlmap, crlfuzz) are active injection testing, so
+        # they follow the scan's module selection like every other scanner: a full scan (no
+        # explicit modules) or one that includes an injection module. They used to run whenever
+        # the tools were installed, so a Quick/Stealth/Recon scan fired injection payloads it
+        # never selected and could spend up to an hour in dalfox alone.
+        _xss_selected, _injection_selected = proactive_sweeps_allowed(context.get("modules"))
+
         # ── Proactive dalfox — XSS sweep on ALL param URLs ────────────────────
         # Runs before the confirmed-only pass so we catch XSS even when nuclei/
         # internal scanners didn't flag an indicator first (common on WAF-heavy
         # targets that silently absorb payloads without triggering heuristics).
         try:
             _toolkit_proactive = self.toolkit
-            if _toolkit_proactive.dalfox.available:
+            if _xss_selected and _toolkit_proactive.dalfox.available:
                 _param_urls = list(context.get("urls_with_params", set()))
                 # Score and sort: prefer shorter paths and high-risk param names
                 _HIGH_RISK_XSS_PARAMS = {
@@ -4129,7 +4157,7 @@ class KillChainExecutor:
         # an internal scanner to surface an indicator first.
         try:
             _toolkit_sqli = self.toolkit
-            if _toolkit_sqli.sqlmap.available:
+            if _injection_selected and _toolkit_sqli.sqlmap.available:
                 _SQLI_RISK_PARAMS = {
                     "id", "user_id", "uid", "pid", "item_id", "order_id",
                     "product_id", "cat", "category_id", "page_id",
@@ -4181,7 +4209,7 @@ class KillChainExecutor:
         # override, and path tricks to bypass access controls without creds.
         try:
             _nm_toolkit = self.toolkit
-            if _nm_toolkit.nomore403.available:
+            if module_requested(context.get("modules"), "bac") and _nm_toolkit.nomore403.available:
                 _forbidden_urls = list(context.get("auth_protected_endpoints", []))
                 # Also grab any 403/401 findings from this exploit run
                 for _r in results:
@@ -4225,7 +4253,7 @@ class KillChainExecutor:
         # misses (encoded variants, multi-stage injections).
         try:
             _crlf_toolkit = self.toolkit
-            if _crlf_toolkit.crlfuzz.available:
+            if _injection_selected and _crlf_toolkit.crlfuzz.available:
                 _crlf_targets = list(context.get("urls_with_params", []))[:40]
                 if _crlf_targets:
                     self._emit("info", message=f"Running crlfuzz on {len(_crlf_targets)} param URLs")
@@ -4468,7 +4496,7 @@ class KillChainExecutor:
         # provenance-tagged findings. No-op on a pure web hunt.
         try:
             _rtk = self.toolkit
-            if _rtk.rea.available:
+            if not context.get("modules") and _rtk.rea.available:     # binary RE: no module covers it → full scans only
                 _bin_exts = (".apk", ".jar", ".exe", ".dll", ".so", ".wasm", ".ipa", ".dex", ".bin", ".elf")
                 _artifacts = [u for u in context.get("discovered_urls", [])
                               if isinstance(u, str) and u.lower().split("?")[0].endswith(_bin_exts)]

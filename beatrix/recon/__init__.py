@@ -25,6 +25,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from beatrix.core.types import Confidence, Finding, Severity
+from beatrix.utils.helpers import in_domain
 
 
 @dataclass
@@ -101,7 +102,7 @@ class ReconRunner:
                             sub = sub.strip().lower()
                             if sub.startswith("*."):
                                 sub = sub[2:]
-                            if sub.endswith(self.domain) and sub:
+                            if in_domain(sub, self.domain):
                                 subdomains.add(sub)
         except Exception as e:
             self.log(f"crt.sh error: {e}", "WARN")
@@ -116,7 +117,7 @@ class ReconRunner:
                     for line in resp.text.split("\n"):
                         if "," in line:
                             sub = line.split(",")[0].strip().lower()
-                            if sub.endswith(self.domain):
+                            if in_domain(sub, self.domain):
                                 subdomains.add(sub)
         except Exception as e:
             self.log(f"HackerTarget error: {e}", "WARN")

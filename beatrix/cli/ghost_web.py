@@ -286,13 +286,19 @@ class GhostWebServer:
     """
 
     def __init__(self, meta: Optional[Dict[str, Any]] = None,
-                 host: str = "0.0.0.0", port: int = 8799):
+                 host: str = "0.0.0.0", port: int = 8799,
+                 token: Optional[str] = None):
         self.broker = _Broker(meta or {})
         self.host = host
         self.port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
         self.url: Optional[str] = None
         self.public_url: Optional[str] = None
+        # The run's events (requests, responses, findings) are only served with the access
+        # token shared by Beatrix's web UIs — see beatrix/cli/_webauth.py.
+        self.token: Optional[str] = token
+        self.launch_url: Optional[str] = None
+        self.public_launch_url: Optional[str] = None
 
     # The hooks call this for every agent event.
     def emit(self, event: Dict[str, Any]) -> None:
@@ -307,9 +313,16 @@ class GhostWebServer:
         self.broker.finish()
 
     def start(self, open_browser: bool = True) -> str:
+        from beatrix.cli import _webauth
         broker = self.broker
+        if self.token is None:
+            self.token = _webauth.load_or_create_token()
+        token = self.token
+        page = _webauth.inject_shim(_PAGE).encode()
 
         class _H(BaseHTTPRequestHandler):
+            timeout = 120
+
             def log_message(self, *a):  # quiet
                 pass
 
@@ -323,7 +336,9 @@ class GhostWebServer:
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path in ("/", "/index.html"):
-                    self._send(200, _PAGE.encode(), "text/html; charset=utf-8")
+                    self._send(200, page, "text/html; charset=utf-8")
+                elif not _webauth.token_ok(token, self):
+                    self._send(401, b'{"ok": false, "auth_required": true}', "application/json")
                 elif path == "/state":
                     self._send(200, json.dumps(broker.meta).encode(), "application/json")
                 elif path == "/events":
@@ -343,15 +358,17 @@ class GhostWebServer:
         self.port = self._httpd.server_address[1]
         display_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
         self.url = f"http://{display_host}:{self.port}/"
+        self.launch_url = _webauth.launch_url(self.url, token)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
         codespace = os.environ.get("CODESPACE_NAME")
         fwd = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
         if codespace and fwd:
             self.public_url = f"https://{codespace}-{self.port}.{fwd}/"
+            self.public_launch_url = _webauth.launch_url(self.public_url, token)
 
         if open_browser:
-            threading.Thread(target=lambda: webbrowser.open(self.url), daemon=True).start()
+            threading.Thread(target=lambda: webbrowser.open(self.launch_url), daemon=True).start()
         return self.url
 
     def wait(self) -> None:

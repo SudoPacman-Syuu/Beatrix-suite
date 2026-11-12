@@ -16,6 +16,7 @@ from typing import List, Optional, Set
 import httpx
 
 from beatrix.core.types import Confidence, Finding, Severity
+from beatrix.utils.helpers import in_domain
 
 # Subdomain takeover fingerprints
 TAKEOVER_FINGERPRINTS = {
@@ -67,7 +68,7 @@ class RapidHunter:
                     for entry in resp.json()[:100]:
                         for s in entry.get("name_value", "").split("\n"):
                             s = s.strip().lower().replace("*.", "")
-                            if s.endswith(domain) and s != domain:
+                            if in_domain(s, domain) and s != domain:
                                 subs.add(s)
                     return list(subs)
             except Exception as e:

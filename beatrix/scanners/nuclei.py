@@ -256,8 +256,9 @@ class NucleiScanner(BaseScanner):
         if path:
             return path
         # Check common locations
+        from beatrix.core.external_tools import go_bin_dirs
         for candidate in ["/usr/bin/nuclei", "/usr/local/bin/nuclei",
-                         str(Path.home() / "go/bin/nuclei"),
+                         *(str(Path(d) / "nuclei") for d in go_bin_dirs()),
                          str(Path.home() / ".local/bin/nuclei")]:
             if Path(candidate).exists():
                 return candidate

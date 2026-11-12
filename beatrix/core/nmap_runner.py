@@ -22,8 +22,11 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from beatrix.utils.helpers import kill_on_stop
 
 # The à-la-carte preset catalog, grouped by nmap capability so any single useful
 # function is one click. NMAP_PROFILES (flat name→args) is derived from the groups
@@ -206,13 +209,23 @@ def nmap_available() -> bool:
     return shutil.which("nmap") is not None
 
 
-def sudo_available() -> bool:
-    """True if we can gain root non-interactively (passwordless sudo)."""
+def sudo_available(*argv: str) -> bool:
+    """True if ``argv`` (default: nmap) can run as root without a password prompt.
+
+    Asks sudo about that exact command (``sudo -n -l <cmd> [args]``), so a sudoers rule scoped
+    to it — what ``install.sh --with-sudo-rules`` writes — counts. The old ``sudo -n true``
+    probe only passed with blanket NOPASSWD rights.
+    """
     if shutil.which("sudo") is None:
         return False
+    if not argv:
+        nmap = shutil.which("nmap")
+        if not nmap:
+            return False
+        argv = (nmap,)
     try:
         return subprocess.run(
-            ["sudo", "-n", "true"], capture_output=True, timeout=5
+            ["sudo", "-n", "-l", *argv], capture_output=True, timeout=5
         ).returncode == 0
     except Exception:
         return False
@@ -372,6 +385,13 @@ def run_scan(
         result["error"] = f"{type(e).__name__}: {e}"
         return result
 
+    # Stop and the timeout are enforced by a watcher, not between output lines: a quiet scan
+    # (no -v, e.g. a slow full-port sweep) prints nothing for long stretches, so the line
+    # loop below used to ignore Stop until nmap exited on its own.
+    timed_out: List[bool] = []
+    kill_on_stop(proc, stop_event, deadline=(time.time() + timeout) if timeout else None,
+                 on_deadline=lambda: timed_out.append(True))
+
     stream = LiveHostStream(xml_path) if (on_hosts and not resume_base) else None
     poll_stop = threading.Event()
 
@@ -414,6 +434,8 @@ def run_scan(
             poller.join()
         if stream is not None:
             _deliver(stream.poll())
+    if timed_out and not result["error"]:
+        result["error"] = f"scan exceeded {timeout}s and was killed"
 
     # Parse whatever XML landed (nmap writes it even for partial scans).
     try:

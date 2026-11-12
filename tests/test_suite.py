@@ -42,6 +42,19 @@ def server(tmp_path):
 
 
 @pytest.fixture
+def open_server(tmp_path):
+    # For tests that aim the Repeater / AutoRepeater at the suite itself: those requests are
+    # built from raw templates and don't carry the access token.
+    srv = SuiteServer(host="127.0.0.1", port=0, state_dir=tmp_path / "suite",
+                      sessions_registry=tmp_path / "sessions.json", require_auth=False)
+    srv.start(open_browser=False)
+    try:
+        yield srv
+    finally:
+        srv.stop()
+
+
+@pytest.fixture
 def sessionless(tmp_path):
     # A server with NO session mounted (what `beatrix-suite` shows at launch).
     srv = SuiteServer(host="127.0.0.1", port=0,
@@ -54,13 +67,16 @@ def sessionless(tmp_path):
 
 
 def _get(srv, path):
-    with urllib.request.urlopen(srv.url.rstrip("/") + path, timeout=5) as r:
+    req = urllib.request.Request(srv.url.rstrip("/") + path,
+                                 headers={"X-Beatrix-Token": srv.token or ""})
+    with urllib.request.urlopen(req, timeout=5) as r:
         return r.getcode(), r.read()
 
 
 def _post(srv, path, obj):
     req = urllib.request.Request(
-        srv.url.rstrip("/") + path, data=json.dumps(obj).encode(), method="POST"
+        srv.url.rstrip("/") + path, data=json.dumps(obj).encode(), method="POST",
+        headers={"X-Beatrix-Token": srv.token or ""},
     )
     with urllib.request.urlopen(req, timeout=5) as r:
         return r.getcode(), json.loads(r.read())
@@ -1317,13 +1333,13 @@ def test_repeater_close_last_reseeds(server):
     assert d["ok"] is True and len(d["tabs"]) == 1  # pane never empties
 
 
-def test_repeater_send_round_trips_and_records_history(server):
+def test_repeater_send_round_trips_and_records_history(open_server):
     # Point the Repeater at the suite's own /projects endpoint — a real send.
-    tid = json.loads(_get(server, "/repeater")[1])["tabs"][0]["id"]
-    host = server.url.split("//", 1)[1].rstrip("/")
+    tid = json.loads(_get(open_server, "/repeater")[1])["tabs"][0]["id"]
+    host = open_server.url.split("//", 1)[1].rstrip("/")
     req = "GET /projects HTTP/1.1\r\nHost: %s\r\n\r\n" % host
-    _, d = _post(server, "/repeater/send",
-                 {"id": tid, "request": req, "target": server.url})
+    _, d = _post(open_server, "/repeater/send",
+                 {"id": tid, "request": req, "target": open_server.url})
     resp = d["response"]
     assert resp["status"] == 200 and resp["error"] is None
     assert '"projects"' in resp["body"] and resp["size"] > 0
@@ -1332,8 +1348,8 @@ def test_repeater_send_round_trips_and_records_history(server):
     assert len(d["tab"]["history"]) == 1           # send was recorded
 
     # A second send appends to history; the tab remembers its last response.
-    _post(server, "/repeater/send", {"id": tid, "request": req, "target": server.url})
-    reloaded = json.loads(_get(server, "/repeater")[1])["tabs"][0]
+    _post(open_server, "/repeater/send", {"id": tid, "request": req, "target": open_server.url})
+    reloaded = json.loads(_get(open_server, "/repeater")[1])["tabs"][0]
     assert len(reloaded["history"]) == 2 and reloaded["response"]["status"] == 200
 
 
@@ -1460,16 +1476,16 @@ def test_issue_leaves_a_real_captured_request_untouched():
     assert iss["request"] == raw and iss["request_synthesized"] is False
 
 
-def test_repeater_send_of_wrapped_xxe_does_not_raise_illegal_header(server):
+def test_repeater_send_of_wrapped_xxe_does_not_raise_illegal_header(open_server):
     # End-to-end: the wrapped XXE request sends against the suite itself and comes
     # back with a real status — never a LocalProtocolError.
     iss = _finding_to_issue(
-        _bare_finding(title="XXE", url=server.url.rstrip("/") + "/upload", request=_XXE_XML),
+        _bare_finding(title="XXE", url=open_server.url.rstrip("/") + "/upload", request=_XXE_XML),
         "hunt", "xxe")
-    _, d = _post(server, "/repeater/new", {"request": iss["request"], "target": server.url})
+    _, d = _post(open_server, "/repeater/new", {"request": iss["request"], "target": open_server.url})
     tid = d["tabs"][-1]["id"]
-    _, sent = _post(server, "/repeater/send",
-                    {"id": tid, "request": iss["request"], "target": server.url})
+    _, sent = _post(open_server, "/repeater/send",
+                    {"id": tid, "request": iss["request"], "target": open_server.url})
     resp = sent["response"]
     assert resp["error"] is None and resp["status"] is not None
     assert "LocalProtocolError" not in (resp.get("error") or "")
@@ -1636,22 +1652,22 @@ def test_repeater_new_without_seed_keeps_template(server):
     assert d["tabs"][-1]["target"] == ""
 
 
-def test_send_to_repeater_end_to_end_from_issue(server):
+def test_send_to_repeater_end_to_end_from_issue(open_server):
     # An issue's reconstructed request handed to the Repeater is sendable: seed a
     # tab from it, then send it back at the suite's own /projects endpoint.
     from beatrix.core.types import Finding, Severity
-    host = server.url.split("//", 1)[1].rstrip("/")
-    server.issues.add_finding(1, Finding(
-        title="probe", url=server.url.rstrip("/") + "/projects",
+    host = open_server.url.split("//", 1)[1].rstrip("/")
+    open_server.issues.add_finding(1, Finding(
+        title="probe", url=open_server.url.rstrip("/") + "/projects",
         severity=Severity.INFO), "hunt", "hunt")
-    iid = json.loads(_get(server, "/issues?project=1")[1])["issues"][0]["id"]
-    issue = json.loads(_get(server, "/issues/detail?project=1&id=%d" % iid)[1])["issue"]
+    iid = json.loads(_get(open_server, "/issues?project=1")[1])["issues"][0]["id"]
+    issue = json.loads(_get(open_server, "/issues/detail?project=1&id=%d" % iid)[1])["issue"]
     # The button posts the issue's request + origin as a new tab.
-    _, d = _post(server, "/repeater/new",
-                 {"request": issue["request"], "target": server.url})
+    _, d = _post(open_server, "/repeater/new",
+                 {"request": issue["request"], "target": open_server.url})
     tid = d["tabs"][-1]["id"]
-    _, sent = _post(server, "/repeater/send",
-                    {"id": tid, "request": issue["request"], "target": server.url})
+    _, sent = _post(open_server, "/repeater/send",
+                    {"id": tid, "request": issue["request"], "target": open_server.url})
     assert sent["response"]["status"] == 200 and '"projects"' in sent["response"]["body"]
 
 
@@ -1872,14 +1888,14 @@ def _ar_poll(server, project=1, tries=150):
     return st.get("results", []), last
 
 
-def test_autorepeater_run_streams_results_with_grep(server):
-    host = server.url.split("//", 1)[1].rstrip("/")
+def test_autorepeater_run_streams_results_with_grep(open_server):
+    host = open_server.url.split("//", 1)[1].rstrip("/")
     template = "GET /§projects§ HTTP/1.1\r\nHost: %s\r\n\r\n" % host
-    _, r = _post(server, "/autorepeater/run", {
-        "template": template, "target": server.url, "attack_type": "sniper",
+    _, r = _post(open_server, "/autorepeater/run", {
+        "template": template, "target": open_server.url, "attack_type": "sniper",
         "payload_sets": [["projects", "nope"]], "grep": "active", "concurrency": 4})
     assert r["ok"] and r["total"] == 2
-    rows, last = _ar_poll(server)
+    rows, last = _ar_poll(open_server)
     assert last["done"] is True and len(rows) == 2
     by_payload = {tuple(x["payloads"]): x for x in rows}
     assert by_payload[("projects",)]["status"] == 200
@@ -1887,7 +1903,7 @@ def test_autorepeater_run_streams_results_with_grep(server):
     assert by_payload[("nope",)]["status"] == 404
     assert by_payload[("nope",)]["grep"] == 0
     # a row's full request/response is retrievable
-    d = json.loads(_get(server, "/autorepeater/result?project=1&index=1")[1])["result"]
+    d = json.loads(_get(open_server, "/autorepeater/result?project=1&index=1")[1])["result"]
     assert d["request"].startswith("GET /") and d["response"].startswith("HTTP/")
 
 
@@ -1929,26 +1945,26 @@ def test_ar_payload_processing_rules():
     assert req.startswith("id=%27%20OR%201&y=2")
 
 
-def test_autorepeater_grep_extract_captures_value(server):
-    host = server.url.split("//", 1)[1].rstrip("/")
+def test_autorepeater_grep_extract_captures_value(open_server):
+    host = open_server.url.split("//", 1)[1].rstrip("/")
     template = "GET /§projects§ HTTP/1.1\r\nHost: %s\r\n\r\n" % host
-    _, r = _post(server, "/autorepeater/run", {
-        "template": template, "target": server.url, "attack_type": "sniper",
+    _, r = _post(open_server, "/autorepeater/run", {
+        "template": template, "target": open_server.url, "attack_type": "sniper",
         "payload_sets": [{"type": "list", "items": ["projects"]}],
         "extract": r'"active":\s*(\d+)'})           # capture group → Extract column
     assert r["ok"]
-    rows, last = _ar_poll(server)
+    rows, last = _ar_poll(open_server)
     assert last["done"] and rows[0]["extract"] == "1"   # /projects has "active": 1
 
 
-def test_autorepeater_numbers_payload_with_processing(server):
-    host = server.url.split("//", 1)[1].rstrip("/")
-    _, r = _post(server, "/autorepeater/run", {
-        "template": "GET /a?n=§1§ HTTP/1.1\r\nHost: %s\r\n\r\n" % host, "target": server.url,
+def test_autorepeater_numbers_payload_with_processing(open_server):
+    host = open_server.url.split("//", 1)[1].rstrip("/")
+    _, r = _post(open_server, "/autorepeater/run", {
+        "template": "GET /a?n=§1§ HTTP/1.1\r\nHost: %s\r\n\r\n" % host, "target": open_server.url,
         "attack_type": "sniper", "payload_sets": [{"type": "numbers", "from": 1, "to": 3, "step": 1}],
         "processing": [{"type": "prefix", "value": "P"}]})
     assert r["ok"] and r["total"] == 3
-    rows, _last = _ar_poll(server)
+    rows, _last = _ar_poll(open_server)
     assert sorted(tuple(x["payloads"]) for x in rows) == [("P1",), ("P2",), ("P3",)]
 
 
@@ -1960,15 +1976,15 @@ def test_autorepeater_bad_extract_regex_rejected(server):
     assert r["ok"] is False and "regex" in r["error"].lower()
 
 
-def test_autorepeater_stop_and_state(server):
-    host = server.url.split("//", 1)[1].rstrip("/")
+def test_autorepeater_stop_and_state(open_server):
+    host = open_server.url.split("//", 1)[1].rstrip("/")
     template = "GET /§projects§ HTTP/1.1\r\nHost: %s\r\n\r\n" % host
-    _post(server, "/autorepeater/run", {"template": template, "target": server.url,
+    _post(open_server, "/autorepeater/run", {"template": template, "target": open_server.url,
         "attack_type": "sniper", "payload_sets": [["projects"]], "concurrency": 2})
-    _ar_poll(server)                                     # let it finish
-    st = json.loads(_get(server, "/autorepeater/state?project=1")[1])
+    _ar_poll(open_server)                                     # let it finish
+    st = json.loads(_get(open_server, "/autorepeater/state?project=1")[1])
     assert st["running"] is False and st["total"] == 1 and len(st["results"]) == 1
-    assert _post(server, "/autorepeater/stop", {"project": 1})[1]["ok"] is True
+    assert _post(open_server, "/autorepeater/stop", {"project": 1})[1]["ok"] is True
 
 
 # ── Feed Issues → Ghost for validation (token-saving: validate, don't re-discover) ──

@@ -6,12 +6,11 @@
 # shell have the real binaries available without touching the host.
 #
 # Build:   docker build -f docker/ghost-sandbox.Dockerfile -t beatrix/ghost-sandbox:latest .
-#   (or:   beatrix ghost2 --build-sandbox)
-# Use:     ai.sandbox_image: beatrix/ghost-sandbox:latest   (config.yaml)
+#   (or:   ./install.sh --with-docker)
+# Use:     automatic once built — DockerRuntime prefers beatrix/ghost-sandbox:latest when
+#          ai.sandbox_image isn't set in config.yaml (otherwise it uses python:3.11-slim).
 #
-# The DockerRuntime also works with a plain python:3.11-slim image (its default);
-# this image just adds the external tooling. Keep the tool list in sync with the
-# GO_TOOLS map and apt block in install.sh.
+# Builds on amd64 and arm64. Keep the tool list in sync with the Go tool map in install.sh.
 
 FROM python:3.11-slim AS base
 
@@ -20,21 +19,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GOPATH=/opt/go \
     PATH=/opt/go/bin:/usr/local/go/bin:/usr/local/bin:$PATH
 
-# ── System deps: build tools, nmap, sqlmap, git, and Chromium shared libs
-#    (nuclei headless / Playwright need these) ────────────────────────────
+# ── System deps: build tools, nmap, sqlmap, git ──────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential \
-        nmap sqlmap \
-        libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 \
-        libgtk-3-0 libnss3 libxcomposite1 libxdamage1 \
-        libxfixes3 libxrandr2 libpango-1.0-0 libdrm2 \
-        libxshmfence1 libxkbcommon0 libasound2 \
+        ca-certificates curl git build-essential libpcap-dev \
+        nmap sqlmap whois dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Go toolchain + the ProjectDiscovery / recon arsenal (matches install.sh) ─
-ARG GO_VERSION=1.22.5
-RUN curl -sSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
-      | tar -C /usr/local -xz
+# ── Go toolchain (current release, this image's architecture) + the arsenal ─
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    ver="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"; \
+    curl -fsSL "https://go.dev/dl/${ver}.linux-${arch}.tar.gz" | tar -C /usr/local -xz
 RUN go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \
  && go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest \
  && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \
@@ -44,16 +39,20 @@ RUN go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \
  && go install -v github.com/lc/gau/v2/cmd/gau@latest \
  && go install -v github.com/jaeles-project/gospider@latest \
  && go install -v github.com/hakluke/hakrawler@latest \
+ && go install -v github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest \
  && rm -rf /root/.cache/go-build
 
 # ── Beatrix + the agent extra, installed into the image ──────────────────
+# docs/manual is part of the wheel (pyproject's force-include), so the build needs it.
 WORKDIR /opt/beatrix
 COPY pyproject.toml README.md ./
+COPY docs/manual ./docs/manual
 COPY beatrix ./beatrix
 RUN pip install ".[agent]"
 
-# Playwright browser (Beatrix's browser transport / auto_login use chromium)
-RUN python -m playwright install chromium || true
+# Playwright's Chromium plus the system libraries it needs (Beatrix's browser
+# transport / auto_login; nuclei headless uses the same libraries).
+RUN python -m playwright install --with-deps chromium
 
 # ── Nuclei templates (best-effort; scans still run without a fresh set) ───
 RUN nuclei -update-templates >/dev/null 2>&1 || true

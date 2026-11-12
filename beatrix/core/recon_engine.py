@@ -21,13 +21,18 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import itertools
 import re
+import shutil
 import socket
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+
+from beatrix.utils.helpers import in_domain
 
 Log = Callable[[str], None]
 
@@ -65,6 +70,21 @@ def _cdn_name(text: str) -> Optional[str]:
         if c in t:
             return "Cloudflare" if c == "cloudflare" else c.title()
     return None
+
+
+# CDNs and clouds whose address space is shared by countless unrelated customers.
+# Whole words only (unlike _cdn_name's display labels): a skip decision can't let
+# "Lawson Software" pass for AWS or "Amazonas Energia" for Amazon. "(?:net)?" catches
+# ASN-style names such as CLOUDFLARENET.
+_SHARED_PROVIDER_RE = re.compile(
+    r"\b(%s)(?:net)?\b" % "|".join(_CDN_ORGS + ("digitalocean", "linode", "vultr", "hetzner", "ovh")),
+    re.I)
+
+
+def shared_provider(org: str) -> Optional[str]:
+    """The CDN / cloud provider an RDAP or ASN org string names (lower-case), else None."""
+    m = _SHARED_PROVIDER_RE.search(org or "")
+    return m.group(1).lower() if m else None
 
 
 # ── RDAP (IP + domain ownership) ──────────────────────────────────────────────
@@ -181,7 +201,7 @@ def comp_crtsh(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
             for row in r.json():
                 for nm in (row.get("name_value") or "").splitlines():
                     nm = nm.strip().lstrip("*.").lower()
-                    if nm.endswith(domain) and _valid_host(nm):
+                    if in_domain(nm, domain) and _valid_host(nm):
                         names.add(nm)
     except Exception as e:  # noqa: BLE001
         return {"entities": [], "log": [f"crt.sh error: {e}"]}
@@ -224,15 +244,45 @@ def comp_dns_records(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, A
 
 
 # ── DNS brute force ───────────────────────────────────────────────────────────
-def _resolve(host: str, timeout: float = 3.0) -> List[str]:
+# _resolve/_ptr deliberately do NOT call socket.setdefaulttimeout(). That setting is
+# process-wide: once an OSINT sweep reached these stages it left every socket the suite
+# opened afterwards (its own HTTP server connections included) on a 3 s timeout. It never
+# bounded these lookups anyway — getaddrinfo()/gethostbyaddr() are libc resolver calls
+# that ignore Python socket timeouts (the system resolver config governs them).
+def _resolve(host: str) -> List[str]:
     try:
-        socket.setdefaulttimeout(timeout)
         return list({r[4][0] for r in socket.getaddrinfo(host, None)})
     except Exception:  # noqa: BLE001
         return []
 
 
-def comp_dns_brute(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
+def _stoppable_map(fn: Callable[[Any], Any], items: List[Any], workers: int,
+                   stop: Optional[threading.Event]) -> Tuple[List[Any], bool]:
+    """Run ``fn`` over ``items`` on a thread pool; return (results in input order, stopped).
+
+    Replaces ``with ThreadPoolExecutor() as ex: ex.map(...)``, which queues every item up
+    front and then blocks until all of them finish — so a Stop could not land until a whole
+    netblock (up to 4,096 lookups) was done. Here a Stop takes effect within ~0.25 s:
+    lookups not yet started are cancelled, the pool is not waited on (the few in-flight
+    libc lookups finish on their own), and items that never ran come back as ``None``."""
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = [ex.submit(fn, it) for it in items]
+    stopped = False
+    try:
+        pending = set(futs)
+        while pending:
+            if stop is not None and stop.is_set():
+                stopped = True
+                break
+            _, pending = wait(pending, timeout=0.25)
+    finally:
+        ex.shutdown(wait=not stopped, cancel_futures=True)
+    return [f.result() if f.done() and not f.cancelled() and f.exception() is None else None
+            for f in futs], stopped
+
+
+def comp_dns_brute(domain: str, opts: Dict[str, Any], log: Log,
+                   stop: Optional[threading.Event] = None) -> Dict[str, Any]:
     words = opts.get("words") or _DEFAULT_SUBS
     if isinstance(words, str):
         words = [w.strip() for w in re.split(r"[\s,]+", words) if w.strip()]
@@ -242,52 +292,75 @@ def comp_dns_brute(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any
     if wildcard:
         log(f"  wildcard DNS detected ({', '.join(sorted(wildcard))}) — filtering matches")
     log(f"Brute-forcing {len(words)} subdomains of {domain} …")
+    results, stopped = _stoppable_map(lambda w: _resolve(f"{w}.{domain}"), words, 40, stop)
     ents: List[Dict[str, Any]] = []
     found = 0
-    with ThreadPoolExecutor(max_workers=40) as ex:
-        results = ex.map(lambda w: (w, _resolve(f"{w}.{domain}")), words)
-        for w, ips in results:
-            ips = [i for i in ips if i not in wildcard]
-            if ips:
-                found += 1
-                ents.append(_ent("subdomain", f"{w}.{domain}", ips=ips, source="brute"))
-                for ip in ips:
-                    ents.append(_ent("ip", ip, source=f"brute {w}.{domain}"))
-    log(f"  {found} subdomains resolved")
-    return {"entities": ents, "log": []}
+    for w, ips in zip(words, results):
+        ips = [i for i in (ips or []) if i not in wildcard]
+        if ips:
+            found += 1
+            ents.append(_ent("subdomain", f"{w}.{domain}", ips=ips, source="brute"))
+            for ip in ips:
+                ents.append(_ent("ip", ip, source=f"brute {w}.{domain}"))
+    tried = sum(r is not None for r in results)
+    # Returned, not log()ged: callers mute live logs once Stop is pressed, but always
+    # print the returned lines — so the "stopped after" note is actually seen.
+    return {"entities": ents, "interrupted": stopped, "log": [
+        f"  {found} subdomains resolved"
+        + (f" — stopped after {tried} of {len(words)} lookups" if stopped else "")]}
 
 
 # ── Reverse-DNS netblock sweep ────────────────────────────────────────────────
-def _ptr(ip: str, timeout: float = 3.0) -> str:
+_REVERSE_SWEEP_CAP = 4096   # max addresses PTR-swept per netblock
+
+
+def _ptr(ip: str) -> str:
     try:
-        socket.setdefaulttimeout(timeout)
         return socket.gethostbyaddr(ip)[0]
     except Exception:  # noqa: BLE001
         return ""
 
 
-def comp_reverse_sweep(cidr: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
+def comp_reverse_sweep(cidr: str, opts: Dict[str, Any], log: Log,
+                       stop: Optional[threading.Event] = None) -> Dict[str, Any]:
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError as e:
         return {"entities": [], "log": [f"bad CIDR: {e}"]}
-    hosts = list(net.hosts()) if net.num_addresses > 2 else list(net)
-    if len(hosts) > 4096:
-        log(f"  {cidr} has {len(hosts)} addresses — capping sweep at 4096")
-        hosts = hosts[:4096]
+    if net.version == 6 and net.num_addresses > _REVERSE_SWEEP_CAP:
+        # IPv6 space is far too sparse to walk address-by-address: the first 4,096
+        # addresses of a /32 are ~5e-26 of it and almost never hold a PTR, so sweeping them
+        # only burned minutes of lookups. Known hosts inside the block still get reverse-
+        # resolved one by one by the "reverse" component (the sweep's Reverse DNS stage).
+        log(f"  {cidr}: skipped — an IPv6 block of 2^{net.max_prefixlen - net.prefixlen} "
+            f"addresses is too sparse to sweep; reverse-resolve its known IPs with "
+            f"{COMPONENTS['reverse']['label']} instead")
+        return {"entities": [], "log": []}
+    # Take at most CAP+1 addresses off the lazy iterator — never list() the whole network
+    # first: an IPv4 /8 is 16.7M address objects, and (before oversized IPv6 blocks were
+    # skipped above) a /32 of 2^96 addresses grew the process until the OOM killer took
+    # down the whole suite mid-sweep.
+    addrs = net.hosts() if net.num_addresses > 2 else iter(net)
+    hosts = list(itertools.islice(addrs, _REVERSE_SWEEP_CAP + 1))
+    if len(hosts) > _REVERSE_SWEEP_CAP:
+        log(f"  {cidr} has {net.num_addresses:,} addresses — capping sweep at {_REVERSE_SWEEP_CAP}")
+        hosts = hosts[:_REVERSE_SWEEP_CAP]
     log(f"Reverse-DNS sweep of {cidr} ({len(hosts)} addresses) …")
+    ips = [str(h) for h in hosts]
+    names, stopped = _stoppable_map(_ptr, ips, 50, stop)
     ents: List[Dict[str, Any]] = []
     found = 0
-    with ThreadPoolExecutor(max_workers=50) as ex:
-        results = ex.map(lambda ip: (str(ip), _ptr(str(ip))), hosts)
-        for ip, name in results:
-            if name:
-                found += 1
-                ents.append(_ent("ip", ip, ptr=name, source=f"rDNS {cidr}"))
-                if _valid_host(name.lower()):
-                    ents.append(_ent("subdomain", name.lower().rstrip("."), ips=[ip], source="rDNS"))
-    log(f"  {found} addresses with PTR records")
-    return {"entities": ents, "log": []}
+    for ip, name in zip(ips, names):
+        if name:
+            found += 1
+            ents.append(_ent("ip", ip, ptr=name, source=f"rDNS {cidr}"))
+            if _valid_host(name.lower()):
+                ents.append(_ent("subdomain", name.lower().rstrip("."), ips=[ip], source="rDNS"))
+    tried = sum(n is not None for n in names)
+    # Returned, not log()ged — see comp_dns_brute.
+    return {"entities": ents, "interrupted": stopped, "log": [
+        f"  {found} addresses with PTR records"
+        + (f" — stopped after {tried} of {len(ips)} lookups" if stopped else "")]}
 
 
 # ── Zone transfer (AXFR) ──────────────────────────────────────────────────────
@@ -352,14 +425,77 @@ def comp_asn(target: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
     return {"entities": ents, "log": []}
 
 
-# ── WHOIS (binary) ────────────────────────────────────────────────────────────
+# ── WHOIS (the binary if installed, else a pure-Python RFC 3912 client) ───────
+_WHOIS_IANA = "whois.iana.org"
+_WHOIS_PORT = 43
+# A referral to the next WHOIS server: IANA's "refer:" (or "whois:"), a registry's
+# "Registrar WHOIS Server:" / "Whois Server:", ARIN-style "ReferralServer: whois://host".
+# [ \t]* (not \s*) so an empty value can't swallow the next line.
+_WHOIS_REFERRAL = re.compile(
+    r"^[ \t]*(?:refer|whois|(?:registrar[ \t]+)?whois[ \t]+server|referralserver)[ \t]*:[ \t]*"
+    r"(?:r?whois://)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)", re.I | re.M)
+
+
+def _whois_query(server: str, query: str, timeout: float = 8.0) -> str:
+    """One RFC 3912 exchange: send the query line, read until the server closes."""
+    try:
+        q = query.encode("idna")
+    except UnicodeError:
+        q = query.encode("ascii", "ignore")
+    with socket.create_connection((server, _WHOIS_PORT), timeout=timeout) as s:
+        s.sendall(q + b"\r\n")
+        chunks: List[bytes] = []
+        total = 0
+        while total < 1_000_000:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def _whois_lookup(domain: str, timeout: float = 8.0) -> str:
+    """Pure-Python WHOIS for hosts without the ``whois`` binary (a fresh Codespace has
+    none). IANA is asked only which server runs the domain's TLD — that reply describes
+    the registry operator and is never output, or the operator's contacts would be recorded
+    as the target's. Then the registry is queried and referrals followed to the registrar
+    (at most 3 servers, never the same one twice; IANA may legitimately be one, e.g. for
+    example.com). Returns the answers concatenated, like the binary prints them."""
+    tld = domain.rstrip(".").rsplit(".", 1)[-1]
+    try:
+        m = _WHOIS_REFERRAL.search(_whois_query(_WHOIS_IANA, tld, timeout))
+    except OSError:
+        return ""
+    out: List[str] = []
+    seen: set = set()
+    # IANA leaves some TLDs' whois field blank (e.g. .uk) — fall back to the
+    # whois.nic.<tld> convention that ICANN requires of gTLDs and most ccTLDs follow.
+    server = m.group(1).lower().rstrip(".") if m else f"whois.nic.{tld.lower()}"
+    while server and server not in seen and len(seen) < 3:
+        seen.add(server)
+        try:
+            txt = _whois_query(server, domain, timeout)
+        except OSError:
+            break
+        out.append(txt)
+        m = _WHOIS_REFERRAL.search(txt)
+        server = m.group(1).lower().rstrip(".") if m else None
+    return "\n".join(out)
+
+
 def comp_whois(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
     log(f"WHOIS {domain} …")
     try:
-        out = subprocess.run(["whois", domain], capture_output=True, text=True,
-                             timeout=20).stdout
+        if shutil.which("whois"):
+            out = subprocess.run(["whois", domain], capture_output=True, text=True,
+                                 timeout=20).stdout
+        else:   # no whois binary installed — speak the protocol directly
+            out = _whois_lookup(domain)
     except Exception as e:  # noqa: BLE001
         return {"entities": [], "log": [f"whois error: {e}"]}
+    if not out.strip():
+        log("  no WHOIS response")
     emails = sorted(set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", out)))
     ents = [_ent("contact", e, role="whois", source=f"WHOIS {domain}") for e in emails
             if not e.lower().endswith((".arpa", "example.com"))]
@@ -446,7 +582,7 @@ def comp_certspotter(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, A
         for iss in r.json() or []:
             for nm in iss.get("dns_names") or []:
                 nm = str(nm).strip().lstrip("*.").lower()
-                if nm.endswith(domain) and _valid_host(nm):
+                if in_domain(nm, domain) and _valid_host(nm):
                     names.add(nm)
     except Exception as e:  # noqa: BLE001
         return {"entities": [], "log": [f"CertSpotter error: {e}"]}
@@ -470,11 +606,13 @@ def comp_otx(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
     for row in rows[:3000]:
         host = str(row.get("hostname") or "").strip().strip(".").lower()
         addr = str(row.get("address") or "").strip()
-        if host and host.endswith(domain) and _valid_host(host) and host not in seen:
+        if not (in_domain(host, domain) and _valid_host(host)):
+            continue        # lookalike / unrelated host: neither it nor its IP is in scope
+        if host not in seen:
             seen.add(host)
             ents.append(_ent("subdomain", host, ips=[addr] if _is_ip(addr) else None, source="OTX"))
         if _is_ip(addr):
-            ents.append(_ent("ip", addr, source=f"OTX {host}" if host else "OTX"))
+            ents.append(_ent("ip", addr, source=f"OTX {host}"))
     log(f"  OTX: {len(seen)} passive-DNS hostnames")
     return {"entities": ents, "log": []}
 
@@ -498,10 +636,11 @@ def comp_hackertarget(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, 
         if len(parts) != 2:
             continue
         host, ip = parts[0].strip().strip(".").lower(), parts[1].strip()
-        if host and host.endswith(domain) and _valid_host(host):
-            found += 1
-            ents.append(_ent("subdomain", host, ips=[ip] if _is_ip(ip) else None,
-                             source="HackerTarget"))
+        if not (in_domain(host, domain) and _valid_host(host)):
+            continue        # lookalike / unrelated host: neither it nor its IP is in scope
+        found += 1
+        ents.append(_ent("subdomain", host, ips=[ip] if _is_ip(ip) else None,
+                         source="HackerTarget"))
         if _is_ip(ip):
             ents.append(_ent("ip", ip, source=f"HackerTarget {host}"))
     log(f"  HackerTarget: {found} hostnames")
@@ -525,7 +664,7 @@ def comp_wayback(domain: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
     for row in data_rows:
         url = row[0] if isinstance(row, (list, tuple)) and row else str(row)
         host = _host_from_url(url)
-        if host and host.endswith(domain) and _valid_host(host):
+        if in_domain(host, domain) and _valid_host(host):
             names.add(host)
     log(f"  Wayback: {len(names)} unique hostnames from archived URLs")
     return {"entities": [_ent("subdomain", n, source="Wayback") for n in sorted(names)], "log": []}
@@ -608,15 +747,18 @@ def comp_geoip(ip: str, opts: Dict[str, Any], log: Log) -> Dict[str, Any]:
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 # needs: the kind of target the component expects (domain | ip | cidr | host).
+# stoppable: takes the run's Stop event (the long thread-pool fan-outs).
+# contacts_host: connects to the host itself, not just to resolvers / third-party APIs —
+#   so a Full Sweep only fans it out to hosts inside the sweep's domains.
 COMPONENTS: Dict[str, Dict[str, Any]] = {
     "dns_records":   {"label": "DNS records (A/MX/NS/TXT/SOA)", "cluster": "DNS & Hosts", "needs": "domain", "fn": comp_dns_records},
-    "dns_brute":     {"label": "DNS brute-force (subdomains)", "cluster": "DNS & Hosts", "needs": "domain", "fn": comp_dns_brute, "opts": ["words"]},
+    "dns_brute":     {"label": "DNS brute-force (subdomains)", "cluster": "DNS & Hosts", "needs": "domain", "fn": comp_dns_brute, "opts": ["words"], "stoppable": True},
     "zone_transfer": {"label": "Zone transfer (AXFR)", "cluster": "DNS & Hosts", "needs": "domain", "fn": comp_zone_transfer},
     "resolve":       {"label": "Resolve host → IP", "cluster": "DNS & Hosts", "needs": "host", "fn": comp_resolve},
     "reverse":       {"label": "Reverse DNS (IP → PTR)", "cluster": "DNS & Hosts", "needs": "ip", "fn": comp_reverse},
     "crtsh":         {"label": "Certificate Transparency (crt.sh)", "cluster": "Subdomains", "needs": "domain", "fn": comp_crtsh},
     "certspotter":   {"label": "Certificate Transparency (CertSpotter)", "cluster": "Subdomains", "needs": "domain", "fn": comp_certspotter},
-    "tls_san":       {"label": "TLS certificate SANs", "cluster": "Subdomains", "needs": "host", "fn": comp_tls_san},
+    "tls_san":       {"label": "TLS certificate SANs", "cluster": "Subdomains", "needs": "host", "fn": comp_tls_san, "contacts_host": True},
     "otx":           {"label": "Passive DNS — AlienVault OTX", "cluster": "Passive DNS & archives", "needs": "domain", "fn": comp_otx},
     "hackertarget":  {"label": "Passive DNS — HackerTarget", "cluster": "Passive DNS & archives", "needs": "domain", "fn": comp_hackertarget},
     "wayback":       {"label": "Wayback Machine (archived hosts)", "cluster": "Passive DNS & archives", "needs": "domain", "fn": comp_wayback},
@@ -627,7 +769,7 @@ COMPONENTS: Dict[str, Dict[str, Any]] = {
     "asn":           {"label": "ASN / netblock", "cluster": "Ownership", "needs": "host", "fn": comp_asn},
     "whois":         {"label": "WHOIS (contacts)", "cluster": "Ownership", "needs": "domain", "fn": comp_whois},
     "geoip":         {"label": "GeoIP / ISP (ip-api.com)", "cluster": "Ownership", "needs": "ip", "fn": comp_geoip},
-    "reverse_sweep": {"label": "Reverse-DNS sweep (CIDR → hosts)", "cluster": "Netblock", "needs": "cidr", "fn": comp_reverse_sweep},
+    "reverse_sweep": {"label": "Reverse-DNS sweep (CIDR → hosts)", "cluster": "Netblock", "needs": "cidr", "fn": comp_reverse_sweep, "stoppable": True},
     "origin_ip":     {"label": "Origin-IP discovery (CDN bypass)", "cluster": "Origin-IP", "needs": "domain", "fn": comp_origin_ip},
 }
 
@@ -638,7 +780,11 @@ def component_catalog() -> List[Dict[str, Any]]:
 
 
 def run_component(name: str, target: str, opts: Optional[Dict[str, Any]] = None,
-                  on_log: Optional[Log] = None) -> Dict[str, Any]:
+                  on_log: Optional[Log] = None,
+                  stop: Optional[threading.Event] = None) -> Dict[str, Any]:
+    """Run one component. ``stop`` (the run's Stop event) is handed to ``stoppable``
+    components — the long thread-pool fan-outs — so a Stop lands mid-run; their result
+    then has ``interrupted=True`` and keeps whatever was found before the Stop."""
     comp = COMPONENTS.get(name)
     log: Log = on_log or (lambda _m: None)
     if comp is None:
@@ -647,9 +793,11 @@ def run_component(name: str, target: str, opts: Optional[Dict[str, Any]] = None,
     if not target:
         return {"entities": [], "log": [], "error": "no target"}
     try:
-        res = comp["fn"](target, opts or {}, log)
+        kw = {"stop": stop} if comp.get("stoppable") else {}
+        res = comp["fn"](target, opts or {}, log, **kw)
         res.setdefault("entities", [])
         res.setdefault("log", [])
+        res.setdefault("interrupted", False)
         res["error"] = None
         return res
     except Exception as e:  # noqa: BLE001

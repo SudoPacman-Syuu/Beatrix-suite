@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from beatrix.utils.helpers import kill_on_stop
+
 _SCANNER = None
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")   # strip color codes from nuclei's stderr
 _COUNT_CACHE: Dict[str, int] = {}       # dir path -> recursive .yaml count (session cache)
@@ -354,6 +356,10 @@ def run(target: str, opts: Dict[str, Any],
 
     terr = threading.Thread(target=_drain_err, daemon=True)
     terr.start()
+    # Stop/timeout are enforced by a watcher, not per stdout line: stdout carries only
+    # findings, so a run that finds nothing used to ignore both until nuclei exited.
+    kill_on_stop(proc, stop_event, deadline=(started + timeout) if timeout else None,
+                 on_deadline=(lambda: on_line("[timed out]")) if on_line else None)
 
     count = 0
     findings: List[Dict[str, Any]] = []

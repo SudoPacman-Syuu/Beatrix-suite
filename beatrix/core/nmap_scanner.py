@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -351,8 +352,13 @@ class NetworkScanner:
             kwargs: Dict[str, Any] = {"arguments": arguments}
             if ports:
                 kwargs["ports"] = ports
-            if sudo:
-                kwargs["sudo"] = True
+            if sudo and os.geteuid() != 0:
+                # python-nmap runs a bare `sudo nmap …`: without passwordless rights that waits
+                # for a password on the server's terminal (a hung scan in the GUI). Only ask for
+                # root when sudo won't prompt; otherwise nmap reports the missing privilege.
+                from beatrix.core.nmap_runner import sudo_available
+                if sudo_available():
+                    kwargs["sudo"] = True
             kwargs["timeout"] = self.timeout
 
             self._scanner.scan(hosts=target, **kwargs)

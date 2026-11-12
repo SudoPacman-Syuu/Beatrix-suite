@@ -14,9 +14,10 @@ timeouts are enforced with coreutils ``timeout`` *inside* the container (exit
 Design notes / current scope (M2 first cut):
 * One ``sleep infinity`` container per run, created lazily and torn down on
   ``aclose()``; run as a non-root user with a read-only-ish work dir volume.
-* Image is configurable (``ai.sandbox_image``); defaults to a lean
-  ``python:3.11-slim`` so the driver works before the full ``ghost-sandbox``
-  image (Beatrix + external binaries + Playwright) is built.
+* Image is configurable (``ai.sandbox_image``). Unset, it is the full
+  ``beatrix/ghost-sandbox`` image (Beatrix + external binaries + Playwright) when
+  that has been built locally (``install.sh --with-docker``), else a lean
+  ``python:3.11-slim`` so the driver works before it is.
 * Egress policy is configurable via ``ai.sandbox_network`` (``open`` | ``none``):
   ``none`` starts the container fully network-isolated (``network_disabled``),
   so in-container shells and external binaries cannot reach anything —
@@ -39,6 +40,7 @@ from typing import Optional
 from .base import ExecResult
 
 DEFAULT_IMAGE = "python:3.11-slim"
+BUILT_IMAGE = "beatrix/ghost-sandbox:latest"     # docker/ghost-sandbox.Dockerfile
 WORKDIR = "/work"
 
 
@@ -54,7 +56,7 @@ class DockerRuntime:
 
         self._docker = docker
         self._client = docker.from_env()
-        self.image = image or getattr(cfg, "sandbox_image", None) or DEFAULT_IMAGE
+        self.image = image or getattr(cfg, "sandbox_image", None) or self._default_image()
         self.mem_limit = mem_limit
         self.cpus = cpus
         # Egress policy: "open" (default) or "none" (network_disabled container).
@@ -75,6 +77,13 @@ class DockerRuntime:
         self._ensure_image()
 
     # ── image / container lifecycle ─────────────────────────────────────
+    def _default_image(self) -> str:
+        try:
+            self._client.images.get(BUILT_IMAGE)
+            return BUILT_IMAGE
+        except Exception:  # noqa: BLE001 — not built (or daemon hiccup): the lean default
+            return DEFAULT_IMAGE
+
     def _ensure_image(self) -> None:
         try:
             self._client.images.get(self.image)

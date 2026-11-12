@@ -494,6 +494,12 @@ def _save_keys(payload: dict) -> dict:
     """
     valid = {env for env, _, _ in _AI_KEYS}
     incoming = payload.get("keys") or {}
+    if not isinstance(incoming, dict):
+        return {"ok": False, "error": "keys must be an object"}
+    # One line per key: a pasted CR/LF would otherwise start a new KEY=VALUE line in .env.
+    incoming = {env: val if val == "__CLEAR__"
+                else str(val or "").replace("\r", "").replace("\n", "").strip()
+                for env, val in incoming.items()}
     stored = _read_env_file()
 
     changed = []
@@ -762,9 +768,26 @@ def _build_and_save(payload: dict) -> dict:
     }
 
 
+_BODY_CAPS = {"/api/save": 128 << 20}     # a HAR export can be large; everything else is small
+_BODY_CAP = 1 << 20
+
+
 class _Handler(BaseHTTPRequestHandler):
+    # Access token (see beatrix/cli/_webauth.py); serve_auth_gui sets it on a subclass.
+    # None means every API request is refused — the page alone is served.
+    token = None
+    timeout = 120
+
     def log_message(self, *args):  # silence default stderr logging
         pass
+
+    def _authorized(self) -> bool:
+        from beatrix.cli import _webauth
+        return _webauth.token_ok(self.token, self)
+
+    def _deny(self) -> None:
+        self.close_connection = True
+        self._send(401, b'{"ok": false, "auth_required": true}', "application/json")
 
     def _send(self, code: int, body: bytes, ctype: str):
         self.send_response(code)
@@ -775,7 +798,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            from beatrix.cli import _webauth
+            self._send(200, _webauth.inject_shim(_PAGE).encode("utf-8"), "text/html; charset=utf-8")
+        elif not self._authorized():
+            self._deny()
         elif self.path in ("/api/list", "/api/keys", "/api/model", "/api/models"):
             try:
                 result = {
@@ -794,19 +820,33 @@ class _Handler(BaseHTTPRequestHandler):
         routes = {"/api/save": _build_and_save, "/api/clear": _clear_auth,
                   "/api/keys": _save_keys, "/api/model": _save_model_settings}
         handler = routes.get(self.path)
+        if not self._authorized():
+            self._deny()
+            return
         if handler is None:
             self._send(404, b"not found", "text/plain")
             return
         try:
-            length = int(self.headers.get("Content-Length") or 0)
+            length = max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            length = -1
+        if length < 0 or length > _BODY_CAPS.get(self.path, _BODY_CAP):
+            self.close_connection = True
+            self._send(413 if length > 0 else 400,
+                       b'{"ok": false, "error": "bad or oversized request body"}', "application/json")
+            return
+        try:
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
             result = handler(payload)
         except Exception as e:  # noqa: BLE001 — report any failure back to the page
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         self._send(200, json.dumps(result).encode("utf-8"), "application/json")
 
 
-def serve_auth_gui(host: str = "0.0.0.0", port: int = 8765, open_browser: bool = True):
+def serve_auth_gui(host: str = "0.0.0.0", port: int = 8765, open_browser: bool = True,
+                   new_token: bool = False):
     """Start the auth GUI server and block until Ctrl-C.
 
     Binds ``0.0.0.0`` by default, not ``127.0.0.1`` — Codespaces' port-forwarding
@@ -816,16 +856,18 @@ def serve_auth_gui(host: str = "0.0.0.0", port: int = 8765, open_browser: bool =
     Returns nothing; prints connection info. In Codespaces the forwarded URL is
     derived from the standard env vars so the user can click straight through.
     """
-    httpd = ThreadingHTTPServer((host, port), _Handler)
+    from beatrix.cli import _webauth
+    token = _webauth.load_or_create_token(rotate=new_token)
+    httpd = ThreadingHTTPServer((host, port), type("_TokenHandler", (_Handler,), {"token": token}))
     actual_port = httpd.server_address[1]
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    local_url = f"http://{display_host}:{actual_port}/"
+    local_url = _webauth.launch_url(f"http://{display_host}:{actual_port}/", token)
 
     # Codespaces exposes forwarded ports at <name>-<port>.<forwarding-domain>.
     codespace = os.environ.get("CODESPACE_NAME")
     fwd_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
     public_url = (
-        f"https://{codespace}-{actual_port}.{fwd_domain}/"
+        _webauth.launch_url(f"https://{codespace}-{actual_port}.{fwd_domain}/", token)
         if codespace and fwd_domain else None
     )
 
@@ -834,6 +876,7 @@ def serve_auth_gui(host: str = "0.0.0.0", port: int = 8765, open_browser: bool =
     if public_url:
         print(f"    Codespaces: {public_url}")
         print("    (VS Code should pop a 'Open in Browser' toast for the forwarded port.)")
+    print(f"\n  The link carries the access token (also in {_webauth.TOKEN_FILE}).")
     print("\n  Press Ctrl-C to stop.\n")
 
     if open_browser:

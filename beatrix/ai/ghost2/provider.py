@@ -25,10 +25,9 @@ def make_model(cfg: GhostV2Config):
     try:
         from agents.extensions.models.litellm_model import LitellmModel
     except ImportError as e:  # pragma: no cover - install guard
+        from . import agent_extra_hint
         raise RuntimeError(
-            "GHOST v2 requires the 'agent' extra. Install it with:\n"
-            "    pip install 'beatrix-cli[agent]'\n"
-            "(or: pip install 'openai-agents[litellm]')"
+            "GHOST v2 requires the 'agent' extra. Install it with:\n    " + agent_extra_hint()
         ) from e
 
     # LiteLLM tolerates provider params that a given backend doesn't support

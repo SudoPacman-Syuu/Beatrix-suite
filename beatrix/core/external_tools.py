@@ -27,6 +27,32 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from beatrix.utils.helpers import in_domain
+
+
+def go_bin_dirs() -> List[str]:
+    """Where ``go install`` puts binaries: $GOBIN, each $GOPATH/bin (default ~/go/bin), and
+    /go/bin — the devcontainer/Codespaces GOPATH, which often comes after ~/.local/bin on
+    PATH and so loses to same-named Python shims (httpx, s3scanner)."""
+    dirs = [os.environ.get("GOBIN", "")]
+    dirs += [os.path.join(p, "bin") for p in (os.environ.get("GOPATH") or "").split(os.pathsep) if p]
+    dirs += [str(Path.home() / "go" / "bin"), "/go/bin"]
+    out: List[str] = []
+    for d in dirs:
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def is_python_script(path: str) -> bool:
+    """True for a Python entry-point script (``#!…python``) rather than a compiled binary."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return False
+    return head.startswith(b"#!") and b"python" in head.split(b"\n", 1)[0]
+
 # =============================================================================
 # BASE CLASS
 # =============================================================================
@@ -53,7 +79,7 @@ class ExternalTool:
         for candidate in self.COMMON_PATHS + [
             f"/usr/bin/{self.BINARY_NAME}",
             f"/usr/local/bin/{self.BINARY_NAME}",
-            str(Path.home() / f"go/bin/{self.BINARY_NAME}"),
+            *(os.path.join(d, self.BINARY_NAME) for d in go_bin_dirs()),
             str(Path.home() / f".local/bin/{self.BINARY_NAME}"),
         ]:
             if Path(candidate).exists():
@@ -71,8 +97,12 @@ class ExternalTool:
 
     async def _run(self, cmd: List[str], stdin: Optional[str] = None,
                    output_manager=None, tool_name: str = "",
-                   phase: int = 0) -> Optional[str]:
+                   phase: int = 0, timeout: Optional[float] = None) -> Optional[str]:
         """Run a command and return stdout, or None on failure/timeout.
+
+        ``timeout`` overrides the tool's default for this one call. Fifteen runners
+        pass it, but this method used to have no such parameter, so each of those
+        calls raised TypeError and the tool (waymore, naabu, httpx, …) never ran.
 
         When the root logger is at DEBUG level (-vvv), streams each output line
         in real-time via the tool's own logger (beatrix.tools.<name>).
@@ -80,6 +110,7 @@ class ExternalTool:
         """
         if not self.available:
             return None
+        _timeout = timeout or self.timeout
         _om = output_manager or self.output_manager
         _phase = phase if phase else self.DEFAULT_PHASE
         _log = logging.getLogger(f"beatrix.tools.{self.BINARY_NAME}")
@@ -115,7 +146,7 @@ class ExternalTool:
                             _drain(process.stdout, stdout_lines, "out"),
                             _drain(process.stderr, stderr_lines, "err"),
                         ),
-                        timeout=self.timeout,
+                        timeout=_timeout,
                     )
                     await process.wait()
                 except asyncio.TimeoutError:
@@ -132,7 +163,7 @@ class ExternalTool:
                 try:
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(input=stdin.encode() if stdin else None),
-                        timeout=self.timeout,
+                        timeout=_timeout,
                     )
                 except asyncio.TimeoutError:
                     process.kill()
@@ -280,7 +311,7 @@ class AmassRunner(ExternalTool):
         subdomains = []
         for line in self._parse_lines(output):
             sub = line.strip().lower()
-            if sub and sub.endswith(domain):
+            if in_domain(sub, domain):
                 subdomains.append(sub)
 
         return sorted(set(subdomains))
@@ -1311,66 +1342,50 @@ class KiterRunnerRunner(ExternalTool):
             )
             return {"endpoints": [], "total": 0}
 
-        outfile = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        outfile.close()
+        # kr prints each hit as a JSON line on stdout (`-o json`); progress and logs go to stderr.
+        # It has no output-file flag, and --timeout is a Go duration ("3s", not "3").
+        cmd = [
+            self.path,
+            "scan", url,
+            "-w", wordlist,
+            "-x", str(concurrency),
+            "--timeout", f"{timeout}s",
+            "--fail-status-codes", fail_status_codes,
+            "-o", "json",
+            "--kitebuilder-full-scan",
+        ]
+        if not self._verbose_mode:
+            cmd.append("-q")
+        out = await self._run(cmd) or ""
+        endpoints = self._parse(out, url)
+        return {"endpoints": endpoints, "total": len(endpoints)}
 
-        try:
-            cmd = [
-                self.path,
-                "scan", url,
-                "-w", wordlist,
-                "-x", str(concurrency),
-                "--timeout", str(timeout),
-                "--fail-status-codes", fail_status_codes,
-                "--output", "json",
-                "--output-file", outfile.name,
-                "--kitebuilder-full-scan",
-            ]
-            if not self._verbose_mode:
-                cmd.append("--quiet")
-
-            await self._run(cmd)
-
-            endpoints = []
+    @staticmethod
+    def _parse(output: str, base: str) -> List[Dict[str, Any]]:
+        endpoints: List[Dict[str, Any]] = []
+        for line in output.splitlines():
+            line = line.strip().lstrip("\r")
+            if not line:
+                continue
             try:
-                with open(outfile.name) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            endpoints.append({
-                                "url": entry.get("request", {}).get("URL",
-                                        entry.get("URL", url)),
-                                "method": entry.get("request", {}).get("Method",
-                                           entry.get("Method", "GET")),
-                                "status": entry.get("response", {}).get("StatusCode",
-                                           entry.get("StatusCode", 0)),
-                                "length": entry.get("response", {}).get("ContentLength",
-                                           entry.get("ContentLength", 0)),
-                            })
-                        except json.JSONDecodeError:
-                            # Plain-text line: "POST   200 [  1234, 12, 5] https://..."
-                            m = re.match(
-                                r'(\w+)\s+(\d+)\s+\[.*?\]\s+(https?://\S+)', line
-                            )
-                            if m:
-                                endpoints.append({
-                                    "url": m.group(3),
-                                    "method": m.group(1),
-                                    "status": int(m.group(2)),
-                                    "length": 0,
-                                })
-            except FileNotFoundError:
-                pass
-
-            return {"endpoints": endpoints, "total": len(endpoints)}
-        finally:
-            try:
-                os.unlink(outfile.name)
-            except OSError:
-                pass
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                # text/pretty format: "GET  200 [   1234,   12,   5] https://host/path …"
+                m = re.match(r"(\w+)\s+(\d+)\s+\[.*?\]\s+(https?://\S+)", line)
+                if m:
+                    endpoints.append({"url": m.group(3), "method": m.group(1),
+                                      "status": int(m.group(2)), "length": 0})
+                continue
+            if not isinstance(entry, dict) or "path" not in entry or "method" not in entry:
+                continue                                     # a log line, not a hit
+            first = (entry.get("responses") or [{}])[0] or {}
+            endpoints.append({
+                "url": str(entry.get("target") or base).rstrip("/") + str(entry["path"]),
+                "method": entry["method"],
+                "status": int(first.get("sc") or 0),
+                "length": int(first.get("len") or 0),
+            })
+        return endpoints
 
 
 class ArjunRunner(ExternalTool):
@@ -1588,6 +1603,20 @@ class Nomore403Runner(ExternalTool):
     BINARY_NAME = "nomore403"
     DEFAULT_PHASE = 4
 
+    # nomore403 reads its techniques' payload lists from a payloads/ folder next to the binary
+    # unless given --folder; `go install` doesn't put one there, so install.sh copies it here.
+    _PAYLOAD_DIRS = [
+        str(Path.home() / ".local/share/nomore403/payloads"),
+        "/usr/share/nomore403/payloads",
+    ]
+
+    def _payload_dir(self) -> Optional[str]:
+        beside = str(Path(self.path).resolve().parent / "payloads") if self.path else ""
+        for d in [*self._PAYLOAD_DIRS, beside]:
+            if d and Path(d, "httpmethods").exists():
+                return d
+        return None
+
     async def bypass(
         self,
         url: str,
@@ -1601,80 +1630,54 @@ class Nomore403Runner(ExternalTool):
             {bypassed: bool, bypass_url: str, technique: str, status: int,
              all_attempts: [{url, technique, status}]}
         """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        ) as tmpf:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmpf:
             outfile = tmpf.name
+        result: Dict[str, Any] = {
+            "bypassed": False, "bypass_url": "", "technique": "", "status": 403, "all_attempts": [],
+        }
+
+        def add(code: int, technique: str, payload: str) -> None:
+            if technique == "default":          # the unmodified request — the 403 itself
+                return
+            # Path techniques report the rewritten URL; header/verb techniques report what
+            # they sent, against the original URL.
+            target, tech = (payload, technique) if payload.startswith(("http://", "https://")) \
+                else (url, f"{technique}: {payload}" if payload else technique)
+            result["all_attempts"].append({"url": target, "technique": tech, "status": code})
+            if 200 <= code < 300 and not result["bypassed"]:
+                result.update(bypassed=True, bypass_url=target, technique=tech, status=code)
 
         try:
-            cmd = [
-                self.path,
-                "--url", url,
-                "--threads", str(threads),
-                "--output", outfile,
-            ]
+            cmd = [self.path, "-u", url, "-m", str(threads), "--no-banner", "--json", "-o", outfile]
+            folder = self._payload_dir()
+            if folder:
+                cmd += ["-f", folder]
             output = await self._run(cmd, timeout=timeout) or ""
-
-            result: Dict[str, Any] = {
-                "bypassed": False,
-                "bypass_url": "",
-                "technique": "",
-                "status": 403,
-                "all_attempts": [],
-            }
-
-            # Parse stdout — nomore403 prints lines like:
-            # [200] <url>  (<technique>)
-            for line in output.splitlines():
-                line = line.strip()
-                parts = line.split()
-                if not parts:
-                    continue
-                # Look for lines with a 2xx status that differs from 403
-                try:
-                    code_part = parts[0].strip("[]")
-                    code = int(code_part)
-                    if len(parts) >= 2:
-                        attempt_url = parts[1]
-                        technique = " ".join(parts[2:]).strip("()")
-                        result["all_attempts"].append({
-                            "url": attempt_url,
-                            "technique": technique,
-                            "status": code,
-                        })
-                        if 200 <= code < 300 and not result["bypassed"]:
-                            result["bypassed"] = True
-                            result["bypass_url"] = attempt_url
-                            result["technique"] = technique
-                            result["status"] = code
-                except (ValueError, IndexError):
-                    pass
-
-            # Also check file output if available
+            rows: Any = None
             try:
-                if Path(outfile).exists():
-                    for line in Path(outfile).read_text(errors="replace").splitlines():
-                        line = line.strip()
-                        if not line or line in [a["url"] for a in result["all_attempts"]]:
-                            continue
-                        parts = line.split()
+                rows = json.loads(Path(outfile).read_text() or "null")
+            except (OSError, ValueError):
+                rows = None
+            if isinstance(rows, list):
+                for r in rows:
+                    if isinstance(r, dict):
                         try:
-                            code = int(parts[0].strip("[]"))
-                            attempt_url = parts[1] if len(parts) > 1 else ""
-                            technique = " ".join(parts[2:]).strip("()")
-                            result["all_attempts"].append({
-                                "url": attempt_url, "technique": technique, "status": code,
-                            })
-                            if 200 <= code < 300 and not result["bypassed"]:
-                                result["bypassed"] = True
-                                result["bypass_url"] = attempt_url
-                                result["technique"] = technique
-                                result["status"] = code
-                        except (ValueError, IndexError):
+                            add(int(r.get("status_code") or 0), str(r.get("technique") or ""),
+                                str(r.get("payload") or ""))
+                        except (TypeError, ValueError):
                             pass
-            except Exception:
-                pass
-
+            else:
+                # No JSON file (killed by the timeout): read the streamed lines instead —
+                # "200 \t   380 bytes http://host/admin/." under a "━━ TECHNIQUE ━━" banner.
+                section = ""
+                for line in output.splitlines():
+                    s = line.strip()
+                    if s.startswith("━"):
+                        section = s.strip("━ ").lower()
+                        continue
+                    m = re.match(r"^(\d{3})\s+\d+\s+bytes\s+(.+)$", s)
+                    if m and section != "default request":
+                        add(int(m.group(1)), section or "unknown", m.group(2).strip())
             return result
         finally:
             try:
@@ -1856,7 +1859,7 @@ class HttpxRunner(ExternalTool):
         # that is where the colliding Python httpx CLI typically lives.
         candidates: List[str] = []
         for c in [
-            str(Path.home() / "go" / "bin" / "httpx"),
+            *(os.path.join(d, "httpx") for d in go_bin_dirs()),
             "/usr/local/bin/httpx",
             "/usr/bin/httpx",
             shutil.which(self.BINARY_NAME),
@@ -2104,7 +2107,9 @@ class GowitnessRunner(ExternalTool):
         listfile = Path(out_dir) / "_targets.txt"
         listfile.write_text("\n".join(urls))
         for cmd in (
-            [self.path, "scan", "file", "--file", str(listfile), "--screenshot-path", out_dir, "--write-db=false"],
+            # v3: `scan file`; its default format is JPEG, so ask for PNG explicitly.
+            [self.path, "scan", "file", "--file", str(listfile), "--screenshot-path", out_dir,
+             "--screenshot-format", "png", "--write-none"],
             [self.path, "file", "-f", str(listfile), "--destination", out_dir, "--disable-db"],
             [self.path, "file", "-f", str(listfile), "-P", out_dir],
         ):
@@ -2116,7 +2121,8 @@ class GowitnessRunner(ExternalTool):
     @staticmethod
     def _collect_pngs(out_dir: str) -> List[str]:
         try:
-            return sorted(str(p) for p in Path(out_dir).rglob("*.png"))
+            return sorted(str(p) for p in Path(out_dir).rglob("*")
+                          if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
         except Exception:
             return []
 
@@ -2131,6 +2137,16 @@ class S3ScannerRunner(ExternalTool):
     BINARY_NAME = "s3scanner"
     DEFAULT_PHASE = 1
 
+    def _find_binary(self) -> Optional[str]:
+        # The Go v3 CLI (sa7mon/s3scanner). The old PyPI "s3scanner" shares the name but not
+        # the flags, and usually sits first on PATH (~/.local/bin) — skip it.
+        for c in [*(os.path.join(d, "s3scanner") for d in go_bin_dirs()),
+                  shutil.which(self.BINARY_NAME), "/usr/local/bin/s3scanner", "/usr/bin/s3scanner",
+                  str(Path.home() / ".local" / "bin" / "s3scanner")]:
+            if c and Path(c).exists() and not is_python_script(c):
+                return c
+        return None
+
     async def scan(self, buckets, *, timeout: int = 300, extra_flags=None) -> List[Dict[str, Any]]:
         if not self.available:
             return []
@@ -2142,9 +2158,7 @@ class S3ScannerRunner(ExternalTool):
         import tempfile
         f = Path(tempfile.mkdtemp()) / "buckets.txt"
         f.write_text("\n".join(buckets))
-        out = await self._run([self.path, "scan", "-bucket-file", str(f)], timeout=timeout)
-        if out is None:
-            out = await self._run([self.path, "-bucket-file", str(f)], timeout=timeout) or ""
+        out = await self._run([self.path, "-bucket-file", str(f), *(extra_flags or [])], timeout=timeout)
         return self._parse(out or "")
 
     def _parse(self, output: str) -> List[Dict[str, Any]]:
@@ -2366,7 +2380,7 @@ class RealReaRunner(ExternalTool):
             return {}
         cmd = [self.path, command, target]
         if json_out:
-            cmd.append("--json")
+            cmd += ["--format", "json"]
         if extra:
             cmd += list(extra)
         out = await self._run(cmd, timeout=timeout)

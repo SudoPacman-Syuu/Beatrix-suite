@@ -1054,22 +1054,15 @@ def _find_install_sh() -> Path | None:
 @click.pass_context
 def setup_cmd(ctx, check):
     """
-    Install all external security tools (the full arsenal).
+    Install (or repair) the external security tools — the full arsenal.
 
     \b
-    Automatically installs all 21 external dependencies:
-    nuclei, httpx, subfinder, ffuf, katana, sqlmap, nmap,
-    adb, mitmproxy, playwright, amass, whatweb, webanalyze,
-    gospider, hakrawler, gau, dirsearch, dalfox, commix,
-    jwt_tool, and metasploit.
-
-    \b
-    Uses the best method for each tool:
-      • System packages (apt/dnf/pacman) for nmap, sqlmap, etc.
-      • Go install for nuclei, subfinder, httpx, ffuf, etc.
-      • pip for mitmproxy, playwright, dirsearch, commix
-      • Go install for webanalyze
-      • Official installer for metasploit
+    Runs install.sh's tool step: everything `beatrix setup --check` lists.
+      • System packages (apt/dnf/pacman/apk): nmap, sqlmap, whois, dig, tshark, adb
+      • go install: nuclei, httpx, subfinder, katana, ffuf, dalfox, naabu, nomore403, …
+      • Release binaries: trufflehog, kiterunner (+ its routes wordlist)
+      • uv tool (isolated venvs): mitmproxy, arjun, commix, dirsearch, waymore, …
+      • Playwright Chromium, nuclei templates, Metasploit
 
     \b
     Examples:
@@ -1097,9 +1090,19 @@ def setup_cmd(ctx, check):
         table.add_column("Status", justify="center")
         table.add_column("Path", style="dim")
 
+        from beatrix.core.external_tools import go_bin_dirs, is_python_script
+
+        def _locate(name: str):
+            # PD httpx / Go s3scanner hide behind same-named Python shims earlier on PATH.
+            for c in [*(str(Path(d) / name) for d in go_bin_dirs()), shutil.which(name),
+                      str(Path.home() / ".local" / "bin" / name)]:
+                if c and Path(c).exists() and not (name in ("httpx", "s3scanner") and is_python_script(c)):
+                    return c
+            return None
+
         found = 0
         for tool in tools:
-            path = shutil.which(tool)
+            path = _locate(tool)
             if path:
                 table.add_row(tool, "[green]✓ installed[/green]", path)
                 found += 1
@@ -1120,7 +1123,7 @@ def setup_cmd(ctx, check):
         console.print("[bright_yellow]Downloading installer from GitHub...[/bright_yellow]")
         try:
             result = subprocess.run(
-                ["curl", "-sSL", "https://raw.githubusercontent.com/SudoPacman-Syuu/Beatrix/main/install.sh"],
+                ["curl", "-fsSL", "https://raw.githubusercontent.com/SudoPacman-Syuu/Beatrix-suite/main/install.sh"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and "install_external_tools" in result.stdout:
@@ -1139,12 +1142,14 @@ def setup_cmd(ctx, check):
     console.print("[bright_yellow]⚔️  Arming the full arsenal...[/bright_yellow]")
     console.print(f"[dim]Using {install_sh}[/dim]\n")
 
-    # Source install.sh and call install_external_tools directly
+    # Source install.sh (its main() only runs when executed, not sourced) and call
+    # install_external_tools directly, pointing it at the venv this command runs from.
+    import sys as _sys
     bash_cmd = f'source "{install_sh}" && install_external_tools'
     try:
         proc = subprocess.run(
             ["bash", "-c", bash_cmd],
-            env={**__import__("os").environ, "PYTHON": shutil.which("python3") or "python3"},
+            env={**__import__("os").environ, "BEATRIX_VENV": _sys.prefix},
         )
         raise SystemExit(proc.returncode)
     except FileNotFoundError:
@@ -1248,15 +1253,22 @@ def update_cmd(stash, no_deps):
             console.print("[yellow]⚠ Could not auto-restore; your changes are safe in `git stash list`.[/yellow]")
 
     if not no_deps:
-        venv_py = Path.home() / ".beatrix" / "bin" / "python"
-        py = str(venv_py) if venv_py.exists() else _sys.executable
+        # The interpreter running this command is the Beatrix venv (~/.beatrix/venv). An editable
+        # install (install.sh from a git checkout) stays editable; a regular one is upgraded.
+        import shutil as _shutil
+        py = _sys.executable
+        editable = Path(__file__).resolve().is_relative_to(root.resolve())
         console.print("[bright_yellow]Refreshing dependencies…[/bright_yellow]")
-        dep = subprocess.run([py, "-m", "pip", "install", "--upgrade", "--quiet", f"{root}[extended]"],
-                             capture_output=True, text=True)
-        if dep.returncode != 0:
-            dep = subprocess.run([py, "-m", "pip", "install", "--upgrade", "--quiet", str(root)],
-                                 capture_output=True, text=True)
-        if dep.returncode == 0:
+        uv = _shutil.which("uv")
+        dep = None
+        for extras in ("[extended,agent]", "[extended]", ""):
+            spec = ["-e", f"{root}{extras}"] if editable else [f"{root}{extras}"]
+            cmd = ([uv, "pip", "install", "--python", py, "--quiet", *spec] if uv
+                   else [py, "-m", "pip", "install", "--upgrade", "--quiet", *spec])
+            dep = subprocess.run(cmd, capture_output=True, text=True)
+            if dep.returncode == 0:
+                break
+        if dep is not None and dep.returncode == 0:
             console.print("[green]✓[/green] Dependencies up to date.")
         else:
             console.print(f"[yellow]⚠ Dependency refresh had issues:[/yellow] [dim]{(dep.stderr or '').strip()[:300]}[/dim]")
@@ -1290,8 +1302,9 @@ def _run_ghost_hunt(target, *, cli_headers=(), cli_cookies=(), cli_token=None, v
     try:
         from beatrix.ai.ghost2 import GhostV2Config, run_investigation
     except ImportError:
+        from beatrix.ai.ghost2 import agent_extra_hint
         console.print("[red]--ghost requires the 'agent' extra:[/red]")
-        console.print("  [bold]pip install 'beatrix-cli[agent]'[/bold]")
+        console.print(f"  [bold]{agent_extra_hint()}[/bold]")
         sys.exit(1)
 
     base_headers = {}
@@ -5038,7 +5051,9 @@ def ghost(ctx, target, objective, method, header, data, max_turns, model, api_ke
 @click.option("--port", type=int, default=8790, help="Port to serve the dashboard on (default: 8790)")
 @click.option("--host", default="0.0.0.0", help="Interface to bind (default: 0.0.0.0)")
 @click.option("--no-browser", is_flag=True, help="Don't try to open a browser automatically")
-def suite(port, host, no_browser):
+@click.option("--new-token", is_flag=True,
+              help="Replace the access token (~/.beatrix/suite.token); old links stop working")
+def suite(port, host, no_browser, new_token):
     """Open the Beatrix Suite central dashboard (also: `beatrix-suite`).
 
     \b
@@ -5048,7 +5063,7 @@ def suite(port, host, no_browser):
     """
     from beatrix.cli.suite import main as suite_main
     try:
-        suite_main(host=host, port=port, open_browser=not no_browser)
+        suite_main(host=host, port=port, open_browser=not no_browser, new_token=new_token)
     except OSError as e:
         console.print(f"[red]Could not start Suite on {host}:{port} — {e}[/red]")
         console.print("[dim]Try a different port: beatrix suite --port 8899[/dim]")
@@ -5094,8 +5109,9 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
     try:
         from beatrix.ai.ghost2 import GhostV2Config, run_investigation
     except ImportError:
+        from beatrix.ai.ghost2 import agent_extra_hint
         console.print("[red]GHOST v2 requires the 'agent' extra:[/red]")
-        console.print("  [bold]pip install 'beatrix-cli[agent]'[/bold]")
+        console.print(f"  [bold]{agent_extra_hint()}[/bold]")
         sys.exit(1)
 
     base_headers = {}
@@ -5183,9 +5199,9 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
             )
             web_server.start(open_browser=True)
             on_event = web_server.emit
-            console.print(f"[green]📺 Live dashboard:[/green] {web_server.url}")
-            if web_server.public_url:
-                console.print(f"[green]   Codespaces:[/green] {web_server.public_url}")
+            console.print(f"[green]📺 Live dashboard:[/green] {web_server.launch_url}")
+            if web_server.public_launch_url:
+                console.print(f"[green]   Codespaces:[/green] {web_server.public_launch_url}")
         except Exception as e:  # noqa: BLE001 — dashboard is optional, never fatal
             console.print(f"[yellow]Could not start --web dashboard: {e}[/yellow]")
 
@@ -5240,7 +5256,7 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
         interactive = sys.stdout.isatty() or sys.stderr.isatty()
         if interactive:
             console.print(
-                f"\n[green]📺 Dashboard still live at {web_server.url}[/green] "
+                f"\n[green]📺 Dashboard still live at {web_server.launch_url}[/green] "
                 "[dim](Ctrl-C to close)[/dim]"
             )
             web_server.wait()
